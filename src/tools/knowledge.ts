@@ -1,0 +1,214 @@
+import { z } from "zod";
+import { Storage, TrustTier } from "../storage.js";
+import { mutationSchema, runIdempotentMutation } from "./mutation.js";
+
+const trustTierSchema = z.enum(["raw", "verified", "policy-backed", "deprecated"]);
+
+export const knowledgePromoteSchema = z.object({
+  mutation: mutationSchema,
+  source_type: z.enum(["note", "transcript"]),
+  source_id: z.string().min(1),
+  promoted_text: z.string().optional(),
+  trust_tier: trustTierSchema.default("verified"),
+  tags: z.array(z.string()).optional(),
+  reason: z.string().optional(),
+  expires_in_days: z.number().int().min(1).max(3650).optional(),
+  source_client: z.string().optional(),
+  source_model: z.string().optional(),
+  source_agent: z.string().optional(),
+});
+
+export const knowledgeDecaySchema = z.object({
+  mutation: mutationSchema,
+  older_than_days: z.number().int().min(1).max(3650),
+  from_tiers: z.array(trustTierSchema).min(1),
+  to_tier: trustTierSchema.default("deprecated"),
+  limit: z.number().int().min(1).max(500).optional(),
+});
+
+export const retrievalHybridSchema = z.object({
+  query: z.string().min(1),
+  tags: z.array(z.string()).optional(),
+  session_id: z.string().optional(),
+  source_client: z.string().optional(),
+  source_model: z.string().optional(),
+  source_agent: z.string().optional(),
+  trust_tiers: z.array(trustTierSchema).optional(),
+  include_notes: z.boolean().optional(),
+  include_transcripts: z.boolean().optional(),
+  limit: z.number().int().min(1).max(50).optional(),
+});
+
+export async function knowledgePromote(storage: Storage, input: z.infer<typeof knowledgePromoteSchema>) {
+  return runIdempotentMutation({
+    storage,
+    tool_name: "knowledge.promote",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => {
+      const source =
+        input.source_type === "note"
+          ? storage.getNoteById(input.source_id)
+          : storage.getTranscriptById(input.source_id);
+
+      if (!source) {
+        throw new Error(`Source ${input.source_type} not found: ${input.source_id}`);
+      }
+
+      const promotedText = input.promoted_text ?? source.text;
+      const expiresAt = input.expires_in_days
+        ? new Date(Date.now() + input.expires_in_days * 24 * 60 * 60 * 1000).toISOString()
+        : undefined;
+
+      const note = storage.insertNote({
+        text: promotedText,
+        source:
+          input.source_type === "note"
+            ? `promoted:note:${input.source_id}`
+            : `promoted:transcript:${input.source_id}`,
+        source_client: input.source_client,
+        source_model: input.source_model,
+        source_agent: input.source_agent,
+        trust_tier: input.trust_tier as TrustTier,
+        expires_at: expiresAt,
+        promoted_from_note_id: input.source_type === "note" ? input.source_id : undefined,
+        tags: ["promoted", input.source_type, ...(input.tags ?? [])],
+        related_paths: input.reason ? [input.reason] : undefined,
+      });
+
+      return {
+        note_id: note.id,
+        created_at: note.created_at,
+        source_type: input.source_type,
+        source_id: input.source_id,
+      };
+    },
+  });
+}
+
+export async function knowledgeDecay(storage: Storage, input: z.infer<typeof knowledgeDecaySchema>) {
+  return runIdempotentMutation({
+    storage,
+    tool_name: "knowledge.decay",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => {
+      const olderThanIso = new Date(Date.now() - input.older_than_days * 24 * 60 * 60 * 1000).toISOString();
+      const result = storage.decayNotes({
+        older_than_iso: olderThanIso,
+        from_tiers: input.from_tiers as TrustTier[],
+        to_tier: input.to_tier as TrustTier,
+        limit: input.limit ?? 100,
+      });
+      return {
+        updated_count: result.updated_ids.length,
+        updated_ids: result.updated_ids,
+        older_than_iso: olderThanIso,
+      };
+    },
+  });
+}
+
+export function retrievalHybrid(storage: Storage, input: z.infer<typeof retrievalHybridSchema>) {
+  const limit = input.limit ?? 10;
+  const includeNotes = input.include_notes ?? true;
+  const includeTranscripts = input.include_transcripts ?? true;
+
+  const notes = includeNotes
+    ? storage.searchNotes({
+        query: input.query,
+        tags: input.tags,
+        source_client: input.source_client,
+        source_model: input.source_model,
+        source_agent: input.source_agent,
+        trust_tiers: input.trust_tiers,
+        include_expired: false,
+        limit,
+      })
+    : [];
+
+  const transcripts = includeTranscripts
+    ? storage.searchTranscripts({
+        query: input.query,
+        session_id: input.session_id,
+        source_client: input.source_client,
+        source_model: input.source_model,
+        source_agent: input.source_agent,
+        limit,
+      })
+    : [];
+
+  const nowMs = Date.now();
+
+  const matches = [
+    ...notes.map((note) => {
+      const lexical = note.score ?? 0;
+      const recency = recencyBoost(nowMs, note.created_at);
+      const trustBoost = note.trust_tier === "policy-backed" ? 1.5 : note.trust_tier === "verified" ? 1 : 0;
+      const hybridScore = lexical + recency + trustBoost;
+      return {
+        type: "note",
+        id: note.id,
+        text: note.text,
+        score: Number(hybridScore.toFixed(4)),
+        citation: {
+          entity_type: "note",
+          entity_id: note.id,
+          created_at: note.created_at,
+          source_client: note.source_client,
+          source_model: note.source_model,
+          source_agent: note.source_agent,
+          trust_tier: note.trust_tier,
+        },
+      };
+    }),
+    ...transcripts.map((transcript) => {
+      const lexical = transcript.score ?? 0;
+      const recency = recencyBoost(nowMs, transcript.created_at);
+      const hybridScore = lexical + recency;
+      return {
+        type: "transcript",
+        id: transcript.id,
+        text: transcript.text,
+        score: Number(hybridScore.toFixed(4)),
+        citation: {
+          entity_type: "transcript",
+          entity_id: transcript.id,
+          created_at: transcript.created_at,
+          session_id: transcript.session_id,
+          source_client: transcript.source_client,
+          source_model: transcript.source_model,
+          source_agent: transcript.source_agent,
+        },
+      };
+    }),
+  ]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  return {
+    query: input.query,
+    strategy: "lexical+recency+trust",
+    counts: {
+      notes: notes.length,
+      transcripts: transcripts.length,
+      matches: matches.length,
+    },
+    matches,
+  };
+}
+
+function recencyBoost(nowMs: number, createdAtIso: string): number {
+  const createdMs = Date.parse(createdAtIso);
+  if (Number.isNaN(createdMs)) {
+    return 0;
+  }
+  const ageHours = Math.max(0, (nowMs - createdMs) / (1000 * 60 * 60));
+  if (ageHours <= 24) {
+    return 1;
+  }
+  if (ageHours <= 24 * 7) {
+    return 0.5;
+  }
+  return 0;
+}

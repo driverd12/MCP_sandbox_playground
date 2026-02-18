@@ -1,6 +1,6 @@
-# MCP Sandbox/Playground Setup Instructions:
+# Anamnesis Setup Instructions:
 
-This is the fastest path to run my MCP sandbox locally.
+This is the fastest path to run Anamnesis locally.
 
 ## 1. Prereqs
 
@@ -34,7 +34,8 @@ cp .env.example .env
 Minimal `.env` values:
 
 ```bash
-MCP_HUB_DB_PATH=./data/hub.sqlite
+ANAMNESIS_HUB_DB_PATH=./data/hub.sqlite
+# MCP_HUB_DB_PATH=./data/hub.sqlite
 MCP_HTTP_BEARER_TOKEN=change-me
 MCP_HTTP_ALLOWED_ORIGINS=http://localhost,http://127.0.0.1
 ```

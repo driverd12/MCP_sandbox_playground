@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { Storage, TranscriptRecord } from "../storage.js";
+import { Storage, TranscriptLineRecord, TranscriptRecord } from "../storage.js";
 import { mutationSchema } from "./mutation.js";
 
 export const transcriptAppendSchema = z.object({
@@ -12,6 +12,14 @@ export const transcriptAppendSchema = z.object({
   text: z.string().min(1),
 });
 
+export const transcriptLogSchema = z.object({
+  mutation: mutationSchema,
+  run_id: z.string().optional(),
+  role: z.enum(["user", "assistant", "system"]).or(z.string().min(1)),
+  content: z.string().min(1),
+  is_squished: z.boolean().optional(),
+});
+
 export const transcriptSummarizeSchema = z.object({
   mutation: mutationSchema,
   session_id: z.string().min(1),
@@ -19,11 +27,24 @@ export const transcriptSummarizeSchema = z.object({
   max_points: z.number().int().min(3).max(20).optional(),
 });
 
+export const transcriptSquishSchema = z.object({
+  mutation: mutationSchema,
+  run_id: z.string().min(1),
+  limit: z.number().int().min(1).max(5000).optional(),
+  max_points: z.number().int().min(3).max(20).optional(),
+});
+
 export function appendTranscript(
   storage: Storage,
   input: z.infer<typeof transcriptAppendSchema>
 ) {
-  return storage.insertTranscript({
+  const line = storage.insertTranscriptLine({
+    run_id: input.session_id,
+    role: input.kind,
+    content: input.text,
+    is_squished: false,
+  });
+  const transcript = storage.insertTranscript({
     session_id: input.session_id,
     source_client: input.source_client,
     source_model: input.source_model,
@@ -31,6 +52,56 @@ export function appendTranscript(
     kind: input.kind,
     text: input.text,
   });
+  return {
+    ...transcript,
+    line_id: line.id,
+    line_timestamp: line.timestamp,
+  };
+}
+
+export function logTranscript(
+  storage: Storage,
+  input: z.infer<typeof transcriptLogSchema>
+) {
+  return storage.insertTranscriptLine({
+    run_id: input.run_id,
+    role: input.role,
+    content: input.content,
+    is_squished: input.is_squished,
+  });
+}
+
+export function squishTranscript(
+  storage: Storage,
+  input: z.infer<typeof transcriptSquishSchema>
+) {
+  const unsquished = storage.getUnsquishedTranscriptLines(input.run_id, input.limit ?? 200);
+  if (unsquished.length === 0) {
+    return {
+      run_id: input.run_id,
+      created_memory: false,
+      squished_count: 0,
+      reason: "no-unsquished-lines",
+    };
+  }
+
+  const lines = collectTranscriptLineContents(unsquished);
+  const summary = buildSquishedSummary(input.run_id, unsquished, lines, input.max_points ?? 8);
+  const keywords = extractKeywords(lines, 12);
+  const memory = storage.insertMemory({
+    content: summary,
+    keywords,
+  });
+  const squished = storage.markTranscriptLinesSquished(unsquished.map((line) => line.id));
+
+  return {
+    run_id: input.run_id,
+    created_memory: true,
+    memory_id: memory.id,
+    memory_created_at: memory.created_at,
+    squished_count: squished.updated_count,
+    keywords,
+  };
 }
 
 export async function summarizeTranscript(
@@ -97,6 +168,42 @@ function buildLocalSummary(sessionId: string, transcripts: TranscriptRecord[], m
   ].join("\n");
 }
 
+function buildSquishedSummary(
+  runId: string,
+  transcriptLines: TranscriptLineRecord[],
+  lines: string[],
+  maxPoints: number
+): string {
+  const first = transcriptLines[0];
+  const last = transcriptLines[transcriptLines.length - 1];
+  const points = collectRecentUnique(lines, maxPoints);
+  const decisions = collectPatternMatches(lines, /\b(decision|decide|decided|agreed|approved|chosen)\b/i, 6);
+  const actions = collectPatternMatches(
+    lines,
+    /\b(action|todo|next|follow[ -]?up|owner|pending|need to|should|must)\b/i,
+    8
+  );
+  const questions = collectPatternMatches(lines, /\?/, 6);
+
+  return [
+    `Run: ${runId}`,
+    `Raw lines squished: ${transcriptLines.length}`,
+    `Window: ${first.timestamp} -> ${last.timestamp}`,
+    "",
+    "Key points:",
+    ...toBullets(points, "No key points captured."),
+    "",
+    "Decisions:",
+    ...toBullets(decisions, "No explicit decisions detected."),
+    "",
+    "Action items:",
+    ...toBullets(actions, "No explicit action items detected."),
+    "",
+    "Open questions:",
+    ...toBullets(questions, "No open questions detected."),
+  ].join("\n");
+}
+
 function collectParticipants(transcripts: TranscriptRecord[]): string[] {
   const participants = new Set<string>();
   for (const transcript of transcripts) {
@@ -122,6 +229,18 @@ function collectTranscriptLines(transcripts: TranscriptRecord[]): string[] {
     lines.push(...split);
   }
   return lines;
+}
+
+function collectTranscriptLineContents(lines: TranscriptLineRecord[]): string[] {
+  const output: string[] = [];
+  for (const line of lines) {
+    const split = line.content
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    output.push(...split);
+  }
+  return output;
 }
 
 function collectRecentUnique(lines: string[], limit: number): string[] {
@@ -192,4 +311,48 @@ function toBullets(values: string[], fallback: string): string[] {
     return [`- ${fallback}`];
   }
   return values.map((value) => `- ${value}`);
+}
+
+function extractKeywords(lines: string[], maxKeywords: number): string[] {
+  const stopWords = new Set([
+    "the",
+    "and",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "have",
+    "will",
+    "into",
+    "about",
+    "need",
+    "next",
+    "then",
+    "were",
+    "when",
+    "what",
+    "where",
+    "which",
+    "your",
+    "our",
+    "you",
+    "can",
+    "all",
+    "not",
+  ]);
+  const counts = new Map<string, number>();
+  for (const line of lines) {
+    const words = line.toLowerCase().match(/[a-z0-9][a-z0-9-]{2,}/g) ?? [];
+    for (const word of words) {
+      if (stopWords.has(word)) {
+        continue;
+      }
+      counts.set(word, (counts.get(word) ?? 0) + 1);
+    }
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, maxKeywords)
+    .map(([keyword]) => keyword);
 }

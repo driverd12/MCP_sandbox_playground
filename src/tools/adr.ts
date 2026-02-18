@@ -1,53 +1,106 @@
 import { z } from "zod";
-import { spawnSync } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
-import { logEvent, truncate } from "../utils.js";
+import { Storage } from "../storage.js";
+import { logEvent } from "../utils.js";
 import { mutationSchema } from "./mutation.js";
 
 export const adrCreateSchema = z.object({
   mutation: mutationSchema,
   title: z.string().min(1),
-  status: z.string().min(1),
+  content: z.string().min(1),
+  status: z.string().min(1).optional(),
 });
 
-export function createAdr(input: z.infer<typeof adrCreateSchema>, repoRoot = process.cwd()) {
-  const scriptPath = path.resolve(repoRoot, "scripts", "new_adr.py");
-  const args = [scriptPath, "--title", input.title, "--status", input.status];
-  const result = spawnSync("python3", args, {
-    encoding: "utf8",
-    cwd: repoRoot,
-    maxBuffer: 1024 * 1024,
+export function createAdr(
+  storage: Storage,
+  input: z.infer<typeof adrCreateSchema>,
+  repoRoot = process.cwd()
+) {
+  const adrDir = path.resolve(repoRoot, "docs", "adrs");
+  fs.mkdirSync(adrDir, { recursive: true });
+
+  const number = nextAdrNumber(adrDir);
+  const adrId = `${String(number).padStart(4, "0")}-${slugify(input.title)}`;
+  const status = input.status?.trim() || "proposed";
+  const filePath = path.join(adrDir, `${adrId}.md`);
+  const createdAt = new Date().toISOString();
+  const markdown = renderAdrMarkdown({
+    id: adrId,
+    title: input.title.trim(),
+    status,
+    created_at: createdAt,
+    content: input.content.trim(),
   });
 
-  const stderr = truncate(result.stderr ?? "");
-  const stdout = (result.stdout ?? "").trim();
-  const ok = result.status === 0;
-  logEvent("adr.create", { ok, status: result.status, stdout: truncate(stdout) });
-
-  let createdPath: string | null = null;
-  let updatedPath: string | null = null;
-  if (stdout) {
-    const lines = stdout.split(/\r?\n/).filter(Boolean);
-    for (const line of lines) {
-      const createdMatch = line.match(/^Created:\s+(.+)$/i);
-      if (createdMatch) {
-        createdPath = createdMatch[1]?.trim() ?? null;
-        continue;
-      }
-      const updatedMatch = line.match(/^Updated:\s+(.+)$/i);
-      if (updatedMatch) {
-        updatedPath = updatedMatch[1]?.trim() ?? null;
-      }
-    }
-    if (!createdPath) {
-      createdPath = lines[0] ?? null;
-    }
+  if (fs.existsSync(filePath)) {
+    throw new Error(`ADR file already exists: ${filePath}`);
   }
 
+  fs.writeFileSync(filePath, markdown, "utf8");
+  try {
+    storage.insertAdr({
+      id: adrId,
+      title: input.title.trim(),
+      status,
+      content: input.content.trim(),
+    });
+  } catch (error) {
+    fs.rmSync(filePath, { force: true });
+    throw error;
+  }
+
+  logEvent("adr.create", { ok: true, id: adrId, status, path: filePath });
   return {
-    path: createdPath ? path.resolve(createdPath) : null,
-    index_path: updatedPath ? path.resolve(updatedPath) : undefined,
-    ok,
-    stderr_trunc: stderr || undefined,
+    id: adrId,
+    status,
+    path: filePath,
+    ok: true,
   };
+}
+
+function nextAdrNumber(adrDir: string): number {
+  const entries = fs.existsSync(adrDir) ? fs.readdirSync(adrDir, { withFileTypes: true }) : [];
+  let max = 0;
+  const pattern = /^(\d{4})-[a-z0-9-]+\.md$/;
+  for (const entry of entries) {
+    if (!entry.isFile()) {
+      continue;
+    }
+    const match = entry.name.match(pattern);
+    if (!match) {
+      continue;
+    }
+    max = Math.max(max, Number(match[1]));
+  }
+  return max + 1;
+}
+
+function slugify(title: string): string {
+  const slug = title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/[\s_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "untitled";
+}
+
+function renderAdrMarkdown(params: {
+  id: string;
+  title: string;
+  status: string;
+  created_at: string;
+  content: string;
+}): string {
+  return [
+    `# ${params.id}: ${params.title}`,
+    "",
+    `- Status: ${params.status}`,
+    `- Date: ${params.created_at}`,
+    "",
+    "## Content",
+    params.content,
+    "",
+  ].join("\n");
 }

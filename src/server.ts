@@ -9,8 +9,12 @@ import { Storage } from "./storage.js";
 import { appendMemory, memoryAppendSchema, memorySearchSchema, searchMemory } from "./tools/memory.js";
 import {
   appendTranscript,
+  logTranscript,
+  squishTranscript,
   summarizeTranscript,
   transcriptAppendSchema,
+  transcriptLogSchema,
+  transcriptSquishSchema,
   transcriptSummarizeSchema,
 } from "./tools/transcript.js";
 import { adrCreateSchema, createAdr } from "./tools/adr.js";
@@ -37,15 +41,16 @@ const envPath = process.env.DOTENV_CONFIG_PATH
   : path.join(repoRoot, ".env");
 dotenv.config({ path: envPath });
 
-const storagePath = process.env.MCP_HUB_DB_PATH
-  ? path.resolve(process.env.MCP_HUB_DB_PATH)
+const storagePathEnv = process.env.ANAMNESIS_HUB_DB_PATH ?? process.env.MCP_HUB_DB_PATH;
+const storagePath = storagePathEnv
+  ? path.resolve(storagePathEnv)
   : path.join(repoRoot, "data", "hub.sqlite");
 const storage = new Storage(storagePath);
 storage.init();
 
 const server = new Server(
   {
-    name: "mcp-sandbox-playground",
+    name: "anamnesis",
     version: "0.2.0",
   },
   {
@@ -72,7 +77,7 @@ function registerTool(name: string, description: string, schema: z.ZodTypeAny, h
   toolRegistry.set(name, { schema, tool, handler });
 }
 
-registerTool("memory.append", "Append a memory note with trust tier metadata.", memoryAppendSchema, (input) =>
+registerTool("memory.append", "Append distilled long-term memory content.", memoryAppendSchema, (input) =>
   runIdempotentMutation({
     storage,
     tool_name: "memory.append",
@@ -82,8 +87,28 @@ registerTool("memory.append", "Append a memory note with trust tier metadata.", 
   })
 );
 
-registerTool("memory.search", "Search memory notes with actor and trust filters.", memorySearchSchema, (input) =>
+registerTool("memory.search", "Search long-term memory using lexical matching.", memorySearchSchema, (input) =>
   searchMemory(storage, input)
+);
+
+registerTool("transcript.log", "Log raw transcript lines into working memory.", transcriptLogSchema, (input) =>
+  runIdempotentMutation({
+    storage,
+    tool_name: "transcript.log",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => logTranscript(storage, input),
+  })
+);
+
+registerTool("transcript.squish", "Squish raw transcript lines into distilled memories.", transcriptSquishSchema, (input) =>
+  runIdempotentMutation({
+    storage,
+    tool_name: "transcript.squish",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => squishTranscript(storage, input),
+  })
 );
 
 registerTool("transcript.append", "Append a transcript entry with actor attribution.", transcriptAppendSchema, (input) =>
@@ -110,13 +135,13 @@ registerTool(
     })
 );
 
-registerTool("adr.create", "Create an ADR file using scripts/new_adr.py.", adrCreateSchema, (input) =>
+registerTool("adr.create", "Create an ADR markdown file and record it in local storage.", adrCreateSchema, (input) =>
   runIdempotentMutation({
     storage,
     tool_name: "adr.create",
     mutation: input.mutation,
     payload: input,
-    execute: () => createAdr(input, repoRoot),
+    execute: () => createAdr(storage, input, repoRoot),
   })
 );
 

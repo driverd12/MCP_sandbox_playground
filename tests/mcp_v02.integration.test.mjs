@@ -7,7 +7,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const REPO_ROOT = process.cwd();
-const ADR_INDEX_PATH = path.join(REPO_ROOT, "docs", "ADR", "0000-index.md");
+const ADR_DIR_PATH = path.join(REPO_ROOT, "docs", "adrs");
 
 const EXPECTED_TOOLS = [
   "adr.create",
@@ -35,6 +35,8 @@ const EXPECTED_TOOLS = [
   "run.step",
   "run.timeline",
   "simulate.workflow",
+  "transcript.log",
+  "transcript.squish",
   "transcript.append",
   "transcript.summarize",
   "who_knows",
@@ -53,6 +55,8 @@ const MUTATION_REQUIRED_TOOLS = [
   "run.begin",
   "run.end",
   "run.step",
+  "transcript.log",
+  "transcript.squish",
   "transcript.append",
   "transcript.summarize",
 ];
@@ -61,12 +65,11 @@ test("MCP v0.2 integration and safety invariants", async () => {
   const testId = `${Date.now()}`;
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-v02-test-"));
   const dbPath = path.join(tempDir, "hub.sqlite");
-  const adrIndexBeforeSuite = fs.readFileSync(ADR_INDEX_PATH, "utf8");
   const adrFilesToRemove = new Set();
   let mutationCounter = 0;
 
   const env = inheritedEnv({
-    MCP_HUB_DB_PATH: dbPath,
+    ANAMNESIS_HUB_DB_PATH: dbPath,
   });
   const transport = new StdioClientTransport({
     command: "node",
@@ -103,21 +106,15 @@ test("MCP v0.2 integration and safety invariants", async () => {
     const noteMutation = nextMutation(testId, "memory.append", () => mutationCounter++);
     const note = await callTool(client, "memory.append", {
       mutation: noteMutation,
-      text: `integration note ${testId}`,
-      tags: ["integration", "v02"],
-      source_client: "codex-tests",
-      source_model: "local-test",
-      source_agent: "integration-suite",
+      content: `integration note ${testId}`,
+      keywords: ["integration", "v02"],
     });
     assert.ok(note.id);
 
     const replayedNote = await callTool(client, "memory.append", {
       mutation: noteMutation,
-      text: `integration note ${testId}`,
-      tags: ["integration", "v02"],
-      source_client: "codex-tests",
-      source_model: "local-test",
-      source_agent: "integration-suite",
+      content: `integration note ${testId}`,
+      keywords: ["integration", "v02"],
     });
     assert.equal(replayedNote.id, note.id);
     assert.equal(replayedNote.replayed, true);
@@ -127,13 +124,12 @@ test("MCP v0.2 integration and safety invariants", async () => {
         idempotency_key: noteMutation.idempotency_key,
         side_effect_fingerprint: `${noteMutation.side_effect_fingerprint}-changed`,
       },
-      text: "same key different fingerprint must fail",
+      content: "same key different fingerprint must fail",
     });
     assert.match(mismatchedFingerprintError, /mismatched side_effect_fingerprint/i);
 
     const memoryMatches = await callTool(client, "memory.search", {
       query: `integration note ${testId}`,
-      source_client: "codex-tests",
       limit: 5,
     });
     assert.ok(Array.isArray(memoryMatches));
@@ -158,6 +154,38 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.equal(mutationCheckMismatch.reason, "mismatch");
 
     const sessionId = `session-${testId}`;
+    const transcriptLog = await callTool(client, "transcript.log", {
+      mutation: nextMutation(testId, "transcript.log", () => mutationCounter++),
+      run_id: sessionId,
+      role: "user",
+      content: `Raw transcript line for ${testId}`,
+    });
+    assert.equal(typeof transcriptLog.id, "number");
+
+    await callTool(client, "transcript.log", {
+      mutation: nextMutation(testId, "transcript.log", () => mutationCounter++),
+      run_id: sessionId,
+      role: "assistant",
+      content: `Follow-up action for ${testId} should be tested.`,
+    });
+
+    const squishMutation = nextMutation(testId, "transcript.squish", () => mutationCounter++);
+    const transcriptSquish = await callTool(client, "transcript.squish", {
+      mutation: squishMutation,
+      run_id: sessionId,
+      max_points: 6,
+    });
+    assert.equal(transcriptSquish.created_memory, true);
+    assert.ok(typeof transcriptSquish.memory_id === "number");
+    assert.ok(transcriptSquish.squished_count >= 2);
+
+    const transcriptSquishReplay = await callTool(client, "transcript.squish", {
+      mutation: squishMutation,
+      run_id: sessionId,
+      max_points: 6,
+    });
+    assert.equal(transcriptSquishReplay.replayed, true);
+
     const transcript = await callTool(client, "transcript.append", {
       mutation: nextMutation(testId, "transcript.append", () => mutationCounter++),
       session_id: sessionId,
@@ -181,6 +209,17 @@ test("MCP v0.2 integration and safety invariants", async () => {
     const whoKnows = await callTool(client, "who_knows", { query: testId, limit: 10 });
     assert.equal(whoKnows.local_only, true);
     assert.ok(whoKnows.counts.matches >= 1);
+    assert.ok(whoKnows.counts.memories >= 1);
+
+    const whoKnowsRaw = await callTool(client, "who_knows", {
+      query: `Raw transcript line for ${testId}`,
+      session_id: sessionId,
+      limit: 10,
+    });
+    assert.ok(
+      whoKnowsRaw.matches.some((match) => match.type === "memory" || match.type === "transcript_line"),
+      "Expected memory or transcript_line match for raw transcript query"
+    );
 
     const knowledgeQuery = await callTool(client, "knowledge.query", { query: testId, limit: 10 });
     assert.equal(knowledgeQuery.local_only, true);
@@ -310,7 +349,7 @@ test("MCP v0.2 integration and safety invariants", async () => {
     const promoted = await callTool(client, "knowledge.promote", {
       mutation: nextMutation(testId, "knowledge.promote", () => mutationCounter++),
       source_type: "note",
-      source_id: note.id,
+      source_id: transcriptSummary.note_id,
       tags: ["promotion-test"],
       reason: "promotion path validation",
       source_client: "codex-tests",
@@ -341,6 +380,7 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(Array.isArray(hybrid.matches));
     assert.ok(hybrid.matches.length >= 1);
     assert.ok(hybrid.matches[0].citation?.entity_id);
+    assert.ok(typeof hybrid.counts.memories === "number");
 
     const decision = await callTool(client, "decision.link", {
       mutation: nextMutation(testId, "decision.link", () => mutationCounter++),
@@ -412,21 +452,19 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.equal(healthPolicy.ok, true);
     assert.ok(healthPolicy.enforced_rules.length >= 3);
 
-    const adrIndexBeforeCall = fs.readFileSync(ADR_INDEX_PATH, "utf8");
     const adr = await callTool(client, "adr.create", {
       mutation: nextMutation(testId, "adr.create", () => mutationCounter++),
       title: `MCP integration test ${testId}`,
+      content: "Integration test ADR content.",
       status: "proposed",
     });
     assert.equal(adr.ok, true);
     if (adr.path) {
       assert.equal(path.isAbsolute(adr.path), true);
       assert.equal(fs.existsSync(adr.path), true);
+      assert.equal(path.dirname(adr.path), ADR_DIR_PATH);
       adrFilesToRemove.add(adr.path);
     }
-    const adrIndexAfterCall = fs.readFileSync(ADR_INDEX_PATH, "utf8");
-    assert.notEqual(adrIndexAfterCall, adrIndexBeforeCall);
-    fs.writeFileSync(ADR_INDEX_PATH, adrIndexBeforeCall, "utf8");
   } finally {
     await client.close().catch(() => {});
     for (const adrPath of adrFilesToRemove) {
@@ -434,7 +472,6 @@ test("MCP v0.2 integration and safety invariants", async () => {
         fs.unlinkSync(adrPath);
       }
     }
-    fs.writeFileSync(ADR_INDEX_PATH, adrIndexBeforeSuite, "utf8");
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });

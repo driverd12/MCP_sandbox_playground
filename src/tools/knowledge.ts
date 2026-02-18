@@ -138,6 +138,21 @@ export function retrievalHybrid(storage: Storage, input: z.infer<typeof retrieva
       })
     : [];
 
+  const memories = includeNotes
+    ? storage.searchMemories({
+        query: input.query,
+        limit,
+      })
+    : [];
+
+  const transcriptLines = includeTranscripts
+    ? storage.searchTranscriptLines({
+        query: input.query,
+        run_id: input.session_id,
+        limit,
+      })
+    : [];
+
   const nowMs = Date.now();
 
   const matches = [
@@ -162,6 +177,26 @@ export function retrievalHybrid(storage: Storage, input: z.infer<typeof retrieva
         },
       };
     }),
+    ...memories.map((memory) => {
+      const lexical = memory.score ?? 0;
+      const recency = recencyBoost(nowMs, memory.created_at);
+      const decayBoost = Math.max(0, Math.min(memory.decay_score, 2)) / 2;
+      const hybridScore = lexical + recency + decayBoost;
+      return {
+        type: "memory",
+        id: memory.id,
+        text: memory.content,
+        score: Number(hybridScore.toFixed(4)),
+        citation: {
+          entity_type: "memory",
+          entity_id: memory.id,
+          created_at: memory.created_at,
+          last_accessed_at: memory.last_accessed_at,
+          keywords: memory.keywords,
+          decay_score: memory.decay_score,
+        },
+      };
+    }),
     ...transcripts.map((transcript) => {
       const lexical = transcript.score ?? 0;
       const recency = recencyBoost(nowMs, transcript.created_at);
@@ -182,16 +217,38 @@ export function retrievalHybrid(storage: Storage, input: z.infer<typeof retrieva
         },
       };
     }),
+    ...transcriptLines.map((line) => {
+      const lexical = line.score ?? 0;
+      const recency = recencyBoost(nowMs, line.timestamp);
+      const freshnessBoost = line.is_squished ? 0 : 0.25;
+      const hybridScore = lexical + recency + freshnessBoost;
+      return {
+        type: "transcript_line",
+        id: line.id,
+        text: line.content,
+        score: Number(hybridScore.toFixed(4)),
+        citation: {
+          entity_type: "transcript_line",
+          entity_id: line.id,
+          created_at: line.timestamp,
+          run_id: line.run_id,
+          role: line.role,
+          is_squished: line.is_squished,
+        },
+      };
+    }),
   ]
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 
   return {
     query: input.query,
-    strategy: "lexical+recency+trust",
+    strategy: "lexical+recency+trust+decay",
     counts: {
       notes: notes.length,
+      memories: memories.length,
       transcripts: transcripts.length,
+      transcript_lines: transcriptLines.length,
       matches: matches.length,
     },
     matches,

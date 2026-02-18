@@ -33,6 +33,26 @@ export type TranscriptRecord = {
   score?: number;
 };
 
+export type TranscriptLineRecord = {
+  id: number;
+  run_id: string | null;
+  role: string | null;
+  content: string;
+  timestamp: string;
+  is_squished: boolean;
+  score?: number;
+};
+
+export type MemoryRecord = {
+  id: number;
+  content: string;
+  keywords: string[];
+  created_at: string;
+  last_accessed_at: string;
+  decay_score: number;
+  score?: number;
+};
+
 export type MutationMeta = {
   idempotency_key: string;
   side_effect_fingerprint: string;
@@ -130,6 +150,28 @@ export class Storage {
         source_agent TEXT,
         kind TEXT NOT NULL,
         text TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS transcript_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT,
+        role TEXT,
+        content TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        is_squished BOOLEAN DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT,
+        keywords TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        decay_score REAL DEFAULT 1.0
+      );
+      CREATE TABLE IF NOT EXISTS adrs (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        status TEXT,
+        content TEXT
       );
       CREATE TABLE IF NOT EXISTS mutation_journal (
         idempotency_key TEXT PRIMARY KEY,
@@ -235,6 +277,12 @@ export class Storage {
     this.ensureIndex("idx_notes_created", "notes", "created_at DESC");
     this.ensureIndex("idx_notes_trust", "notes", "trust_tier");
     this.ensureIndex("idx_transcripts_session", "transcripts", "session_id, created_at ASC");
+    this.ensureIndex("idx_transcript_lines_run", "transcript_lines", "run_id, timestamp ASC");
+    this.ensureIndex("idx_transcript_lines_squished", "transcript_lines", "is_squished, timestamp ASC");
+    this.ensureIndex("idx_memories_created", "memories", "created_at DESC");
+    this.ensureIndex("idx_memories_last_accessed", "memories", "last_accessed_at DESC");
+    this.ensureIndex("idx_memories_keywords", "memories", "keywords");
+    this.ensureIndex("idx_adrs_status", "adrs", "status");
     this.ensureIndex("idx_run_events_run", "run_events", "run_id, created_at ASC");
     this.ensureIndex("idx_incident_events_incident", "incident_events", "incident_id, created_at ASC");
   }
@@ -366,6 +414,86 @@ export class Storage {
     return results;
   }
 
+  insertMemory(params: {
+    content: string;
+    keywords?: string[];
+    decay_score?: number;
+  }): { id: number; created_at: string; last_accessed_at: string } {
+    const now = new Date().toISOString();
+    const keywords = normalizeKeywords(params.keywords);
+    const stmt = this.db.prepare(
+      `INSERT INTO memories (content, keywords, created_at, last_accessed_at, decay_score)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    const result = stmt.run(
+      params.content,
+      keywords.join(", "),
+      now,
+      now,
+      params.decay_score ?? 1.0
+    );
+    return {
+      id: Number(result.lastInsertRowid),
+      created_at: now,
+      last_accessed_at: now,
+    };
+  }
+
+  getMemoryById(memoryId: number): MemoryRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, content, keywords, created_at, last_accessed_at, decay_score
+         FROM memories
+         WHERE id = ?`
+      )
+      .get(memoryId) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return mapMemoryRow(row);
+  }
+
+  searchMemories(params: {
+    query: string;
+    limit: number;
+  }): MemoryRecord[] {
+    const limit = Math.max(1, Math.min(50, params.limit));
+    const query = params.query.trim();
+    if (!query) {
+      return [];
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT id, content, keywords, created_at, last_accessed_at, decay_score
+         FROM memories
+         WHERE content LIKE ? OR keywords LIKE ?
+         ORDER BY last_accessed_at DESC, created_at DESC
+         LIMIT ?`
+      )
+      .all(`%${query}%`, `%${query}%`, limit) as Array<Record<string, unknown>>;
+
+    const accessedAt = new Date().toISOString();
+    const result = rows.map((row) => {
+      const memory = mapMemoryRow(row);
+      memory.score = computeTermScore(`${memory.content} ${memory.keywords.join(" ")}`, query);
+      memory.last_accessed_at = accessedAt;
+      return memory;
+    });
+
+    if (result.length > 0) {
+      const updateStmt = this.db.prepare(`UPDATE memories SET last_accessed_at = ? WHERE id = ?`);
+      const tx = this.db.transaction((ids: number[]) => {
+        for (const id of ids) {
+          updateStmt.run(accessedAt, id);
+        }
+      });
+      tx(result.map((entry) => entry.id));
+    }
+
+    return result;
+  }
+
   decayNotes(params: {
     older_than_iso: string;
     from_tiers: TrustTier[];
@@ -426,6 +554,116 @@ export class Storage {
       params.text
     );
     return { id, created_at: createdAt };
+  }
+
+  insertTranscriptLine(params: {
+    run_id?: string;
+    role: string;
+    content: string;
+    is_squished?: boolean;
+  }): { id: number; timestamp: string } {
+    const timestamp = new Date().toISOString();
+    const stmt = this.db.prepare(
+      `INSERT INTO transcript_lines (run_id, role, content, timestamp, is_squished)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+    const result = stmt.run(
+      params.run_id ?? null,
+      params.role,
+      params.content,
+      timestamp,
+      params.is_squished ? 1 : 0
+    );
+    return {
+      id: Number(result.lastInsertRowid),
+      timestamp,
+    };
+  }
+
+  getTranscriptLinesByRun(runId: string, limit = 1000): TranscriptLineRecord[] {
+    const boundedLimit = Math.max(1, Math.min(5000, limit));
+    const rows = this.db
+      .prepare(
+        `SELECT id, run_id, role, content, timestamp, is_squished
+         FROM transcript_lines
+         WHERE run_id = ?
+         ORDER BY timestamp ASC
+         LIMIT ?`
+      )
+      .all(runId, boundedLimit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapTranscriptLineRow(row));
+  }
+
+  getUnsquishedTranscriptLines(runId: string, limit = 500): TranscriptLineRecord[] {
+    const boundedLimit = Math.max(1, Math.min(5000, limit));
+    const rows = this.db
+      .prepare(
+        `SELECT id, run_id, role, content, timestamp, is_squished
+         FROM transcript_lines
+         WHERE run_id = ?
+           AND is_squished = 0
+         ORDER BY timestamp ASC
+         LIMIT ?`
+      )
+      .all(runId, boundedLimit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapTranscriptLineRow(row));
+  }
+
+  searchTranscriptLines(params: {
+    query: string;
+    run_id?: string;
+    include_squished?: boolean;
+    limit: number;
+  }): TranscriptLineRecord[] {
+    const limit = Math.max(1, Math.min(50, params.limit));
+    const query = params.query.trim();
+    if (!query) {
+      return [];
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT id, run_id, role, content, timestamp, is_squished
+         FROM transcript_lines
+         WHERE content LIKE ?
+         ORDER BY timestamp DESC
+         LIMIT ?`
+      )
+      .all(`%${query}%`, limit * 20) as Array<Record<string, unknown>>;
+
+    const includeSquished = params.include_squished ?? true;
+    const result: TranscriptLineRecord[] = [];
+    for (const row of rows) {
+      const line = mapTranscriptLineRow(row);
+      if (params.run_id && line.run_id !== params.run_id) {
+        continue;
+      }
+      if (!includeSquished && line.is_squished) {
+        continue;
+      }
+      line.score = computeTermScore(line.content, query);
+      result.push(line);
+      if (result.length >= limit) {
+        break;
+      }
+    }
+    return result;
+  }
+
+  markTranscriptLinesSquished(lineIds: number[]): { updated_count: number } {
+    if (lineIds.length === 0) {
+      return { updated_count: 0 };
+    }
+    const stmt = this.db.prepare(`UPDATE transcript_lines SET is_squished = 1 WHERE id = ?`);
+    const tx = this.db.transaction((ids: number[]) => {
+      let updated = 0;
+      for (const id of ids) {
+        const result = stmt.run(id);
+        updated += Number(result.changes ?? 0);
+      }
+      return updated;
+    });
+    return { updated_count: tx(lineIds) };
   }
 
   getTranscriptById(transcriptId: string): TranscriptRecord | null {
@@ -1023,10 +1261,25 @@ export class Storage {
     return { incident, events };
   }
 
+  insertAdr(params: {
+    id: string;
+    title: string;
+    status: string;
+    content: string;
+  }): { id: string } {
+    this.db
+      .prepare(`INSERT INTO adrs (id, title, status, content) VALUES (?, ?, ?, ?)`)
+      .run(params.id, params.title, params.status, params.content);
+    return { id: params.id };
+  }
+
   getTableCounts(): Record<string, number> {
     const tables = [
       "notes",
       "transcripts",
+      "transcript_lines",
+      "memories",
+      "adrs",
       "mutation_journal",
       "policy_evaluations",
       "run_events",
@@ -1087,6 +1340,28 @@ function mapTranscriptRow(row: Record<string, unknown>): TranscriptRecord {
   };
 }
 
+function mapTranscriptLineRow(row: Record<string, unknown>): TranscriptLineRecord {
+  return {
+    id: Number(row.id ?? 0),
+    run_id: asNullableString(row.run_id),
+    role: asNullableString(row.role),
+    content: String(row.content ?? ""),
+    timestamp: String(row.timestamp ?? ""),
+    is_squished: Number(row.is_squished ?? 0) === 1,
+  };
+}
+
+function mapMemoryRow(row: Record<string, unknown>): MemoryRecord {
+  return {
+    id: Number(row.id ?? 0),
+    content: String(row.content ?? ""),
+    keywords: parseKeywords(row.keywords),
+    created_at: String(row.created_at ?? ""),
+    last_accessed_at: String(row.last_accessed_at ?? ""),
+    decay_score: Number(row.decay_score ?? 1),
+  };
+}
+
 function normalizeTrustTier(value: unknown): TrustTier {
   const normalized = String(value ?? "raw");
   if (normalized === "verified" || normalized === "policy-backed" || normalized === "deprecated") {
@@ -1101,6 +1376,30 @@ function asNullableString(value: unknown): string | null {
   }
   const text = String(value);
   return text.length > 0 ? text : null;
+}
+
+function normalizeKeywords(keywords: string[] | undefined): string[] {
+  if (!keywords) {
+    return [];
+  }
+  const unique = new Set<string>();
+  for (const keyword of keywords) {
+    const normalized = keyword.trim().toLowerCase();
+    if (normalized) {
+      unique.add(normalized);
+    }
+  }
+  return Array.from(unique);
+}
+
+function parseKeywords(value: unknown): string[] {
+  if (value === null || value === undefined) {
+    return [];
+  }
+  return String(value)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function safeParseJsonArray(value: unknown): string[] {

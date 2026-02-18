@@ -1,4 +1,4 @@
-# MCP Sandbox Playground Connect
+# Anamnesis Connect
 
 This server runs as a local-first MCP hub with STDIO or Streamable HTTP transport.
 
@@ -33,7 +33,8 @@ Notes:
 - The server loads `.env` from repo root automatically.
 - Override env path with `DOTENV_CONFIG_PATH=/absolute/path/to/.env`.
 - SQLite defaults to `./data/hub.sqlite`.
-- Override DB path with `MCP_HUB_DB_PATH=/absolute/path/to/hub.sqlite`.
+- Override DB path with `ANAMNESIS_HUB_DB_PATH=/absolute/path/to/hub.sqlite`.
+- Legacy fallback: `MCP_HUB_DB_PATH=/absolute/path/to/hub.sqlite`.
 
 ## HTTP (Streamable)
 
@@ -54,7 +55,8 @@ Notes:
 ## Minimal `.env`
 
 ```bash
-MCP_HUB_DB_PATH=./data/hub.sqlite
+ANAMNESIS_HUB_DB_PATH=./data/hub.sqlite
+# MCP_HUB_DB_PATH=./data/hub.sqlite
 MCP_HTTP_BEARER_TOKEN=change-me
 MCP_HTTP_ALLOWED_ORIGINS=http://localhost,http://127.0.0.1
 ```
@@ -70,7 +72,7 @@ npm test
 ## Tool Set
 
 - `memory.append`, `memory.search`
-- `transcript.append`, `transcript.summarize`
+- `transcript.log`, `transcript.squish`, `transcript.append`, `transcript.summarize`
 - `adr.create`
 - `who_knows`, `knowledge.query`
 - `policy.evaluate`
@@ -89,4 +91,5 @@ npm test
 ## Data Migration
 
 - Copy `data/hub.sqlite` (+ `-wal` / `-shm`) and your `.env`.
-- If you use custom `MCP_HUB_DB_PATH`, migrate that DB file instead.
+- If you use custom `ANAMNESIS_HUB_DB_PATH`, migrate that DB file instead.
+- Legacy `MCP_HUB_DB_PATH` is still supported.

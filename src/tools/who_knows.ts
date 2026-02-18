@@ -45,6 +45,21 @@ export async function whoKnows(storage: Storage, input: z.infer<typeof whoKnowsS
       })
     : [];
 
+  const memories = includeNotes
+    ? storage.searchMemories({
+        query: input.query,
+        limit,
+      })
+    : [];
+
+  const transcriptLines = includeTranscripts
+    ? storage.searchTranscriptLines({
+        query: input.query,
+        run_id: input.session_id,
+        limit,
+      })
+    : [];
+
   const matches = [
     ...notes.map((note) => ({
       type: "note",
@@ -70,6 +85,26 @@ export async function whoKnows(storage: Storage, input: z.infer<typeof whoKnowsS
       score: transcript.score ?? 0,
       text: transcript.text,
     })),
+    ...memories.map((memory) => ({
+      type: "memory",
+      id: memory.id,
+      created_at: memory.created_at,
+      last_accessed_at: memory.last_accessed_at,
+      decay_score: memory.decay_score,
+      keywords: memory.keywords,
+      score: memory.score ?? 0,
+      text: memory.content,
+    })),
+    ...transcriptLines.map((line) => ({
+      type: "transcript_line",
+      id: line.id,
+      created_at: line.timestamp,
+      run_id: line.run_id,
+      role: line.role,
+      is_squished: line.is_squished,
+      score: line.score ?? 0,
+      text: line.content,
+    })),
   ]
     .sort((a, b) => (b.score ?? 0) - (a.score ?? 0) || b.created_at.localeCompare(a.created_at))
     .slice(0, limit);
@@ -79,12 +114,16 @@ export async function whoKnows(storage: Storage, input: z.infer<typeof whoKnowsS
     query: input.query,
     counts: {
       notes: notes.length,
+      memories: memories.length,
       transcripts: transcripts.length,
+      transcript_lines: transcriptLines.length,
       matches: matches.length,
     },
     consult_ignored: input.consult ? "consult flag ignored in local-only mode" : undefined,
     notes,
+    memories,
     transcripts,
+    transcript_lines: transcriptLines,
     matches,
   };
 }

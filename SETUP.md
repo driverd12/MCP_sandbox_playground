@@ -1,6 +1,6 @@
-# Teammate Setup (5 Minutes)
+# MCP Sandbox/Playground Setup Instructions:
 
-This is the fastest path to run the MCP sandbox locally.
+This is the fastest path to run my MCP sandbox locally.
 
 ## 1. Prereqs
 
@@ -69,7 +69,7 @@ Point your MCP client to:
 node /absolute/path/to/MCP_sandbox_playground/dist/server.js
 ```
 
-Example (macOS path):
+Example (macOS path): (not limited to just cursor, just where mine lives.)
 
 ```bash
 node /Users/<you>/Cursor_projects/python/MCP_sandbox_playground/dist/server.js

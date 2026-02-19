@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { Storage, TranscriptLineRecord, TranscriptRecord } from "../storage.js";
-import { mutationSchema } from "./mutation.js";
+import { mutationSchema, runIdempotentMutation } from "./mutation.js";
 
 export const transcriptAppendSchema = z.object({
   mutation: mutationSchema,
@@ -33,6 +33,117 @@ export const transcriptSquishSchema = z.object({
   limit: z.number().int().min(1).max(5000).optional(),
   max_points: z.number().int().min(3).max(20).optional(),
 });
+
+export const transcriptRunTimelineSchema = z.object({
+  run_id: z.string().min(1),
+  include_squished: z.boolean().optional(),
+  roles: z.array(z.string().min(1)).optional(),
+  limit: z.number().int().min(1).max(5000).optional(),
+});
+
+export const transcriptPendingRunsSchema = z.object({
+  limit: z.number().int().min(1).max(500).optional(),
+});
+
+export const transcriptAutoSquishSchema = z
+  .object({
+    action: z.enum(["status", "start", "stop", "run_once"]).default("status"),
+    mutation: mutationSchema.optional(),
+    interval_seconds: z.number().int().min(5).max(3600).optional(),
+    batch_runs: z.number().int().min(1).max(200).optional(),
+    per_run_limit: z.number().int().min(1).max(5000).optional(),
+    max_points: z.number().int().min(3).max(20).optional(),
+    run_immediately: z.boolean().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.action !== "status" && !value.mutation) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "mutation is required for start, stop, and run_once actions",
+        path: ["mutation"],
+      });
+    }
+  });
+
+export const transcriptRetentionSchema = z.object({
+  mutation: mutationSchema,
+  older_than_days: z.number().int().min(0).max(3650),
+  include_unsquished: z.boolean().optional(),
+  run_id: z.string().optional(),
+  limit: z.number().int().min(1).max(5000).optional(),
+  dry_run: z.boolean().optional(),
+});
+
+type AutoSquishConfig = {
+  interval_seconds: number;
+  batch_runs: number;
+  per_run_limit: number;
+  max_points: number;
+};
+
+type SquishRunResult = {
+  run_id: string;
+  created_memory: boolean;
+  squished_count: number;
+  memory_id?: number;
+  memory_created_at?: string;
+  keywords?: string[];
+  reason?: string;
+};
+
+type AutoSquishRunResult = {
+  run_id: string;
+  unsquished_before: number;
+  created_memory: boolean;
+  squished_count: number;
+  memory_id?: number;
+  reason?: string;
+  error?: string;
+};
+
+type AutoSquishTickResult = {
+  completed_at: string;
+  runs_seen: number;
+  runs_processed: number;
+  memories_created: number;
+  lines_squished: number;
+  run_results: AutoSquishRunResult[];
+  skipped?: boolean;
+  reason?: string;
+};
+
+const DEFAULT_AUTO_SQUISH_CONFIG: AutoSquishConfig = {
+  interval_seconds: 60,
+  batch_runs: 10,
+  per_run_limit: 200,
+  max_points: 8,
+};
+
+const autoSquishRuntime: {
+  running: boolean;
+  timer: NodeJS.Timeout | null;
+  config: AutoSquishConfig;
+  in_tick: boolean;
+  started_at: string | null;
+  last_tick_at: string | null;
+  last_error: string | null;
+  tick_count: number;
+  total_runs_processed: number;
+  total_lines_squished: number;
+  total_memories_created: number;
+} = {
+  running: false,
+  timer: null,
+  config: { ...DEFAULT_AUTO_SQUISH_CONFIG },
+  in_tick: false,
+  started_at: null,
+  last_tick_at: null,
+  last_error: null,
+  tick_count: 0,
+  total_runs_processed: 0,
+  total_lines_squished: 0,
+  total_memories_created: 0,
+};
 
 export function appendTranscript(
   storage: Storage,
@@ -73,8 +184,98 @@ export function logTranscript(
 
 export function squishTranscript(
   storage: Storage,
-  input: z.infer<typeof transcriptSquishSchema>
+  input: Pick<z.infer<typeof transcriptSquishSchema>, "run_id" | "limit" | "max_points">
 ) {
+  return squishRun(storage, input);
+}
+
+export function autoSquishControl(
+  storage: Storage,
+  input: z.infer<typeof transcriptAutoSquishSchema>
+) {
+  if (input.action === "status") {
+    return getAutoSquishStatus();
+  }
+
+  if (!input.mutation) {
+    throw new Error("mutation is required for start, stop, and run_once actions");
+  }
+
+  return runIdempotentMutation({
+    storage,
+    tool_name: "transcript.auto_squish",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => {
+      if (input.action === "start") {
+        const wasRunning = autoSquishRuntime.running;
+        autoSquishRuntime.config = resolveAutoSquishConfig(input, autoSquishRuntime.config);
+        startAutoSquishDaemon(storage);
+        let initialTick: ReturnType<typeof runAutoSquishTick> | undefined;
+        if (input.run_immediately ?? true) {
+          initialTick = runAutoSquishTick(storage, autoSquishRuntime.config);
+        }
+        return {
+          running: true,
+          started: !wasRunning,
+          updated: wasRunning,
+          config: { ...autoSquishRuntime.config },
+          initial_tick: initialTick,
+          status: getAutoSquishStatus(),
+        };
+      }
+
+      if (input.action === "stop") {
+        const wasRunning = autoSquishRuntime.running;
+        stopAutoSquishDaemon();
+        return {
+          running: false,
+          stopped: wasRunning,
+          status: getAutoSquishStatus(),
+        };
+      }
+
+      const config = resolveAutoSquishConfig(input, autoSquishRuntime.config);
+      const tick = runAutoSquishTick(storage, config);
+      return {
+        running: autoSquishRuntime.running,
+        tick,
+        status: getAutoSquishStatus(),
+      };
+    },
+  });
+}
+
+export function applyTranscriptRetention(
+  storage: Storage,
+  input: z.infer<typeof transcriptRetentionSchema>
+) {
+  const olderThanIso = new Date(Date.now() - input.older_than_days * 24 * 60 * 60 * 1000).toISOString();
+  const includeUnsquished = input.include_unsquished ?? false;
+  const dryRun = input.dry_run ?? false;
+  const result = storage.pruneTranscriptLines({
+    older_than_iso: olderThanIso,
+    include_unsquished: includeUnsquished,
+    run_id: input.run_id,
+    limit: input.limit ?? 1000,
+    dry_run: dryRun,
+  });
+
+  return {
+    older_than_iso: olderThanIso,
+    include_unsquished: includeUnsquished,
+    run_id: input.run_id ?? null,
+    dry_run: dryRun,
+    candidate_count: result.candidate_count,
+    deleted_count: result.deleted_count,
+    deleted_ids: result.deleted_ids,
+  };
+}
+
+function squishRun(
+  storage: Storage,
+  input: Pick<z.infer<typeof transcriptSquishSchema>, "run_id" | "limit" | "max_points">
+): SquishRunResult {
   const unsquished = storage.getUnsquishedTranscriptLines(input.run_id, input.limit ?? 200);
   if (unsquished.length === 0) {
     return {
@@ -101,6 +302,200 @@ export function squishTranscript(
     memory_created_at: memory.created_at,
     squished_count: squished.updated_count,
     keywords,
+  };
+}
+
+function getAutoSquishStatus() {
+  return {
+    running: autoSquishRuntime.running,
+    in_tick: autoSquishRuntime.in_tick,
+    config: { ...autoSquishRuntime.config },
+    started_at: autoSquishRuntime.started_at,
+    last_tick_at: autoSquishRuntime.last_tick_at,
+    last_error: autoSquishRuntime.last_error,
+    stats: {
+      tick_count: autoSquishRuntime.tick_count,
+      total_runs_processed: autoSquishRuntime.total_runs_processed,
+      total_lines_squished: autoSquishRuntime.total_lines_squished,
+      total_memories_created: autoSquishRuntime.total_memories_created,
+    },
+  };
+}
+
+function resolveAutoSquishConfig(
+  input:
+    | z.infer<typeof transcriptAutoSquishSchema>
+    | Partial<Pick<z.infer<typeof transcriptAutoSquishSchema>, "interval_seconds" | "batch_runs" | "per_run_limit" | "max_points">>,
+  fallback: AutoSquishConfig
+): AutoSquishConfig {
+  return {
+    interval_seconds: input.interval_seconds ?? fallback.interval_seconds ?? DEFAULT_AUTO_SQUISH_CONFIG.interval_seconds,
+    batch_runs: input.batch_runs ?? fallback.batch_runs ?? DEFAULT_AUTO_SQUISH_CONFIG.batch_runs,
+    per_run_limit: input.per_run_limit ?? fallback.per_run_limit ?? DEFAULT_AUTO_SQUISH_CONFIG.per_run_limit,
+    max_points: input.max_points ?? fallback.max_points ?? DEFAULT_AUTO_SQUISH_CONFIG.max_points,
+  };
+}
+
+function startAutoSquishDaemon(storage: Storage) {
+  stopAutoSquishDaemon();
+  autoSquishRuntime.running = true;
+  autoSquishRuntime.in_tick = false;
+  autoSquishRuntime.started_at = new Date().toISOString();
+  autoSquishRuntime.last_error = null;
+  autoSquishRuntime.timer = setInterval(() => {
+    try {
+      runAutoSquishTick(storage, autoSquishRuntime.config);
+    } catch (error) {
+      autoSquishRuntime.last_error = error instanceof Error ? error.message : String(error);
+    }
+  }, autoSquishRuntime.config.interval_seconds * 1000);
+  autoSquishRuntime.timer.unref?.();
+}
+
+function stopAutoSquishDaemon() {
+  if (autoSquishRuntime.timer) {
+    clearInterval(autoSquishRuntime.timer);
+  }
+  autoSquishRuntime.timer = null;
+  autoSquishRuntime.running = false;
+  autoSquishRuntime.in_tick = false;
+}
+
+function runAutoSquishTick(storage: Storage, config: AutoSquishConfig): AutoSquishTickResult {
+  if (autoSquishRuntime.in_tick) {
+    const completedAt = new Date().toISOString();
+    return {
+      completed_at: completedAt,
+      runs_seen: 0,
+      runs_processed: 0,
+      memories_created: 0,
+      lines_squished: 0,
+      run_results: [],
+      skipped: true,
+      reason: "tick-in-progress",
+    };
+  }
+
+  autoSquishRuntime.in_tick = true;
+  try {
+    const pending = storage.listTranscriptRunsWithPending(config.batch_runs);
+    const runResults: AutoSquishRunResult[] = [];
+    const runErrors: string[] = [];
+    let linesSquished = 0;
+    let memoriesCreated = 0;
+    let runsProcessed = 0;
+
+    for (const run of pending) {
+      try {
+        const result = squishRun(storage, {
+          run_id: run.run_id,
+          limit: config.per_run_limit,
+          max_points: config.max_points,
+        });
+        runResults.push({
+          run_id: run.run_id,
+          unsquished_before: run.unsquished_count,
+          created_memory: result.created_memory,
+          squished_count: result.squished_count,
+          memory_id: result.memory_id,
+          reason: result.reason,
+        });
+        runsProcessed += 1;
+        linesSquished += result.squished_count;
+        if (result.created_memory) {
+          memoriesCreated += 1;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        runErrors.push(`${run.run_id}: ${message}`);
+        runResults.push({
+          run_id: run.run_id,
+          unsquished_before: run.unsquished_count,
+          created_memory: false,
+          squished_count: 0,
+          error: message,
+        });
+      }
+    }
+
+    const completedAt = new Date().toISOString();
+    autoSquishRuntime.tick_count += 1;
+    autoSquishRuntime.total_runs_processed += runsProcessed;
+    autoSquishRuntime.total_lines_squished += linesSquished;
+    autoSquishRuntime.total_memories_created += memoriesCreated;
+    autoSquishRuntime.last_tick_at = completedAt;
+    autoSquishRuntime.last_error = runErrors.length
+      ? `${runErrors.length} run(s) failed: ${runErrors[0]}`
+      : null;
+
+    return {
+      completed_at: completedAt,
+      runs_seen: pending.length,
+      runs_processed: runsProcessed,
+      memories_created: memoriesCreated,
+      lines_squished: linesSquished,
+      run_results: runResults,
+      reason: runErrors.length ? autoSquishRuntime.last_error ?? undefined : undefined,
+    };
+  } catch (error) {
+    const completedAt = new Date().toISOString();
+    const message = error instanceof Error ? error.message : String(error);
+    autoSquishRuntime.tick_count += 1;
+    autoSquishRuntime.last_tick_at = completedAt;
+    autoSquishRuntime.last_error = message;
+    return {
+      completed_at: completedAt,
+      runs_seen: 0,
+      runs_processed: 0,
+      memories_created: 0,
+      lines_squished: 0,
+      run_results: [],
+      reason: message,
+    };
+  } finally {
+    autoSquishRuntime.in_tick = false;
+  }
+}
+
+export function getTranscriptRunTimeline(
+  storage: Storage,
+  input: z.infer<typeof transcriptRunTimelineSchema>
+) {
+  const includeSquished = input.include_squished ?? true;
+  const roleFilter = input.roles?.map((role) => role.trim().toLowerCase()).filter(Boolean) ?? [];
+  const lines = storage
+    .getTranscriptLinesByRun(input.run_id, input.limit ?? 500)
+    .filter((line) => {
+      if (!includeSquished && line.is_squished) {
+        return false;
+      }
+      if (roleFilter.length > 0 && !roleFilter.includes((line.role ?? "").toLowerCase())) {
+        return false;
+      }
+      return true;
+    });
+
+  const first = lines[0];
+  const last = lines[lines.length - 1];
+
+  return {
+    run_id: input.run_id,
+    count: lines.length,
+    include_squished: includeSquished,
+    roles: roleFilter.length > 0 ? roleFilter : undefined,
+    window: first && last ? { from: first.timestamp, to: last.timestamp } : undefined,
+    lines,
+  };
+}
+
+export function getTranscriptPendingRuns(
+  storage: Storage,
+  input: z.infer<typeof transcriptPendingRunsSchema>
+) {
+  const runs = storage.listTranscriptRunsWithPending(input.limit ?? 50);
+  return {
+    count: runs.length,
+    runs,
   };
 }
 

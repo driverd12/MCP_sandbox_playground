@@ -33,6 +33,11 @@ export const memorySearchSchema = z.object({
   include_expired: z.boolean().optional(),
 });
 
+export const memoryGetSchema = z.object({
+  id: z.number().int().min(1),
+  touch: z.boolean().optional(),
+});
+
 export function appendMemory(storage: Storage, input: z.infer<typeof memoryAppendSchema>) {
   const content = (input.content ?? input.text ?? "").trim();
   if (!content) {
@@ -57,6 +62,24 @@ export function searchMemory(storage: Storage, input: z.infer<typeof memorySearc
     query: input.query,
     limit: input.limit ?? 10,
   });
+}
+
+export function getMemory(storage: Storage, input: z.infer<typeof memoryGetSchema>) {
+  const memory = storage.getMemoryById(input.id);
+  if (!memory) {
+    return {
+      found: false,
+      id: input.id,
+    };
+  }
+  if (input.touch ?? true) {
+    const touched = storage.touchMemory(input.id);
+    memory.last_accessed_at = touched.last_accessed_at;
+  }
+  return {
+    found: true,
+    memory,
+  };
 }
 
 function dedupeKeywords(values: string[]): string[] {

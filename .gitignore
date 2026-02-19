@@ -4,4 +4,7 @@ dist/
 .env.local
 .DS_Store
 data/*.sqlite
+data/*.sqlite-shm
+data/*.sqlite-wal
+data/*.sqlite-journal
 coverage/

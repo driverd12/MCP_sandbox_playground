@@ -62,6 +62,20 @@ HTTP (optional local API mode):
 npm run start:http
 ```
 
+## 6b. Smoke Check (HTTP)
+
+Validate the MVP loop using default STDIO mode:
+
+```bash
+./scripts/mvp_smoke.sh
+```
+
+Or against an already-running HTTP server:
+
+```bash
+MCP_SMOKE_TRANSPORT=http MCP_HTTP_BEARER_TOKEN=change-me ./scripts/mvp_smoke.sh
+```
+
 ## 7. IDE MCP Command
 
 Point your MCP client to:

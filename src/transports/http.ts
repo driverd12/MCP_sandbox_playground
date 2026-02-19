@@ -1,6 +1,8 @@
 import http from "node:http";
+import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { logEvent } from "../utils.js";
 
 export type HttpOptions = {
@@ -18,7 +20,7 @@ export async function startHttpTransport(server: Server, options: HttpOptions) {
     throw new Error("MCP_HTTP_BEARER_TOKEN is required for HTTP transport");
   }
 
-  const transport = new StreamableHTTPServerTransport();
+  const transports = new Map<string, StreamableHTTPServerTransport>();
 
   const httpServer = http.createServer((req, res) => {
     if (!validateOrigin(req.headers.origin, options.allowedOrigins)) {
@@ -33,16 +35,18 @@ export async function startHttpTransport(server: Server, options: HttpOptions) {
       return;
     }
 
-    void transport.handleRequest(req, res).catch((error) => {
-      logEvent("http.error", { error: String(error) });
+    void routeRequest(server, transports, req, res).catch((error) => {
+      logEvent("http.error", {
+        error: String(error),
+        method: req.method ?? "unknown",
+        url: req.url ?? "",
+      });
       if (!res.headersSent) {
         res.statusCode = 500;
         res.end("Internal Server Error");
       }
     });
   });
-
-  await server.connect(transport);
 
   await new Promise<void>((resolve) => {
     httpServer.listen(options.port, options.host, () => resolve());
@@ -67,4 +71,88 @@ function validateBearer(authorization: string | undefined, expected: string | nu
   }
   const [scheme, token] = authorization.split(" ");
   return scheme === "Bearer" && token === expected;
+}
+
+async function routeRequest(
+  server: Server,
+  transports: Map<string, StreamableHTTPServerTransport>,
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+) {
+  const method = String(req.method ?? "GET").toUpperCase();
+  const sessionHeader = req.headers["mcp-session-id"];
+  const sessionId = Array.isArray(sessionHeader) ? sessionHeader[0] : sessionHeader;
+
+  if (method === "POST") {
+    const body = await parseJsonBody(req);
+    let transport: StreamableHTTPServerTransport | undefined;
+
+    if (sessionId) {
+      transport = transports.get(sessionId);
+      if (!transport) {
+        res.statusCode = 404;
+        res.end("Unknown MCP session");
+        return;
+      }
+    } else if (isInitializeRequest(body)) {
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (newSessionId) => {
+          transports.set(newSessionId, transport!);
+        },
+      });
+      transport.onclose = () => {
+        const sid = transport?.sessionId;
+        if (sid) {
+          transports.delete(sid);
+        }
+      };
+      await server.connect(transport);
+    } else {
+      res.statusCode = 400;
+      res.end("Missing MCP session id or initialize payload");
+      return;
+    }
+
+    await transport.handleRequest(req, res, body);
+    return;
+  }
+
+  if (method === "GET" || method === "DELETE") {
+    if (!sessionId) {
+      res.statusCode = 400;
+      res.end("Missing MCP session id");
+      return;
+    }
+    const transport = transports.get(sessionId);
+    if (!transport) {
+      res.statusCode = 404;
+      res.end("Unknown MCP session");
+      return;
+    }
+    await transport.handleRequest(req, res);
+    return;
+  }
+
+  res.statusCode = 405;
+  res.end("Method Not Allowed");
+}
+
+async function parseJsonBody(req: http.IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  if (chunks.length === 0) {
+    return undefined;
+  }
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
 }

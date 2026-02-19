@@ -71,8 +71,8 @@ npm test
 
 ## Tool Set
 
-- `memory.append`, `memory.search`
-- `transcript.log`, `transcript.squish`, `transcript.append`, `transcript.summarize`
+- `memory.append`, `memory.get`, `memory.search`
+- `transcript.log`, `transcript.auto_squish`, `transcript.pending_runs`, `transcript.retention`, `transcript.run_timeline`, `transcript.squish`, `transcript.append`, `transcript.summarize`
 - `adr.create`
 - `who_knows`, `knowledge.query`
 - `policy.evaluate`
@@ -87,6 +87,45 @@ npm test
 - `health.tools`, `health.storage`, `health.policy`
 - `incident.open`, `incident.timeline`
 - `query.plan`
+
+## MVP Smoke Check
+
+Run the default smoke check (spawns server via STDIO):
+
+```bash
+./scripts/mvp_smoke.sh
+```
+
+Run against a live HTTP server:
+
+```bash
+MCP_SMOKE_TRANSPORT=http \
+MCP_HTTP_BEARER_TOKEN="change-me" \
+./scripts/mvp_smoke.sh
+```
+
+Optional env overrides:
+
+- `MCP_SMOKE_TRANSPORT` (`stdio` or `http`, default `stdio`)
+- `MCP_SMOKE_URL` (default `http://127.0.0.1:8787/`, HTTP mode only)
+- `MCP_SMOKE_ORIGIN` (default `http://127.0.0.1`, HTTP mode only)
+- `MCP_SMOKE_RUN_ID` (default auto-generated)
+- `MCP_SMOKE_STDIO_COMMAND` (default `node`)
+- `MCP_SMOKE_STDIO_ARGS` (default `dist/server.js`)
+
+## Auto Squish + Retention
+
+Recommended usage pattern:
+
+1. Use `transcript.auto_squish` with `action: "status"` to inspect daemon state.
+2. Use `transcript.auto_squish` with `action: "run_once"` for explicit backlog drain.
+3. Use `transcript.auto_squish` with `action: "start"` for interval-based draining.
+4. Use `transcript.retention` with `dry_run: true` before deleting.
+
+Safety defaults:
+
+- `transcript.retention` only deletes squished lines unless `include_unsquished: true`.
+- `transcript.auto_squish` requires mutation metadata for `start`, `stop`, and `run_once`.
 
 ## Data Migration
 

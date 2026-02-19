@@ -11,7 +11,8 @@
     "test": "npm run build && node --test ./tests/*.test.mjs",
     "start": "node dist/server.js",
     "start:stdio": "node dist/server.js",
-    "start:http": "MCP_HTTP=1 node dist/server.js --http --http-port 8787"
+    "start:http": "MCP_HTTP=1 node dist/server.js --http --http-port 8787",
+    "mvp:smoke": "./scripts/mvp_smoke.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",

@@ -6,14 +6,22 @@ import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from "@modelconte
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { Storage } from "./storage.js";
-import { appendMemory, memoryAppendSchema, memorySearchSchema, searchMemory } from "./tools/memory.js";
+import { appendMemory, getMemory, memoryAppendSchema, memoryGetSchema, memorySearchSchema, searchMemory } from "./tools/memory.js";
 import {
+  applyTranscriptRetention,
+  autoSquishControl,
   appendTranscript,
+  getTranscriptPendingRuns,
+  getTranscriptRunTimeline,
   logTranscript,
   squishTranscript,
   summarizeTranscript,
   transcriptAppendSchema,
+  transcriptAutoSquishSchema,
   transcriptLogSchema,
+  transcriptPendingRunsSchema,
+  transcriptRetentionSchema,
+  transcriptRunTimelineSchema,
   transcriptSquishSchema,
   transcriptSummarizeSchema,
 } from "./tools/transcript.js";
@@ -91,6 +99,10 @@ registerTool("memory.search", "Search long-term memory using lexical matching.",
   searchMemory(storage, input)
 );
 
+registerTool("memory.get", "Fetch a memory by id for deterministic debugging.", memoryGetSchema, (input) =>
+  getMemory(storage, input)
+);
+
 registerTool("transcript.log", "Log raw transcript lines into working memory.", transcriptLogSchema, (input) =>
   runIdempotentMutation({
     storage,
@@ -109,6 +121,41 @@ registerTool("transcript.squish", "Squish raw transcript lines into distilled me
     payload: input,
     execute: () => squishTranscript(storage, input),
   })
+);
+
+registerTool(
+  "transcript.run_timeline",
+  "Read ordered transcript lines for a run with optional filters.",
+  transcriptRunTimelineSchema,
+  (input) => getTranscriptRunTimeline(storage, input)
+);
+
+registerTool(
+  "transcript.pending_runs",
+  "List run ids that still have unsquished transcript lines.",
+  transcriptPendingRunsSchema,
+  (input) => getTranscriptPendingRuns(storage, input)
+);
+
+registerTool(
+  "transcript.auto_squish",
+  "Manage interval-based backlog squishing (status/start/stop/run_once).",
+  transcriptAutoSquishSchema,
+  (input) => autoSquishControl(storage, input)
+);
+
+registerTool(
+  "transcript.retention",
+  "Apply retention policy for old transcript lines with optional dry-run mode.",
+  transcriptRetentionSchema,
+  (input) =>
+    runIdempotentMutation({
+      storage,
+      tool_name: "transcript.retention",
+      mutation: input.mutation,
+      payload: input,
+      execute: () => applyTranscriptRetention(storage, input),
+    })
 );
 
 registerTool("transcript.append", "Append a transcript entry with actor attribution.", transcriptAppendSchema, (input) =>
@@ -218,7 +265,7 @@ registerTool("lock.release", "Release a lease-based lock.", lockReleaseSchema, (
   releaseLock(storage, input)
 );
 
-registerTool("knowledge.promote", "Promote transcript or note content into durable knowledge.", knowledgePromoteSchema, (input) =>
+registerTool("knowledge.promote", "Promote note/transcript/memory/transcript_line content into durable knowledge.", knowledgePromoteSchema, (input) =>
   knowledgePromote(storage, input)
 );
 

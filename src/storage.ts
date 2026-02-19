@@ -453,6 +453,17 @@ export class Storage {
     return mapMemoryRow(row);
   }
 
+  touchMemory(memoryId: number): { touched: boolean; last_accessed_at: string } {
+    const timestamp = new Date().toISOString();
+    const result = this.db
+      .prepare(`UPDATE memories SET last_accessed_at = ? WHERE id = ?`)
+      .run(timestamp, memoryId);
+    return {
+      touched: Number(result.changes ?? 0) > 0,
+      last_accessed_at: timestamp,
+    };
+  }
+
   searchMemories(params: {
     query: string;
     limit: number;
@@ -594,6 +605,20 @@ export class Storage {
     return rows.map((row) => mapTranscriptLineRow(row));
   }
 
+  getTranscriptLineById(lineId: number): TranscriptLineRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT id, run_id, role, content, timestamp, is_squished
+         FROM transcript_lines
+         WHERE id = ?`
+      )
+      .get(lineId) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return mapTranscriptLineRow(row);
+  }
+
   getUnsquishedTranscriptLines(runId: string, limit = 500): TranscriptLineRecord[] {
     const boundedLimit = Math.max(1, Math.min(5000, limit));
     const rows = this.db
@@ -664,6 +689,87 @@ export class Storage {
       return updated;
     });
     return { updated_count: tx(lineIds) };
+  }
+
+  listTranscriptRunsWithPending(limit = 50): Array<{
+    run_id: string;
+    unsquished_count: number;
+    last_timestamp: string;
+  }> {
+    const boundedLimit = Math.max(1, Math.min(500, limit));
+    const rows = this.db
+      .prepare(
+        `SELECT run_id, COUNT(*) AS unsquished_count, MAX(timestamp) AS last_timestamp
+         FROM transcript_lines
+         WHERE run_id IS NOT NULL
+           AND is_squished = 0
+         GROUP BY run_id
+         ORDER BY last_timestamp DESC
+         LIMIT ?`
+      )
+      .all(boundedLimit) as Array<Record<string, unknown>>;
+
+    return rows.map((row) => ({
+      run_id: String(row.run_id ?? ""),
+      unsquished_count: Number(row.unsquished_count ?? 0),
+      last_timestamp: String(row.last_timestamp ?? ""),
+    }));
+  }
+
+  pruneTranscriptLines(params: {
+    older_than_iso: string;
+    include_unsquished: boolean;
+    run_id?: string;
+    limit: number;
+    dry_run?: boolean;
+  }): { candidate_count: number; deleted_count: number; deleted_ids: number[] } {
+    const limit = Math.max(1, Math.min(5000, params.limit));
+    const whereClauses = ["timestamp <= ?"];
+    const values: Array<string | number> = [params.older_than_iso];
+
+    if (!params.include_unsquished) {
+      whereClauses.push("is_squished = 1");
+    }
+    if (params.run_id) {
+      whereClauses.push("run_id = ?");
+      values.push(params.run_id);
+    }
+
+    const idRows = this.db
+      .prepare(
+        `SELECT id
+         FROM transcript_lines
+         WHERE ${whereClauses.join(" AND ")}
+         ORDER BY timestamp ASC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+
+    const ids = idRows.map((row) => Number(row.id ?? 0)).filter((id) => Number.isInteger(id) && id > 0);
+    if (params.dry_run || ids.length === 0) {
+      return {
+        candidate_count: ids.length,
+        deleted_count: 0,
+        deleted_ids: [],
+      };
+    }
+
+    const deleteStmt = this.db.prepare(`DELETE FROM transcript_lines WHERE id = ?`);
+    const tx = this.db.transaction((lineIds: number[]) => {
+      let deleted = 0;
+      for (const lineId of lineIds) {
+        const result = deleteStmt.run(lineId);
+        deleted += Number(result.changes ?? 0);
+      }
+      return deleted;
+    });
+
+    const deletedCount = tx(ids);
+    return {
+      candidate_count: ids.length,
+      deleted_count: deletedCount,
+      deleted_ids: ids,
+    };
   }
 
   getTranscriptById(transcriptId: string): TranscriptRecord | null {

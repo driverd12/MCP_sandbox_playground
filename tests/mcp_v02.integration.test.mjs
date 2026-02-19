@@ -23,6 +23,7 @@ const EXPECTED_TOOLS = [
   "lock.acquire",
   "lock.release",
   "memory.append",
+  "memory.get",
   "memory.search",
   "mutation.check",
   "policy.evaluate",
@@ -36,6 +37,10 @@ const EXPECTED_TOOLS = [
   "run.timeline",
   "simulate.workflow",
   "transcript.log",
+  "transcript.auto_squish",
+  "transcript.pending_runs",
+  "transcript.retention",
+  "transcript.run_timeline",
   "transcript.squish",
   "transcript.append",
   "transcript.summarize",
@@ -56,6 +61,7 @@ const MUTATION_REQUIRED_TOOLS = [
   "run.end",
   "run.step",
   "transcript.log",
+  "transcript.retention",
   "transcript.squish",
   "transcript.append",
   "transcript.summarize",
@@ -135,6 +141,13 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(Array.isArray(memoryMatches));
     assert.ok(memoryMatches.length >= 1);
 
+    const memoryGet = await callTool(client, "memory.get", {
+      id: note.id,
+      touch: true,
+    });
+    assert.equal(memoryGet.found, true);
+    assert.equal(memoryGet.memory.id, note.id);
+
     const mutationCheckReplaySafe = await callTool(client, "mutation.check", {
       tool_name: "memory.append",
       idempotency_key: noteMutation.idempotency_key,
@@ -169,6 +182,15 @@ test("MCP v0.2 integration and safety invariants", async () => {
       content: `Follow-up action for ${testId} should be tested.`,
     });
 
+    const promoteTranscriptLine = await callTool(client, "knowledge.promote", {
+      mutation: nextMutation(testId, "knowledge.promote-line", () => mutationCounter++),
+      source_type: "transcript_line",
+      source_id: String(transcriptLog.id),
+      tags: ["line-promotion"],
+      reason: "transcript line promotion path",
+    });
+    assert.ok(promoteTranscriptLine.memory_id);
+
     const squishMutation = nextMutation(testId, "transcript.squish", () => mutationCounter++);
     const transcriptSquish = await callTool(client, "transcript.squish", {
       mutation: squishMutation,
@@ -185,6 +207,165 @@ test("MCP v0.2 integration and safety invariants", async () => {
       max_points: 6,
     });
     assert.equal(transcriptSquishReplay.replayed, true);
+
+    const transcriptRunTimeline = await callTool(client, "transcript.run_timeline", {
+      run_id: sessionId,
+      include_squished: true,
+      limit: 20,
+    });
+    assert.ok(transcriptRunTimeline.count >= 2);
+    assert.ok(Array.isArray(transcriptRunTimeline.lines));
+
+    const transcriptPendingRuns = await callTool(client, "transcript.pending_runs", {
+      limit: 20,
+    });
+    assert.ok(Array.isArray(transcriptPendingRuns.runs));
+
+    const autoSquishStatus = await callTool(client, "transcript.auto_squish", {
+      action: "status",
+    });
+    assert.equal(typeof autoSquishStatus.running, "boolean");
+    assert.equal(typeof autoSquishStatus.in_tick, "boolean");
+
+    const daemonRunId = `daemon-${testId}`;
+    await callTool(client, "transcript.log", {
+      mutation: nextMutation(testId, "transcript.log-daemon-1", () => mutationCounter++),
+      run_id: daemonRunId,
+      role: "user",
+      content: `Daemon backlog line 1 for ${testId}`,
+    });
+    await callTool(client, "transcript.log", {
+      mutation: nextMutation(testId, "transcript.log-daemon-2", () => mutationCounter++),
+      run_id: daemonRunId,
+      role: "assistant",
+      content: `Daemon backlog line 2 for ${testId}`,
+    });
+
+    const pendingBeforeAutoSquish = await callTool(client, "transcript.pending_runs", {
+      limit: 50,
+    });
+    assert.ok(
+      pendingBeforeAutoSquish.runs.some((run) => run.run_id === daemonRunId),
+      "Expected daemon run to appear in pending backlog before auto squish run_once"
+    );
+
+    const autoSquishRunOnce = await callTool(client, "transcript.auto_squish", {
+      action: "run_once",
+      mutation: nextMutation(testId, "transcript.auto_squish-run-once", () => mutationCounter++),
+      batch_runs: 50,
+      per_run_limit: 500,
+      max_points: 6,
+    });
+    assert.ok(autoSquishRunOnce.tick);
+    assert.ok(Array.isArray(autoSquishRunOnce.tick.run_results));
+    assert.ok(
+      autoSquishRunOnce.tick.run_results.some((run) => run.run_id === daemonRunId && run.created_memory === true),
+      "Expected run_once to squish daemon run into a memory"
+    );
+
+    const pendingAfterAutoSquish = await callTool(client, "transcript.pending_runs", {
+      limit: 50,
+    });
+    assert.equal(
+      pendingAfterAutoSquish.runs.some((run) => run.run_id === daemonRunId),
+      false,
+      "Expected daemon run to be drained from pending backlog after run_once"
+    );
+
+    const autoSquishStart = await callTool(client, "transcript.auto_squish", {
+      action: "start",
+      mutation: nextMutation(testId, "transcript.auto_squish-start", () => mutationCounter++),
+      interval_seconds: 30,
+      batch_runs: 10,
+      per_run_limit: 200,
+      max_points: 8,
+      run_immediately: false,
+    });
+    assert.equal(autoSquishStart.running, true);
+
+    const autoSquishRunningStatus = await callTool(client, "transcript.auto_squish", {
+      action: "status",
+    });
+    assert.equal(autoSquishRunningStatus.running, true);
+
+    const autoSquishStop = await callTool(client, "transcript.auto_squish", {
+      action: "stop",
+      mutation: nextMutation(testId, "transcript.auto_squish-stop", () => mutationCounter++),
+    });
+    assert.equal(autoSquishStop.running, false);
+
+    const retentionRunId = `retention-${testId}`;
+    await callTool(client, "transcript.log", {
+      mutation: nextMutation(testId, "transcript.log-retention-1", () => mutationCounter++),
+      run_id: retentionRunId,
+      role: "user",
+      content: `Retention squished line 1 for ${testId}`,
+    });
+    await callTool(client, "transcript.log", {
+      mutation: nextMutation(testId, "transcript.log-retention-2", () => mutationCounter++),
+      run_id: retentionRunId,
+      role: "assistant",
+      content: `Retention squished line 2 for ${testId}`,
+    });
+    await callTool(client, "transcript.squish", {
+      mutation: nextMutation(testId, "transcript.squish-retention", () => mutationCounter++),
+      run_id: retentionRunId,
+      max_points: 6,
+    });
+
+    const retentionDryRun = await callTool(client, "transcript.retention", {
+      mutation: nextMutation(testId, "transcript.retention-dry", () => mutationCounter++),
+      older_than_days: 0,
+      run_id: retentionRunId,
+      limit: 100,
+      dry_run: true,
+    });
+    assert.ok(retentionDryRun.candidate_count >= 1);
+    assert.equal(retentionDryRun.deleted_count, 0);
+
+    const retentionApply = await callTool(client, "transcript.retention", {
+      mutation: nextMutation(testId, "transcript.retention-apply", () => mutationCounter++),
+      older_than_days: 0,
+      run_id: retentionRunId,
+      limit: 100,
+      dry_run: false,
+    });
+    assert.ok(retentionApply.deleted_count >= 1);
+
+    const retentionTimeline = await callTool(client, "transcript.run_timeline", {
+      run_id: retentionRunId,
+      include_squished: true,
+      limit: 50,
+    });
+    assert.equal(retentionTimeline.count, 0);
+
+    const retentionRawRunId = `retention-raw-${testId}`;
+    await callTool(client, "transcript.log", {
+      mutation: nextMutation(testId, "transcript.log-retention-raw", () => mutationCounter++),
+      run_id: retentionRawRunId,
+      role: "user",
+      content: `Retention raw unsquished line for ${testId}`,
+    });
+
+    const retentionRawProtected = await callTool(client, "transcript.retention", {
+      mutation: nextMutation(testId, "transcript.retention-raw-safe", () => mutationCounter++),
+      older_than_days: 0,
+      run_id: retentionRawRunId,
+      include_unsquished: false,
+      limit: 100,
+      dry_run: true,
+    });
+    assert.equal(retentionRawProtected.candidate_count, 0);
+
+    const retentionRawApply = await callTool(client, "transcript.retention", {
+      mutation: nextMutation(testId, "transcript.retention-raw-apply", () => mutationCounter++),
+      older_than_days: 0,
+      run_id: retentionRawRunId,
+      include_unsquished: true,
+      limit: 100,
+      dry_run: false,
+    });
+    assert.ok(retentionRawApply.deleted_count >= 1);
 
     const transcript = await callTool(client, "transcript.append", {
       mutation: nextMutation(testId, "transcript.append", () => mutationCounter++),
@@ -348,13 +529,13 @@ test("MCP v0.2 integration and safety invariants", async () => {
 
     const promoted = await callTool(client, "knowledge.promote", {
       mutation: nextMutation(testId, "knowledge.promote", () => mutationCounter++),
-      source_type: "note",
-      source_id: transcriptSummary.note_id,
+      source_type: "memory",
+      source_id: String(note.id),
       tags: ["promotion-test"],
       reason: "promotion path validation",
       source_client: "codex-tests",
     });
-    assert.ok(promoted.note_id);
+    assert.ok(promoted.memory_id);
 
     const promoteMissingSourceError = await callToolExpectError(client, "knowledge.promote", {
       mutation: nextMutation(testId, "knowledge.promote-missing", () => mutationCounter++),

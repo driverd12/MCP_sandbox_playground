@@ -6,10 +6,10 @@ const trustTierSchema = z.enum(["raw", "verified", "policy-backed", "deprecated"
 
 export const knowledgePromoteSchema = z.object({
   mutation: mutationSchema,
-  source_type: z.enum(["note", "transcript"]),
+  source_type: z.enum(["note", "transcript", "memory", "transcript_line"]),
   source_id: z.string().min(1),
   promoted_text: z.string().optional(),
-  trust_tier: trustTierSchema.default("verified"),
+  trust_tier: trustTierSchema.optional(),
   tags: z.array(z.string()).optional(),
   reason: z.string().optional(),
   expires_in_days: z.number().int().min(1).max(3650).optional(),
@@ -46,41 +46,32 @@ export async function knowledgePromote(storage: Storage, input: z.infer<typeof k
     mutation: input.mutation,
     payload: input,
     execute: () => {
-      const source =
-        input.source_type === "note"
-          ? storage.getNoteById(input.source_id)
-          : storage.getTranscriptById(input.source_id);
-
-      if (!source) {
-        throw new Error(`Source ${input.source_type} not found: ${input.source_id}`);
-      }
-
+      const source = resolvePromoteSource(storage, input.source_type, input.source_id);
       const promotedText = input.promoted_text ?? source.text;
-      const expiresAt = input.expires_in_days
-        ? new Date(Date.now() + input.expires_in_days * 24 * 60 * 60 * 1000).toISOString()
-        : undefined;
+      const keywords = dedupeKeywords([
+        "promoted",
+        input.source_type,
+        ...source.keywords,
+        ...(input.tags ?? []),
+      ]);
 
-      const note = storage.insertNote({
-        text: promotedText,
-        source:
-          input.source_type === "note"
-            ? `promoted:note:${input.source_id}`
-            : `promoted:transcript:${input.source_id}`,
-        source_client: input.source_client,
-        source_model: input.source_model,
-        source_agent: input.source_agent,
-        trust_tier: input.trust_tier as TrustTier,
-        expires_at: expiresAt,
-        promoted_from_note_id: input.source_type === "note" ? input.source_id : undefined,
-        tags: ["promoted", input.source_type, ...(input.tags ?? [])],
-        related_paths: input.reason ? [input.reason] : undefined,
+      const memory = storage.insertMemory({
+        content: promotedText,
+        keywords,
       });
 
       return {
-        note_id: note.id,
-        created_at: note.created_at,
+        memory_id: memory.id,
+        created_at: memory.created_at,
         source_type: input.source_type,
         source_id: input.source_id,
+        keywords,
+        source_client: input.source_client,
+        source_model: input.source_model,
+        source_agent: input.source_agent,
+        reason: input.reason,
+        trust_tier_ignored: input.trust_tier ? input.trust_tier : undefined,
+        expires_in_days_ignored: input.expires_in_days ?? undefined,
       };
     },
   });
@@ -268,4 +259,65 @@ function recencyBoost(nowMs: number, createdAtIso: string): number {
     return 0.5;
   }
   return 0;
+}
+
+function resolvePromoteSource(
+  storage: Storage,
+  sourceType: z.infer<typeof knowledgePromoteSchema>["source_type"],
+  sourceId: string
+): { text: string; keywords: string[] } {
+  if (sourceType === "note") {
+    const note = storage.getNoteById(sourceId);
+    if (!note) {
+      throw new Error(`Source ${sourceType} not found: ${sourceId}`);
+    }
+    return { text: note.text, keywords: note.tags };
+  }
+  if (sourceType === "transcript") {
+    const transcript = storage.getTranscriptById(sourceId);
+    if (!transcript) {
+      throw new Error(`Source ${sourceType} not found: ${sourceId}`);
+    }
+    return {
+      text: transcript.text,
+      keywords: [transcript.kind, transcript.session_id].filter(Boolean),
+    };
+  }
+  if (sourceType === "memory") {
+    const memoryId = parseNumericId(sourceType, sourceId);
+    const memory = storage.getMemoryById(memoryId);
+    if (!memory) {
+      throw new Error(`Source ${sourceType} not found: ${sourceId}`);
+    }
+    return { text: memory.content, keywords: memory.keywords };
+  }
+
+  const lineId = parseNumericId(sourceType, sourceId);
+  const line = storage.getTranscriptLineById(lineId);
+  if (!line) {
+    throw new Error(`Source ${sourceType} not found: ${sourceId}`);
+  }
+  return {
+    text: line.content,
+    keywords: [line.role ?? "", line.run_id ?? ""].filter(Boolean),
+  };
+}
+
+function parseNumericId(sourceType: string, sourceId: string): number {
+  const parsed = Number(sourceId);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Source id for ${sourceType} must be a positive integer: ${sourceId}`);
+  }
+  return parsed;
+}
+
+function dedupeKeywords(values: string[]): string[] {
+  const unique = new Set<string>();
+  for (const value of values) {
+    const keyword = value.trim().toLowerCase();
+    if (keyword) {
+      unique.add(keyword);
+    }
+  }
+  return Array.from(unique);
 }

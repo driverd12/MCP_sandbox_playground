@@ -35,6 +35,7 @@ Notes:
 - SQLite defaults to `./data/hub.sqlite`.
 - Override DB path with `ANAMNESIS_HUB_DB_PATH=/absolute/path/to/hub.sqlite`.
 - Legacy fallback: `MCP_HUB_DB_PATH=/absolute/path/to/hub.sqlite`.
+- Startup applies deterministic schema migrations and records them in `schema_migrations`.
 
 ## HTTP (Streamable)
 
@@ -87,6 +88,7 @@ npm test
 - `health.tools`, `health.storage`, `health.policy`
 - `incident.open`, `incident.timeline`
 - `query.plan`
+- `migration.status`
 
 ## MVP Smoke Check
 
@@ -126,6 +128,7 @@ Safety defaults:
 
 - `transcript.retention` only deletes squished lines unless `include_unsquished: true`.
 - `transcript.auto_squish` requires mutation metadata for `start`, `stop`, and `run_once`.
+- `transcript.auto_squish` persists daemon state/config, so restart restores previous mode.
 
 ## Data Migration
 

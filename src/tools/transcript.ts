@@ -145,6 +145,33 @@ const autoSquishRuntime: {
   total_memories_created: 0,
 };
 
+export function initializeAutoSquishDaemon(storage: Storage) {
+  const persisted = storage.getTranscriptAutoSquishState();
+  if (!persisted) {
+    autoSquishRuntime.config = { ...DEFAULT_AUTO_SQUISH_CONFIG };
+    stopAutoSquishDaemon();
+    return {
+      restored: false,
+      running: false,
+      config: { ...autoSquishRuntime.config },
+    };
+  }
+
+  autoSquishRuntime.config = resolveAutoSquishConfig(persisted, DEFAULT_AUTO_SQUISH_CONFIG);
+  if (persisted.enabled) {
+    startAutoSquishDaemon(storage);
+  } else {
+    stopAutoSquishDaemon();
+  }
+
+  return {
+    restored: true,
+    running: autoSquishRuntime.running,
+    config: { ...autoSquishRuntime.config },
+    updated_at: persisted.updated_at,
+  };
+}
+
 export function appendTranscript(
   storage: Storage,
   input: z.infer<typeof transcriptAppendSchema>
@@ -220,6 +247,13 @@ export function autoSquishControl(
           started: !wasRunning,
           updated: wasRunning,
           config: { ...autoSquishRuntime.config },
+          persisted: storage.setTranscriptAutoSquishState({
+            enabled: true,
+            interval_seconds: autoSquishRuntime.config.interval_seconds,
+            batch_runs: autoSquishRuntime.config.batch_runs,
+            per_run_limit: autoSquishRuntime.config.per_run_limit,
+            max_points: autoSquishRuntime.config.max_points,
+          }),
           initial_tick: initialTick,
           status: getAutoSquishStatus(),
         };
@@ -231,6 +265,13 @@ export function autoSquishControl(
         return {
           running: false,
           stopped: wasRunning,
+          persisted: storage.setTranscriptAutoSquishState({
+            enabled: false,
+            interval_seconds: autoSquishRuntime.config.interval_seconds,
+            batch_runs: autoSquishRuntime.config.batch_runs,
+            per_run_limit: autoSquishRuntime.config.per_run_limit,
+            max_points: autoSquishRuntime.config.max_points,
+          }),
           status: getAutoSquishStatus(),
         };
       }

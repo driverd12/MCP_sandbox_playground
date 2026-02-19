@@ -25,6 +25,7 @@ const EXPECTED_TOOLS = [
   "memory.append",
   "memory.get",
   "memory.search",
+  "migration.status",
   "mutation.check",
   "policy.evaluate",
   "postflight.verify",
@@ -628,10 +629,27 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.equal(healthStorage.ok, true);
     assert.equal(path.resolve(healthStorage.db_path), path.resolve(dbPath));
     assert.equal(healthStorage.db_exists, true);
+    assert.ok(healthStorage.schema_version >= 2);
+    assert.equal(typeof healthStorage.table_counts.schema_migrations, "number");
+    assert.equal(typeof healthStorage.table_counts.daemon_configs, "number");
 
     const healthPolicy = await callTool(client, "health.policy", {});
     assert.equal(healthPolicy.ok, true);
     assert.ok(healthPolicy.enforced_rules.length >= 3);
+
+    const migrationStatus = await callTool(client, "migration.status", {});
+    assert.ok(migrationStatus.schema_version >= 2);
+    assert.ok(Array.isArray(migrationStatus.applied_versions));
+    assert.ok(
+      migrationStatus.applied_versions.some((entry) => entry.version === 1),
+      "Expected migration version 1 to be present"
+    );
+    assert.ok(
+      migrationStatus.applied_versions.some((entry) => entry.version === 2),
+      "Expected migration version 2 to be present"
+    );
+    assert.equal(typeof migrationStatus.recorded_count, "number");
+    assert.equal(typeof migrationStatus.inferred_count, "number");
 
     const adr = await callTool(client, "adr.create", {
       mutation: nextMutation(testId, "adr.create", () => mutationCounter++),

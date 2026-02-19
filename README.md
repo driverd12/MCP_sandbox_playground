@@ -9,10 +9,12 @@ Anamnesis is designed as a "Shared Apartment" for agents. Different clients and 
 ## Features
 
 - Local SQLite storage (`./data/hub.sqlite` by default)
+- Versioned SQLite migrations with `schema_migrations` + `PRAGMA user_version`
 - Idempotent mutation journal (`idempotency_key` + `side_effect_fingerprint`)
 - Shared memory and transcript tooling across clients
 - Transcript squishing loop (`transcript.log` -> `transcript.squish` -> `memory.search`)
 - Interval backlog drain daemon (`transcript.auto_squish`)
+- Auto-squish daemon config persisted across server restarts
 - Retention policy control for transcript working memory (`transcript.retention`)
 - ADR creation helper (`adr.create`) writing to `./docs/adrs/`
 - Policy/preflight/postflight safety tools
@@ -66,6 +68,7 @@ Run the baseline smoke check with `npm run mvp:smoke`.
 - Use `transcript.run_timeline` for deterministic debugging of a single run.
 - Use `transcript.auto_squish` in `status`, `run_once`, `start`, and `stop` modes to automate backlog draining.
 - Use `transcript.retention` with `dry_run: true` first, then apply deletion once candidates are verified.
+- Use `migration.status` to confirm applied schema versions independently of health checks.
 - Use `memory.get` to inspect exact long-term records by id when triaging behavior.
 - Use `knowledge.promote` with `source_type` set to `memory` or `transcript_line` to elevate proven details.
 - Run `./scripts/mvp_smoke.sh` before handoff to verify end-to-end health (default `stdio`, optional `http`).

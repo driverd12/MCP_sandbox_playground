@@ -10,6 +10,7 @@ import { appendMemory, getMemory, memoryAppendSchema, memoryGetSchema, memorySea
 import {
   applyTranscriptRetention,
   autoSquishControl,
+  initializeAutoSquishDaemon,
   appendTranscript,
   getTranscriptPendingRuns,
   getTranscriptRunTimeline,
@@ -38,6 +39,7 @@ import { simulateWorkflow, simulateWorkflowSchema } from "./tools/simulate.js";
 import { healthPolicy, healthPolicySchema, healthStorage, healthStorageSchema, healthTools, healthToolsSchema } from "./tools/health.js";
 import { incidentOpen, incidentOpenSchema, incidentTimeline, incidentTimelineSchema } from "./tools/incident.js";
 import { queryPlan, queryPlanSchema } from "./tools/query_plan.js";
+import { migrationStatus, migrationStatusSchema } from "./tools/migration.js";
 import { runIdempotentMutation } from "./tools/mutation.js";
 import { startStdioTransport } from "./transports/stdio.js";
 import { startHttpTransport } from "./transports/http.js";
@@ -55,6 +57,7 @@ const storagePath = storagePathEnv
   : path.join(repoRoot, "data", "hub.sqlite");
 const storage = new Storage(storagePath);
 storage.init();
+initializeAutoSquishDaemon(storage);
 
 const server = new Server(
   {
@@ -313,6 +316,10 @@ registerTool("incident.timeline", "Read incident timeline events.", incidentTime
 
 registerTool("query.plan", "Produce a confidence-scored query plan with evidence citations.", queryPlanSchema, (input) =>
   queryPlan(storage, input)
+);
+
+registerTool("migration.status", "Read applied schema migration versions and metadata.", migrationStatusSchema, () =>
+  migrationStatus(storage)
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({

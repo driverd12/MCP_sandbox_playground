@@ -111,6 +111,27 @@ export type IncidentEventRecord = {
   source_agent: string | null;
 };
 
+export type TranscriptAutoSquishStateRecord = {
+  enabled: boolean;
+  interval_seconds: number;
+  batch_runs: number;
+  per_run_limit: number;
+  max_points: number;
+  updated_at: string;
+};
+
+export type MigrationStatusRecord = {
+  schema_version: number;
+  applied_versions: Array<{
+    version: number;
+    name: string | null;
+    applied_at: string | null;
+    source: "recorded" | "inferred-user-version";
+  }>;
+  recorded_count: number;
+  inferred_count: number;
+};
+
 export class Storage {
   private db: Database.Database;
 
@@ -126,165 +147,64 @@ export class Storage {
 
   init(): void {
     this.db.pragma("journal_mode = WAL");
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS notes (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        source TEXT,
-        source_client TEXT,
-        source_model TEXT,
-        source_agent TEXT,
-        trust_tier TEXT NOT NULL DEFAULT 'raw',
-        expires_at TEXT,
-        promoted_from_note_id TEXT,
-        tags_json TEXT NOT NULL,
-        related_paths_json TEXT NOT NULL,
-        text TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS transcripts (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        source_client TEXT NOT NULL,
-        source_model TEXT,
-        source_agent TEXT,
-        kind TEXT NOT NULL,
-        text TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS transcript_lines (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id TEXT,
-        role TEXT,
-        content TEXT,
-        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-        is_squished BOOLEAN DEFAULT 0
-      );
-      CREATE TABLE IF NOT EXISTS memories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        content TEXT,
-        keywords TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        last_accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        decay_score REAL DEFAULT 1.0
-      );
-      CREATE TABLE IF NOT EXISTS adrs (
-        id TEXT PRIMARY KEY,
-        title TEXT,
-        status TEXT,
-        content TEXT
-      );
-      CREATE TABLE IF NOT EXISTS mutation_journal (
-        idempotency_key TEXT PRIMARY KEY,
-        tool_name TEXT NOT NULL,
-        side_effect_fingerprint TEXT NOT NULL,
-        payload_hash TEXT,
-        status TEXT NOT NULL,
-        result_json TEXT,
-        error_text TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS policy_evaluations (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        policy_name TEXT NOT NULL,
-        input_json TEXT NOT NULL,
-        allowed INTEGER NOT NULL,
-        reason TEXT,
-        violations_json TEXT NOT NULL,
-        recommendations_json TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS run_events (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        run_id TEXT NOT NULL,
-        event_type TEXT NOT NULL,
-        step_index INTEGER NOT NULL,
-        status TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        source_client TEXT,
-        source_model TEXT,
-        source_agent TEXT,
-        details_json TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS locks (
-        lock_key TEXT PRIMARY KEY,
-        owner_id TEXT NOT NULL,
-        lease_expires_at TEXT NOT NULL,
-        metadata_json TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS decisions (
-        decision_id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        title TEXT NOT NULL,
-        rationale TEXT NOT NULL,
-        consequences TEXT,
-        rollback TEXT,
-        links_json TEXT NOT NULL,
-        tags_json TEXT NOT NULL,
-        run_id TEXT,
-        source_client TEXT,
-        source_model TEXT,
-        source_agent TEXT
-      );
-      CREATE TABLE IF NOT EXISTS decision_links (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        decision_id TEXT NOT NULL,
-        entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        relation TEXT NOT NULL,
-        details_json TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS incidents (
-        incident_id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        severity TEXT NOT NULL,
-        status TEXT NOT NULL,
-        title TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        tags_json TEXT NOT NULL,
-        source_client TEXT,
-        source_model TEXT,
-        source_agent TEXT
-      );
-      CREATE TABLE IF NOT EXISTS incident_events (
-        id TEXT PRIMARY KEY,
-        created_at TEXT NOT NULL,
-        incident_id TEXT NOT NULL,
-        event_type TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        details_json TEXT NOT NULL,
-        source_client TEXT,
-        source_model TEXT,
-        source_agent TEXT
-      );
-    `);
+    this.ensureMigrationTable();
+    this.applyPendingMigrations([
+      {
+        version: 1,
+        name: "bootstrap-core-schema",
+        run: () => this.applyCoreSchemaMigration(),
+      },
+      {
+        version: 2,
+        name: "add-daemon-config-storage",
+        run: () => this.applyDaemonConfigMigration(),
+      },
+    ]);
+  }
 
-    this.ensureColumn("notes", "source_client", "TEXT");
-    this.ensureColumn("notes", "source_model", "TEXT");
-    this.ensureColumn("notes", "source_agent", "TEXT");
-    this.ensureColumn("notes", "trust_tier", "TEXT NOT NULL DEFAULT 'raw'");
-    this.ensureColumn("notes", "expires_at", "TEXT");
-    this.ensureColumn("notes", "promoted_from_note_id", "TEXT");
-    this.ensureColumn("transcripts", "source_model", "TEXT");
-    this.ensureColumn("transcripts", "source_agent", "TEXT");
+  getSchemaVersion(): number {
+    return readUserVersion(this.db);
+  }
 
-    this.ensureIndex("idx_notes_created", "notes", "created_at DESC");
-    this.ensureIndex("idx_notes_trust", "notes", "trust_tier");
-    this.ensureIndex("idx_transcripts_session", "transcripts", "session_id, created_at ASC");
-    this.ensureIndex("idx_transcript_lines_run", "transcript_lines", "run_id, timestamp ASC");
-    this.ensureIndex("idx_transcript_lines_squished", "transcript_lines", "is_squished, timestamp ASC");
-    this.ensureIndex("idx_memories_created", "memories", "created_at DESC");
-    this.ensureIndex("idx_memories_last_accessed", "memories", "last_accessed_at DESC");
-    this.ensureIndex("idx_memories_keywords", "memories", "keywords");
-    this.ensureIndex("idx_adrs_status", "adrs", "status");
-    this.ensureIndex("idx_run_events_run", "run_events", "run_id, created_at ASC");
-    this.ensureIndex("idx_incident_events_incident", "incident_events", "incident_id, created_at ASC");
+  getMigrationStatus(): MigrationStatusRecord {
+    const schemaVersion = this.getSchemaVersion();
+    const rows = this.db
+      .prepare(
+        `SELECT version, name, applied_at
+         FROM schema_migrations
+         ORDER BY version ASC`
+      )
+      .all() as Array<Record<string, unknown>>;
+
+    const recorded = rows
+      .map((row) => ({
+        version: Number(row.version ?? 0),
+        name: asNullableString(row.name),
+        applied_at: asNullableString(row.applied_at),
+        source: "recorded" as const,
+      }))
+      .filter((entry) => Number.isInteger(entry.version) && entry.version > 0);
+
+    const recordedVersionSet = new Set<number>(recorded.map((entry) => entry.version));
+    const inferred: MigrationStatusRecord["applied_versions"] = [];
+    for (let version = 1; version <= schemaVersion; version += 1) {
+      if (!recordedVersionSet.has(version)) {
+        inferred.push({
+          version,
+          name: null,
+          applied_at: null,
+          source: "inferred-user-version",
+        });
+      }
+    }
+
+    const appliedVersions = [...recorded, ...inferred].sort((a, b) => a.version - b.version);
+    return {
+      schema_version: schemaVersion,
+      applied_versions: appliedVersions,
+      recorded_count: recorded.length,
+      inferred_count: inferred.length,
+    };
   }
 
   insertNote(params: {
@@ -769,6 +689,69 @@ export class Storage {
       candidate_count: ids.length,
       deleted_count: deletedCount,
       deleted_ids: ids,
+    };
+  }
+
+  getTranscriptAutoSquishState(): TranscriptAutoSquishStateRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT enabled, config_json, updated_at
+         FROM daemon_configs
+         WHERE daemon_key = ?`
+      )
+      .get("transcript.auto_squish") as Record<string, unknown> | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    const config = parseJsonObject(row.config_json);
+    return {
+      enabled: Number(row.enabled ?? 0) === 1,
+      interval_seconds: parseBoundedInt(config.interval_seconds, 60, 5, 3600),
+      batch_runs: parseBoundedInt(config.batch_runs, 10, 1, 200),
+      per_run_limit: parseBoundedInt(config.per_run_limit, 200, 1, 5000),
+      max_points: parseBoundedInt(config.max_points, 8, 3, 20),
+      updated_at: String(row.updated_at ?? ""),
+    };
+  }
+
+  setTranscriptAutoSquishState(params: {
+    enabled: boolean;
+    interval_seconds: number;
+    batch_runs: number;
+    per_run_limit: number;
+    max_points: number;
+  }): TranscriptAutoSquishStateRecord {
+    const now = new Date().toISOString();
+    const normalized = {
+      enabled: Boolean(params.enabled),
+      interval_seconds: parseBoundedInt(params.interval_seconds, 60, 5, 3600),
+      batch_runs: parseBoundedInt(params.batch_runs, 10, 1, 200),
+      per_run_limit: parseBoundedInt(params.per_run_limit, 200, 1, 5000),
+      max_points: parseBoundedInt(params.max_points, 8, 3, 20),
+    };
+    const configJson = stableStringify({
+      interval_seconds: normalized.interval_seconds,
+      batch_runs: normalized.batch_runs,
+      per_run_limit: normalized.per_run_limit,
+      max_points: normalized.max_points,
+    });
+
+    this.db
+      .prepare(
+        `INSERT INTO daemon_configs (daemon_key, enabled, config_json, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(daemon_key) DO UPDATE SET
+           enabled = excluded.enabled,
+           config_json = excluded.config_json,
+           updated_at = excluded.updated_at`
+      )
+      .run("transcript.auto_squish", normalized.enabled ? 1 : 0, configJson, now);
+
+    return {
+      ...normalized,
+      updated_at: now,
     };
   }
 
@@ -1394,6 +1377,8 @@ export class Storage {
       "decision_links",
       "incidents",
       "incident_events",
+      "schema_migrations",
+      "daemon_configs",
     ] as const;
     const counts: Record<string, number> = {};
     for (const table of tables) {
@@ -1401,6 +1386,236 @@ export class Storage {
       counts[table] = Number(row.count ?? 0);
     }
     return counts;
+  }
+
+  private ensureMigrationTable(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      );
+    `);
+  }
+
+  private applyPendingMigrations(
+    migrations: Array<{ version: number; name: string; run: () => void }>
+  ): void {
+    const appliedVersions = this.getAppliedMigrationVersions();
+    for (const migration of migrations) {
+      if (appliedVersions.has(migration.version)) {
+        continue;
+      }
+      this.applyMigration(migration.version, migration.name, migration.run);
+      appliedVersions.add(migration.version);
+    }
+  }
+
+  private getAppliedMigrationVersions(): Set<number> {
+    const rows = this.db
+      .prepare(`SELECT version FROM schema_migrations ORDER BY version ASC`)
+      .all() as Array<Record<string, unknown>>;
+    const versions = new Set<number>();
+    for (const row of rows) {
+      const version = Number(row.version ?? 0);
+      if (Number.isInteger(version) && version > 0) {
+        versions.add(version);
+      }
+    }
+
+    const userVersion = readUserVersion(this.db);
+    for (let version = 1; version <= userVersion; version += 1) {
+      versions.add(version);
+    }
+    return versions;
+  }
+
+  private applyMigration(version: number, name: string, run: () => void): void {
+    const apply = this.db.transaction(() => {
+      run();
+      const appliedAt = new Date().toISOString();
+      this.db
+        .prepare(
+          `INSERT INTO schema_migrations (version, name, applied_at)
+           VALUES (?, ?, ?)`
+        )
+        .run(version, name, appliedAt);
+      this.db.exec(`PRAGMA user_version = ${version}`);
+    });
+    apply();
+  }
+
+  private applyCoreSchemaMigration(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS notes (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        source TEXT,
+        source_client TEXT,
+        source_model TEXT,
+        source_agent TEXT,
+        trust_tier TEXT NOT NULL DEFAULT 'raw',
+        expires_at TEXT,
+        promoted_from_note_id TEXT,
+        tags_json TEXT NOT NULL,
+        related_paths_json TEXT NOT NULL,
+        text TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS transcripts (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        source_client TEXT NOT NULL,
+        source_model TEXT,
+        source_agent TEXT,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS transcript_lines (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT,
+        role TEXT,
+        content TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        is_squished BOOLEAN DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT,
+        keywords TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        decay_score REAL DEFAULT 1.0
+      );
+      CREATE TABLE IF NOT EXISTS adrs (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        status TEXT,
+        content TEXT
+      );
+      CREATE TABLE IF NOT EXISTS mutation_journal (
+        idempotency_key TEXT PRIMARY KEY,
+        tool_name TEXT NOT NULL,
+        side_effect_fingerprint TEXT NOT NULL,
+        payload_hash TEXT,
+        status TEXT NOT NULL,
+        result_json TEXT,
+        error_text TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS policy_evaluations (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        policy_name TEXT NOT NULL,
+        input_json TEXT NOT NULL,
+        allowed INTEGER NOT NULL,
+        reason TEXT,
+        violations_json TEXT NOT NULL,
+        recommendations_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS run_events (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        source_client TEXT,
+        source_model TEXT,
+        source_agent TEXT,
+        details_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS locks (
+        lock_key TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS decisions (
+        decision_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        title TEXT NOT NULL,
+        rationale TEXT NOT NULL,
+        consequences TEXT,
+        rollback TEXT,
+        links_json TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        run_id TEXT,
+        source_client TEXT,
+        source_model TEXT,
+        source_agent TEXT
+      );
+      CREATE TABLE IF NOT EXISTS decision_links (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        details_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS incidents (
+        incident_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        status TEXT NOT NULL,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        source_client TEXT,
+        source_model TEXT,
+        source_agent TEXT
+      );
+      CREATE TABLE IF NOT EXISTS incident_events (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        incident_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        source_client TEXT,
+        source_model TEXT,
+        source_agent TEXT
+      );
+    `);
+
+    this.ensureColumn("notes", "source_client", "TEXT");
+    this.ensureColumn("notes", "source_model", "TEXT");
+    this.ensureColumn("notes", "source_agent", "TEXT");
+    this.ensureColumn("notes", "trust_tier", "TEXT NOT NULL DEFAULT 'raw'");
+    this.ensureColumn("notes", "expires_at", "TEXT");
+    this.ensureColumn("notes", "promoted_from_note_id", "TEXT");
+    this.ensureColumn("transcripts", "source_model", "TEXT");
+    this.ensureColumn("transcripts", "source_agent", "TEXT");
+
+    this.ensureIndex("idx_notes_created", "notes", "created_at DESC");
+    this.ensureIndex("idx_notes_trust", "notes", "trust_tier");
+    this.ensureIndex("idx_transcripts_session", "transcripts", "session_id, created_at ASC");
+    this.ensureIndex("idx_transcript_lines_run", "transcript_lines", "run_id, timestamp ASC");
+    this.ensureIndex("idx_transcript_lines_squished", "transcript_lines", "is_squished, timestamp ASC");
+    this.ensureIndex("idx_memories_created", "memories", "created_at DESC");
+    this.ensureIndex("idx_memories_last_accessed", "memories", "last_accessed_at DESC");
+    this.ensureIndex("idx_memories_keywords", "memories", "keywords");
+    this.ensureIndex("idx_adrs_status", "adrs", "status");
+    this.ensureIndex("idx_run_events_run", "run_events", "run_id, created_at ASC");
+    this.ensureIndex("idx_incident_events_incident", "incident_events", "incident_id, created_at ASC");
+  }
+
+  private applyDaemonConfigMigration(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS daemon_configs (
+        daemon_key TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 0,
+        config_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -1571,6 +1786,24 @@ function sortObject(value: unknown): unknown {
     return sorted;
   }
   return value;
+}
+
+function readUserVersion(db: Database.Database): number {
+  const value = db.pragma("user_version", { simple: true }) as unknown;
+  const parsed = Number(value ?? 0);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    return 0;
+  }
+  return parsed;
+}
+
+function parseBoundedInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  const bounded = Math.max(min, Math.min(max, Math.round(parsed)));
+  return bounded;
 }
 
 function computeTermScore(text: string, query?: string): number {

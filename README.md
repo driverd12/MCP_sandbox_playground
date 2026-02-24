@@ -19,6 +19,7 @@ Anamnesis is designed as a "Shared Apartment" for agents. Different clients and 
 - Durable Imprint profile + continuity snapshots (`imprint.profile_set`, `imprint.snapshot`, `imprint.bootstrap`)
 - Interval-based Imprint snapshot daemon (`imprint.auto_snapshot`)
 - Local inbox queue + worker daemon for unprompted workload execution (`data/imprint/inbox`, `imprint.inbox.enqueue`)
+- Durable task orchestration with leases (`tasks`, `task_events`, `task_leases`, `task.*`)
 - Launchd auto-start support for MCP HTTP server + Imprint auto-snapshot
 - Agent on/off switch (`scripts/agents_switch.sh`) for start/stop/status control
 - ADR creation helper (`adr.create`) writing to `./docs/adrs/`
@@ -49,6 +50,8 @@ Key env vars:
 - `MCP_HUB_DB_PATH` (legacy fallback)
 - `MCP_HTTP_BEARER_TOKEN`
 - `MCP_HTTP_ALLOWED_ORIGINS`
+- `ANAMNESIS_INBOX_POLL_INTERVAL` / `ANAMNESIS_INBOX_BATCH_SIZE`
+- `ANAMNESIS_INBOX_LEASE_SECONDS` / `ANAMNESIS_INBOX_HEARTBEAT_INTERVAL`
 
 ## Test
 
@@ -94,10 +97,16 @@ Run worker manually:
 npm run inbox:worker
 ```
 
+Worker behavior:
+
+- Claims durable tasks from SQLite with renewable leases.
+- Imports legacy file drops from `./data/imprint/inbox/pending` into durable tasks.
+- Archives execution payloads/results in `done` and `failed` for human debugging.
+
 Inbox paths:
 
 - `./data/imprint/inbox/pending` (new tasks)
-- `./data/imprint/inbox/processing` (claimed in-flight tasks)
+- `./data/imprint/inbox/processing` (legacy import staging)
 - `./data/imprint/inbox/done` (completed task + result JSON)
 - `./data/imprint/inbox/failed` (failed task + result JSON)
 
@@ -138,6 +147,8 @@ Switch mapping:
 - Use `imprint.auto_snapshot` (`status`, `run_once`, `start`, `stop`) for periodic continuity capture.
 - Use `imprint.inbox.enqueue` (or `npm run inbox:enqueue`) to submit background workloads.
 - Use `imprint.inbox.list` to inspect backlog and task outcomes.
+- Use `task.create`, `task.list`, and `task.claim` for durable queue orchestration.
+- Use `task.heartbeat`, `task.complete`, `task.fail`, and `task.retry` for lease-aware lifecycle control.
 - Run `./scripts/mvp_smoke.sh` before handoff to verify end-to-end health (default `stdio`, optional `http`).
 
 Suggested loop for multi-agent collaboration:

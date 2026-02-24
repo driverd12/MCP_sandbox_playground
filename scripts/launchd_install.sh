@@ -18,6 +18,8 @@ MCP_PORT="${ANAMNESIS_MCP_HTTP_PORT:-8787}"
 ALLOWED_ORIGINS="${MCP_HTTP_ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1}"
 INBOX_POLL_INTERVAL="${ANAMNESIS_INBOX_POLL_INTERVAL:-5}"
 INBOX_BATCH_SIZE="${ANAMNESIS_INBOX_BATCH_SIZE:-3}"
+INBOX_LEASE_SECONDS="${ANAMNESIS_INBOX_LEASE_SECONDS:-300}"
+INBOX_HEARTBEAT_INTERVAL="${ANAMNESIS_INBOX_HEARTBEAT_INTERVAL:-30}"
 NODE_BIN="$(command -v node || true)"
 if [[ -z "${NODE_BIN}" ]]; then
   echo "error: node not found in PATH" >&2
@@ -155,6 +157,10 @@ cat >"${WORKER_PLIST}" <<PLIST
       <string>${INBOX_POLL_INTERVAL}</string>
       <string>--batch-size</string>
       <string>${INBOX_BATCH_SIZE}</string>
+      <string>--lease-seconds</string>
+      <string>${INBOX_LEASE_SECONDS}</string>
+      <string>--heartbeat-interval</string>
+      <string>${INBOX_HEARTBEAT_INTERVAL}</string>
     </array>
 
     <key>WorkingDirectory</key>

@@ -80,6 +80,7 @@ npm test
 - `who_knows`, `knowledge.query`
 - `policy.evaluate`
 - `run.begin`, `run.step`, `run.end`, `run.timeline`
+- `task.create`, `task.list`, `task.claim`, `task.heartbeat`, `task.complete`, `task.fail`, `task.retry`
 - `mutation.check`
 - `preflight.check`, `postflight.verify`
 - `lock.acquire`, `lock.release`
@@ -133,7 +134,7 @@ npm run imprint:bootstrap
 
 ## Launchd Auto-Start + Switches
 
-Install login-time services for local MCP HTTP and imprint auto-snapshot:
+Install login-time services for local MCP HTTP, imprint auto-snapshot, and inbox worker:
 
 ```bash
 npm run launchd:install

@@ -43,6 +43,13 @@ const EXPECTED_TOOLS = [
   "run.end",
   "run.step",
   "run.timeline",
+  "task.claim",
+  "task.complete",
+  "task.create",
+  "task.fail",
+  "task.heartbeat",
+  "task.list",
+  "task.retry",
   "simulate.workflow",
   "transcript.log",
   "transcript.auto_squish",
@@ -71,6 +78,12 @@ const MUTATION_REQUIRED_TOOLS = [
   "run.begin",
   "run.end",
   "run.step",
+  "task.claim",
+  "task.complete",
+  "task.create",
+  "task.fail",
+  "task.heartbeat",
+  "task.retry",
   "transcript.log",
   "transcript.retention",
   "transcript.squish",
@@ -250,6 +263,104 @@ test("MCP v0.2 integration and safety invariants", async () => {
       inboxPending.tasks.some((task) => task.task_id === inboxTask.task_id),
       "Expected enqueued task in pending inbox list"
     );
+
+    const workerId = `worker-${testId}`;
+    const durableTaskId = `task-${testId}-a`;
+    const durableTask = await callTool(client, "task.create", {
+      mutation: nextMutation(testId, "task.create-a", () => mutationCounter++),
+      task_id: durableTaskId,
+      objective: `Review project health for ${testId}`,
+      project_dir: REPO_ROOT,
+      payload: {
+        dry_run: true,
+        max_steps: 3,
+        command_timeout: 60,
+      },
+      priority: 5,
+      tags: ["integration", "durable-task"],
+      source: "integration-suite",
+    });
+    assert.equal(durableTask.created, true);
+    assert.equal(durableTask.task.task_id, durableTaskId);
+    assert.equal(durableTask.task.status, "pending");
+
+    const durablePendingList = await callTool(client, "task.list", {
+      status: "pending",
+      limit: 200,
+    });
+    assert.ok(
+      durablePendingList.tasks.some((task) => task.task_id === durableTaskId),
+      "Expected durable task in pending list"
+    );
+
+    const claimedTask = await callTool(client, "task.claim", {
+      mutation: nextMutation(testId, "task.claim-a", () => mutationCounter++),
+      task_id: durableTaskId,
+      worker_id: workerId,
+      lease_seconds: 120,
+    });
+    assert.equal(claimedTask.claimed, true);
+    assert.equal(claimedTask.task.task_id, durableTaskId);
+    assert.equal(claimedTask.task.status, "running");
+    assert.equal(claimedTask.task.lease.owner_id, workerId);
+
+    const heartbeatTask = await callTool(client, "task.heartbeat", {
+      mutation: nextMutation(testId, "task.heartbeat-a", () => mutationCounter++),
+      task_id: durableTaskId,
+      worker_id: workerId,
+      lease_seconds: 180,
+    });
+    assert.equal(heartbeatTask.ok, true);
+
+    const completedTask = await callTool(client, "task.complete", {
+      mutation: nextMutation(testId, "task.complete-a", () => mutationCounter++),
+      task_id: durableTaskId,
+      worker_id: workerId,
+      result: { ok: true, source: "integration" },
+    });
+    assert.equal(completedTask.completed, true);
+    assert.equal(completedTask.task.task_id, durableTaskId);
+    assert.equal(completedTask.task.status, "completed");
+
+    const durableTaskIdB = `task-${testId}-b`;
+    await callTool(client, "task.create", {
+      mutation: nextMutation(testId, "task.create-b", () => mutationCounter++),
+      task_id: durableTaskIdB,
+      objective: `Run follow-up checks for ${testId}`,
+      project_dir: REPO_ROOT,
+      payload: {
+        dry_run: true,
+      },
+      priority: 2,
+    });
+
+    const claimedTaskB = await callTool(client, "task.claim", {
+      mutation: nextMutation(testId, "task.claim-b", () => mutationCounter++),
+      task_id: durableTaskIdB,
+      worker_id: workerId,
+      lease_seconds: 120,
+    });
+    assert.equal(claimedTaskB.claimed, true);
+    assert.equal(claimedTaskB.task.status, "running");
+
+    const failedTaskB = await callTool(client, "task.fail", {
+      mutation: nextMutation(testId, "task.fail-b", () => mutationCounter++),
+      task_id: durableTaskIdB,
+      worker_id: workerId,
+      error: "simulated integration failure",
+      result: { exit_code: 1 },
+    });
+    assert.equal(failedTaskB.failed, true);
+    assert.equal(failedTaskB.task.status, "failed");
+
+    const retriedTaskB = await callTool(client, "task.retry", {
+      mutation: nextMutation(testId, "task.retry-b", () => mutationCounter++),
+      task_id: durableTaskIdB,
+      delay_seconds: 0,
+      reason: "integration retry path",
+    });
+    assert.equal(retriedTaskB.retried, true);
+    assert.equal(retriedTaskB.task.status, "pending");
 
     const mutationCheckReplaySafe = await callTool(client, "mutation.check", {
       tool_name: "memory.append",

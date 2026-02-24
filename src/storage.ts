@@ -53,6 +53,43 @@ export type MemoryRecord = {
   score?: number;
 };
 
+export type TaskStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
+
+export type TaskRecord = {
+  task_id: string;
+  created_at: string;
+  updated_at: string;
+  status: TaskStatus;
+  priority: number;
+  objective: string;
+  project_dir: string;
+  payload: Record<string, unknown>;
+  source: string | null;
+  source_client: string | null;
+  source_model: string | null;
+  source_agent: string | null;
+  tags: string[];
+  metadata: Record<string, unknown>;
+  max_attempts: number;
+  attempt_count: number;
+  available_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  last_worker_id: string | null;
+  last_error: string | null;
+  result: Record<string, unknown> | null;
+  lease: TaskLeaseRecord | null;
+};
+
+export type TaskLeaseRecord = {
+  task_id: string;
+  owner_id: string;
+  lease_expires_at: string;
+  heartbeat_at: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export type MutationMeta = {
   idempotency_key: string;
   side_effect_fingerprint: string;
@@ -204,6 +241,11 @@ export class Storage {
         version: 3,
         name: "add-imprint-schema",
         run: () => this.applyImprintSchemaMigration(),
+      },
+      {
+        version: 4,
+        name: "add-task-orchestrator-schema",
+        run: () => this.applyTaskSchemaMigration(),
       },
     ]);
   }
@@ -1143,6 +1185,612 @@ export class Storage {
     return Number(row.count ?? 0);
   }
 
+  createTask(params: {
+    task_id?: string;
+    objective: string;
+    project_dir: string;
+    payload?: Record<string, unknown>;
+    priority?: number;
+    max_attempts?: number;
+    available_at?: string;
+    source?: string;
+    source_client?: string;
+    source_model?: string;
+    source_agent?: string;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+  }): { created: boolean; task: TaskRecord } {
+    const now = new Date().toISOString();
+    const taskId = params.task_id?.trim() || crypto.randomUUID();
+    const existing = this.getTaskById(taskId);
+    if (existing) {
+      return {
+        created: false,
+        task: existing,
+      };
+    }
+
+    const objective = params.objective.trim();
+    if (!objective) {
+      throw new Error("task objective is required");
+    }
+    const projectDir = params.project_dir.trim();
+    if (!projectDir) {
+      throw new Error("task project_dir is required");
+    }
+
+    const priority = parseBoundedInt(params.priority, 0, 0, 100);
+    const maxAttempts = parseBoundedInt(params.max_attempts, 3, 1, 20);
+    const availableAt = normalizeIsoTimestamp(params.available_at, now);
+    const tags = dedupeNonEmpty(params.tags ?? []);
+    const payload = params.payload ?? {};
+    const metadata = params.metadata ?? {};
+
+    const create = this.db.transaction(() => {
+      const inserted = this.db
+        .prepare(
+          `INSERT INTO tasks (
+             task_id, created_at, updated_at, status, priority, objective, project_dir,
+             payload_json, source, source_client, source_model, source_agent,
+             tags_json, metadata_json, max_attempts, attempt_count, available_at,
+             started_at, finished_at, last_worker_id, last_error, result_json
+           ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, NULL, NULL, NULL, NULL)
+           ON CONFLICT(task_id) DO NOTHING`
+        )
+        .run(
+          taskId,
+          now,
+          now,
+          priority,
+          objective,
+          projectDir,
+          stableStringify(payload),
+          params.source ?? null,
+          params.source_client ?? null,
+          params.source_model ?? null,
+          params.source_agent ?? null,
+          stableStringify(tags),
+          stableStringify(metadata),
+          maxAttempts,
+          availableAt
+        );
+      const insertedCount = Number(inserted.changes ?? 0);
+      if (insertedCount > 0) {
+        this.appendTaskEvent({
+          task_id: taskId,
+          event_type: "created",
+          to_status: "pending",
+          summary: "Task created.",
+          details: {
+            priority,
+            max_attempts: maxAttempts,
+          },
+        });
+      }
+      return insertedCount > 0;
+    });
+    const created = create();
+
+    const task = this.getTaskById(taskId);
+    if (!task) {
+      throw new Error(`Failed to read task after create: ${taskId}`);
+    }
+    return {
+      created,
+      task,
+    };
+  }
+
+  listTasks(params: {
+    status?: TaskStatus;
+    limit: number;
+  }): TaskRecord[] {
+    const limit = Math.max(1, Math.min(500, params.limit));
+    const rows = params.status
+      ? (this.db
+          .prepare(
+            `SELECT t.task_id, t.created_at, t.updated_at, t.status, t.priority, t.objective, t.project_dir,
+                    t.payload_json, t.source, t.source_client, t.source_model, t.source_agent,
+                    t.tags_json, t.metadata_json, t.max_attempts, t.attempt_count, t.available_at,
+                    t.started_at, t.finished_at, t.last_worker_id, t.last_error, t.result_json,
+                    l.owner_id AS lease_owner_id, l.lease_expires_at AS lease_expires_at,
+                    l.heartbeat_at AS lease_heartbeat_at, l.created_at AS lease_created_at, l.updated_at AS lease_updated_at
+             FROM tasks t
+             LEFT JOIN task_leases l ON l.task_id = t.task_id
+             WHERE t.status = ?
+             ORDER BY t.priority DESC, t.created_at ASC
+             LIMIT ?`
+          )
+          .all(params.status, limit) as Array<Record<string, unknown>>)
+      : (this.db
+          .prepare(
+            `SELECT t.task_id, t.created_at, t.updated_at, t.status, t.priority, t.objective, t.project_dir,
+                    t.payload_json, t.source, t.source_client, t.source_model, t.source_agent,
+                    t.tags_json, t.metadata_json, t.max_attempts, t.attempt_count, t.available_at,
+                    t.started_at, t.finished_at, t.last_worker_id, t.last_error, t.result_json,
+                    l.owner_id AS lease_owner_id, l.lease_expires_at AS lease_expires_at,
+                    l.heartbeat_at AS lease_heartbeat_at, l.created_at AS lease_created_at, l.updated_at AS lease_updated_at
+             FROM tasks t
+             LEFT JOIN task_leases l ON l.task_id = t.task_id
+             ORDER BY
+               CASE t.status
+                 WHEN 'running' THEN 0
+                 WHEN 'pending' THEN 1
+                 WHEN 'failed' THEN 2
+                 WHEN 'completed' THEN 3
+                 ELSE 4
+               END,
+               t.priority DESC,
+               t.updated_at DESC
+             LIMIT ?`
+          )
+          .all(limit) as Array<Record<string, unknown>>);
+    return rows.map((row) => mapTaskRow(row));
+  }
+
+  getTaskById(taskId: string): TaskRecord | null {
+    const normalized = taskId.trim();
+    if (!normalized) {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT t.task_id, t.created_at, t.updated_at, t.status, t.priority, t.objective, t.project_dir,
+                t.payload_json, t.source, t.source_client, t.source_model, t.source_agent,
+                t.tags_json, t.metadata_json, t.max_attempts, t.attempt_count, t.available_at,
+                t.started_at, t.finished_at, t.last_worker_id, t.last_error, t.result_json,
+                l.owner_id AS lease_owner_id, l.lease_expires_at AS lease_expires_at,
+                l.heartbeat_at AS lease_heartbeat_at, l.created_at AS lease_created_at, l.updated_at AS lease_updated_at
+         FROM tasks t
+         LEFT JOIN task_leases l ON l.task_id = t.task_id
+         WHERE t.task_id = ?`
+      )
+      .get(normalized) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return mapTaskRow(row);
+  }
+
+  claimTask(params: {
+    worker_id: string;
+    lease_seconds: number;
+    task_id?: string;
+  }): { claimed: boolean; reason: string; task?: TaskRecord; lease_expires_at?: string } {
+    const workerId = params.worker_id.trim();
+    if (!workerId) {
+      throw new Error("worker_id is required");
+    }
+    const leaseSeconds = parseBoundedInt(params.lease_seconds, 300, 15, 86400);
+    const now = new Date().toISOString();
+    const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+
+    const claim = this.db.transaction(() => {
+      let candidateId: string | null = null;
+      if (params.task_id && params.task_id.trim()) {
+        const specific = this.db
+          .prepare(
+            `SELECT t.task_id, t.status, t.available_at, l.owner_id AS lease_owner_id, l.lease_expires_at
+             FROM tasks t
+             LEFT JOIN task_leases l ON l.task_id = t.task_id
+             WHERE t.task_id = ?`
+          )
+          .get(params.task_id.trim()) as Record<string, unknown> | undefined;
+        if (!specific) {
+          return {
+            claimed: false,
+            reason: "not-found",
+          };
+        }
+        const status = normalizeTaskStatus(specific.status);
+        const availableAt = String(specific.available_at ?? "");
+        const leaseOwner = asNullableString(specific.lease_owner_id);
+        const leaseExpiry = asNullableString(specific.lease_expires_at);
+        if (status !== "pending") {
+          return {
+            claimed: false,
+            reason: `not-pending:${status}`,
+          };
+        }
+        if (availableAt > now) {
+          return {
+            claimed: false,
+            reason: "not-ready",
+          };
+        }
+        if (leaseOwner && leaseExpiry && leaseExpiry > now) {
+          return {
+            claimed: false,
+            reason: "leased",
+          };
+        }
+        candidateId = String(specific.task_id ?? "");
+      } else {
+        const candidate = this.db
+          .prepare(
+            `SELECT t.task_id
+             FROM tasks t
+             LEFT JOIN task_leases l ON l.task_id = t.task_id
+             WHERE t.status = 'pending'
+               AND t.available_at <= ?
+               AND (l.task_id IS NULL OR l.lease_expires_at <= ?)
+             ORDER BY t.priority DESC, t.created_at ASC
+             LIMIT 1`
+          )
+          .get(now, now) as Record<string, unknown> | undefined;
+        if (!candidate) {
+          return {
+            claimed: false,
+            reason: "none-available",
+          };
+        }
+        candidateId = String(candidate.task_id ?? "");
+      }
+
+      const updated = this.db
+        .prepare(
+          `UPDATE tasks
+           SET status = 'running',
+               updated_at = ?,
+               attempt_count = attempt_count + 1,
+               started_at = ?,
+               finished_at = NULL,
+               last_worker_id = ?
+           WHERE task_id = ?
+             AND status = 'pending'
+             AND available_at <= ?`
+        )
+        .run(now, now, workerId, candidateId, now);
+      if (Number(updated.changes ?? 0) <= 0) {
+        return {
+          claimed: false,
+          reason: "race-lost",
+        };
+      }
+
+      this.db
+        .prepare(
+          `INSERT INTO task_leases (task_id, owner_id, lease_expires_at, heartbeat_at, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(task_id) DO UPDATE SET
+             owner_id = excluded.owner_id,
+             lease_expires_at = excluded.lease_expires_at,
+             heartbeat_at = excluded.heartbeat_at,
+             updated_at = excluded.updated_at`
+        )
+        .run(candidateId, workerId, leaseExpiresAt, now, now, now);
+
+      this.appendTaskEvent({
+        task_id: candidateId,
+        event_type: "claimed",
+        from_status: "pending",
+        to_status: "running",
+        worker_id: workerId,
+        summary: "Task claimed for execution.",
+        details: {
+          lease_seconds: leaseSeconds,
+          lease_expires_at: leaseExpiresAt,
+        },
+      });
+
+      const task = this.getTaskById(candidateId);
+      if (!task) {
+        throw new Error(`Claimed task vanished: ${candidateId}`);
+      }
+      return {
+        claimed: true,
+        reason: "claimed",
+        task,
+        lease_expires_at: leaseExpiresAt,
+      };
+    });
+
+    return claim();
+  }
+
+  heartbeatTaskLease(params: {
+    task_id: string;
+    worker_id: string;
+    lease_seconds: number;
+  }): {
+    ok: boolean;
+    reason: string;
+    task_id: string;
+    owner_id?: string;
+    lease_expires_at?: string;
+    heartbeat_at?: string;
+  } {
+    const taskId = params.task_id.trim();
+    const workerId = params.worker_id.trim();
+    if (!taskId || !workerId) {
+      throw new Error("task_id and worker_id are required");
+    }
+    const leaseSeconds = parseBoundedInt(params.lease_seconds, 300, 15, 86400);
+    const now = new Date().toISOString();
+    const leaseExpiresAt = new Date(Date.now() + leaseSeconds * 1000).toISOString();
+    const lease = this.db
+      .prepare(
+        `SELECT owner_id, lease_expires_at
+         FROM task_leases
+         WHERE task_id = ?`
+      )
+      .get(taskId) as Record<string, unknown> | undefined;
+    if (!lease) {
+      return {
+        ok: false,
+        reason: "lease-not-found",
+        task_id: taskId,
+      };
+    }
+    const ownerId = String(lease.owner_id ?? "");
+    if (ownerId !== workerId) {
+      return {
+        ok: false,
+        reason: "owner-mismatch",
+        task_id: taskId,
+        owner_id: ownerId,
+        lease_expires_at: String(lease.lease_expires_at ?? ""),
+      };
+    }
+
+    const heartbeat = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `UPDATE task_leases
+           SET lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+           WHERE task_id = ?`
+        )
+        .run(leaseExpiresAt, now, now, taskId);
+      this.db
+        .prepare(`UPDATE tasks SET updated_at = ? WHERE task_id = ?`)
+        .run(now, taskId);
+      this.appendTaskEvent({
+        task_id: taskId,
+        event_type: "heartbeat",
+        from_status: "running",
+        to_status: "running",
+        worker_id: workerId,
+        summary: "Task lease heartbeat.",
+        details: {
+          lease_seconds: leaseSeconds,
+          lease_expires_at: leaseExpiresAt,
+        },
+      });
+    });
+    heartbeat();
+
+    return {
+      ok: true,
+      reason: "heartbeat-recorded",
+      task_id: taskId,
+      owner_id: workerId,
+      lease_expires_at: leaseExpiresAt,
+      heartbeat_at: now,
+    };
+  }
+
+  completeTask(params: {
+    task_id: string;
+    worker_id: string;
+    result?: Record<string, unknown>;
+    summary?: string;
+  }): { completed: boolean; reason: string; task?: TaskRecord } {
+    const taskId = params.task_id.trim();
+    const workerId = params.worker_id.trim();
+    if (!taskId || !workerId) {
+      throw new Error("task_id and worker_id are required");
+    }
+    const now = new Date().toISOString();
+
+    const complete = this.db.transaction(() => {
+      const lease = this.db
+        .prepare(`SELECT owner_id FROM task_leases WHERE task_id = ?`)
+        .get(taskId) as Record<string, unknown> | undefined;
+      if (!lease) {
+        return {
+          completed: false,
+          reason: "lease-not-found",
+        };
+      }
+      const ownerId = String(lease.owner_id ?? "");
+      if (ownerId !== workerId) {
+        return {
+          completed: false,
+          reason: "owner-mismatch",
+        };
+      }
+      const updated = this.db
+        .prepare(
+          `UPDATE tasks
+           SET status = 'completed',
+               updated_at = ?,
+               finished_at = ?,
+               last_worker_id = ?,
+               last_error = NULL,
+               result_json = ?
+           WHERE task_id = ?
+             AND status = 'running'`
+        )
+        .run(now, now, workerId, stableStringify(params.result ?? {}), taskId);
+      if (Number(updated.changes ?? 0) <= 0) {
+        return {
+          completed: false,
+          reason: "not-running",
+        };
+      }
+      this.db.prepare(`DELETE FROM task_leases WHERE task_id = ?`).run(taskId);
+      this.appendTaskEvent({
+        task_id: taskId,
+        event_type: "completed",
+        from_status: "running",
+        to_status: "completed",
+        worker_id: workerId,
+        summary: params.summary?.trim() || "Task completed successfully.",
+        details: {
+          result_keys: Object.keys(params.result ?? {}),
+        },
+      });
+      const task = this.getTaskById(taskId);
+      return {
+        completed: true,
+        reason: "completed",
+        task: task ?? undefined,
+      };
+    });
+    return complete();
+  }
+
+  failTask(params: {
+    task_id: string;
+    worker_id: string;
+    error: string;
+    result?: Record<string, unknown>;
+    summary?: string;
+  }): { failed: boolean; reason: string; task?: TaskRecord } {
+    const taskId = params.task_id.trim();
+    const workerId = params.worker_id.trim();
+    const errorText = params.error.trim();
+    if (!taskId || !workerId || !errorText) {
+      throw new Error("task_id, worker_id, and error are required");
+    }
+    const now = new Date().toISOString();
+
+    const fail = this.db.transaction(() => {
+      const lease = this.db
+        .prepare(`SELECT owner_id FROM task_leases WHERE task_id = ?`)
+        .get(taskId) as Record<string, unknown> | undefined;
+      if (!lease) {
+        return {
+          failed: false,
+          reason: "lease-not-found",
+        };
+      }
+      const ownerId = String(lease.owner_id ?? "");
+      if (ownerId !== workerId) {
+        return {
+          failed: false,
+          reason: "owner-mismatch",
+        };
+      }
+      const updated = this.db
+        .prepare(
+          `UPDATE tasks
+           SET status = 'failed',
+               updated_at = ?,
+               finished_at = ?,
+               last_worker_id = ?,
+               last_error = ?,
+               result_json = ?
+           WHERE task_id = ?
+             AND status = 'running'`
+        )
+        .run(now, now, workerId, errorText, stableStringify(params.result ?? {}), taskId);
+      if (Number(updated.changes ?? 0) <= 0) {
+        return {
+          failed: false,
+          reason: "not-running",
+        };
+      }
+      this.db.prepare(`DELETE FROM task_leases WHERE task_id = ?`).run(taskId);
+      this.appendTaskEvent({
+        task_id: taskId,
+        event_type: "failed",
+        from_status: "running",
+        to_status: "failed",
+        worker_id: workerId,
+        summary: params.summary?.trim() || "Task failed during execution.",
+        details: {
+          error: errorText,
+          result_keys: Object.keys(params.result ?? {}),
+        },
+      });
+      const task = this.getTaskById(taskId);
+      return {
+        failed: true,
+        reason: "failed",
+        task: task ?? undefined,
+      };
+    });
+    return fail();
+  }
+
+  retryTask(params: {
+    task_id: string;
+    delay_seconds: number;
+    reason?: string;
+    force?: boolean;
+  }): { retried: boolean; reason: string; task?: TaskRecord; available_at?: string } {
+    const taskId = params.task_id.trim();
+    if (!taskId) {
+      throw new Error("task_id is required");
+    }
+    const delaySeconds = parseBoundedInt(params.delay_seconds, 0, 0, 86400);
+    const now = new Date().toISOString();
+    const availableAt = new Date(Date.now() + delaySeconds * 1000).toISOString();
+
+    const retry = this.db.transaction(() => {
+      const existing = this.db
+        .prepare(`SELECT status, attempt_count, max_attempts FROM tasks WHERE task_id = ?`)
+        .get(taskId) as Record<string, unknown> | undefined;
+      if (!existing) {
+        return {
+          retried: false,
+          reason: "not-found",
+        };
+      }
+      const status = normalizeTaskStatus(existing.status);
+      const attemptCount = Number(existing.attempt_count ?? 0);
+      const maxAttempts = Number(existing.max_attempts ?? 3);
+      if (status !== "failed" && status !== "cancelled") {
+        return {
+          retried: false,
+          reason: `not-retryable:${status}`,
+        };
+      }
+      if (!params.force && attemptCount >= maxAttempts) {
+        return {
+          retried: false,
+          reason: "max-attempts-exceeded",
+        };
+      }
+
+      this.db
+        .prepare(
+          `UPDATE tasks
+           SET status = 'pending',
+               updated_at = ?,
+               available_at = ?,
+               started_at = NULL,
+               finished_at = NULL,
+               last_error = NULL,
+               result_json = NULL
+           WHERE task_id = ?`
+        )
+        .run(now, availableAt, taskId);
+      this.db.prepare(`DELETE FROM task_leases WHERE task_id = ?`).run(taskId);
+      this.appendTaskEvent({
+        task_id: taskId,
+        event_type: "retried",
+        from_status: status,
+        to_status: "pending",
+        summary: params.reason?.trim() || "Task scheduled for retry.",
+        details: {
+          delay_seconds: delaySeconds,
+          available_at: availableAt,
+          force: Boolean(params.force),
+        },
+      });
+      const task = this.getTaskById(taskId);
+      return {
+        retried: true,
+        reason: "retried",
+        task: task ?? undefined,
+        available_at: availableAt,
+      };
+    });
+    return retry();
+  }
+
   getTranscriptById(transcriptId: string): TranscriptRecord | null {
     const row = this.db
       .prepare(
@@ -1769,6 +2417,10 @@ export class Storage {
       "daemon_configs",
       "imprint_profiles",
       "imprint_snapshots",
+      "tasks",
+      "task_events",
+      "task_leases",
+      "task_artifacts",
     ] as const;
     const counts: Record<string, number> = {};
     for (const table of tables) {
@@ -2045,6 +2697,99 @@ export class Storage {
     this.ensureIndex("idx_imprint_snapshots_profile", "imprint_snapshots", "profile_id, created_at DESC");
   }
 
+  private applyTaskSchemaMigration(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        task_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        status TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 0,
+        objective TEXT NOT NULL,
+        project_dir TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        source TEXT,
+        source_client TEXT,
+        source_model TEXT,
+        source_agent TEXT,
+        tags_json TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        max_attempts INTEGER NOT NULL DEFAULT 3,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        available_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        last_worker_id TEXT,
+        last_error TEXT,
+        result_json TEXT
+      );
+      CREATE TABLE IF NOT EXISTS task_events (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        from_status TEXT,
+        to_status TEXT,
+        worker_id TEXT,
+        summary TEXT,
+        details_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS task_leases (
+        task_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        lease_expires_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS task_artifacts (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        path TEXT,
+        content_json TEXT
+      );
+    `);
+
+    this.ensureIndex("idx_tasks_status_available", "tasks", "status, available_at, priority DESC, created_at ASC");
+    this.ensureIndex("idx_tasks_updated", "tasks", "updated_at DESC");
+    this.ensureIndex("idx_task_events_task", "task_events", "task_id, created_at ASC");
+    this.ensureIndex("idx_task_leases_expiry", "task_leases", "lease_expires_at ASC");
+    this.ensureIndex("idx_task_artifacts_task", "task_artifacts", "task_id, created_at ASC");
+  }
+
+  private appendTaskEvent(params: {
+    task_id: string;
+    event_type: string;
+    from_status?: TaskStatus;
+    to_status?: TaskStatus;
+    worker_id?: string;
+    summary?: string;
+    details?: Record<string, unknown>;
+  }): { id: string; created_at: string } {
+    const id = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO task_events (
+           id, task_id, created_at, event_type, from_status, to_status, worker_id, summary, details_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        params.task_id,
+        createdAt,
+        params.event_type,
+        params.from_status ?? null,
+        params.to_status ?? null,
+        params.worker_id ?? null,
+        params.summary ?? null,
+        stableStringify(params.details ?? {})
+      );
+    return { id, created_at: createdAt };
+  }
+
   private ensureColumn(table: string, column: string, type: string): void {
     const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<Record<string, unknown>>;
     const exists = rows.some((row) => String(row.name) === column);
@@ -2144,12 +2889,63 @@ function mapImprintSnapshotRow(row: Record<string, unknown>): ImprintSnapshotRec
   };
 }
 
+function mapTaskRow(row: Record<string, unknown>): TaskRecord {
+  const leaseOwnerId = asNullableString(row.lease_owner_id);
+  const leaseExpiresAt = asNullableString(row.lease_expires_at);
+  const leaseHeartbeat = asNullableString(row.lease_heartbeat_at);
+  const leaseCreatedAt = asNullableString(row.lease_created_at);
+  const leaseUpdatedAt = asNullableString(row.lease_updated_at);
+  return {
+    task_id: String(row.task_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    updated_at: String(row.updated_at ?? ""),
+    status: normalizeTaskStatus(row.status),
+    priority: Number(row.priority ?? 0),
+    objective: String(row.objective ?? ""),
+    project_dir: String(row.project_dir ?? ""),
+    payload: parseJsonObject(row.payload_json),
+    source: asNullableString(row.source),
+    source_client: asNullableString(row.source_client),
+    source_model: asNullableString(row.source_model),
+    source_agent: asNullableString(row.source_agent),
+    tags: safeParseJsonArray(row.tags_json),
+    metadata: parseJsonObject(row.metadata_json),
+    max_attempts: Number(row.max_attempts ?? 3),
+    attempt_count: Number(row.attempt_count ?? 0),
+    available_at: String(row.available_at ?? ""),
+    started_at: asNullableString(row.started_at),
+    finished_at: asNullableString(row.finished_at),
+    last_worker_id: asNullableString(row.last_worker_id),
+    last_error: asNullableString(row.last_error),
+    result: parseNullableJsonObject(row.result_json),
+    lease:
+      leaseOwnerId && leaseExpiresAt && leaseHeartbeat && leaseCreatedAt && leaseUpdatedAt
+        ? {
+            task_id: String(row.task_id ?? ""),
+            owner_id: leaseOwnerId,
+            lease_expires_at: leaseExpiresAt,
+            heartbeat_at: leaseHeartbeat,
+            created_at: leaseCreatedAt,
+            updated_at: leaseUpdatedAt,
+          }
+        : null,
+  };
+}
+
 function normalizeTrustTier(value: unknown): TrustTier {
   const normalized = String(value ?? "raw");
   if (normalized === "verified" || normalized === "policy-backed" || normalized === "deprecated") {
     return normalized;
   }
   return "raw";
+}
+
+function normalizeTaskStatus(value: unknown): TaskStatus {
+  const normalized = String(value ?? "pending");
+  if (normalized === "running" || normalized === "completed" || normalized === "failed" || normalized === "cancelled") {
+    return normalized;
+  }
+  return "pending";
 }
 
 function asNullableString(value: unknown): string | null {
@@ -2221,6 +3017,31 @@ function parseJsonObject(value: unknown): Record<string, unknown> {
     return {};
   }
   return {};
+}
+
+function parseNullableJsonObject(value: unknown): Record<string, unknown> | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  return null;
 }
 
 function parseJsonUnknown(value: string | null): unknown {
@@ -2313,4 +3134,16 @@ function computeTermScore(text: string, query?: string): number {
     }
   }
   return score;
+}
+
+function normalizeIsoTimestamp(value: string | undefined, fallback: string): string {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return fallback;
+  }
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) {
+    return fallback;
+  }
+  return parsed.toISOString();
 }

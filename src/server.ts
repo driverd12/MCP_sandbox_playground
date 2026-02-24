@@ -43,6 +43,22 @@ import { migrationStatus, migrationStatusSchema } from "./tools/migration.js";
 import { runIdempotentMutation } from "./tools/mutation.js";
 import { inboxEnqueue, inboxEnqueueSchema, inboxList, inboxListSchema } from "./tools/inbox.js";
 import {
+  taskClaim,
+  taskClaimSchema,
+  taskComplete,
+  taskCompleteSchema,
+  taskCreate,
+  taskCreateSchema,
+  taskFail,
+  taskFailSchema,
+  taskHeartbeat,
+  taskHeartbeatSchema,
+  taskList,
+  taskListSchema,
+  taskRetry,
+  taskRetrySchema,
+} from "./tools/task.js";
+import {
   imprintAutoSnapshotControl,
   imprintAutoSnapshotSchema,
   imprintBootstrap,
@@ -328,6 +344,34 @@ registerTool("run.end", "Finalize an execution run ledger.", runEndSchema, (inpu
 
 registerTool("run.timeline", "Read the timeline for an execution run ledger.", runTimelineSchema, (input) =>
   runTimeline(storage, input)
+);
+
+registerTool("task.create", "Create a durable local task record for autonomous execution.", taskCreateSchema, (input) =>
+  taskCreate(storage, input)
+);
+
+registerTool("task.list", "List durable local tasks with optional status filtering.", taskListSchema, (input) =>
+  taskList(storage, input)
+);
+
+registerTool("task.claim", "Claim the next available task using a renewable lease.", taskClaimSchema, (input) =>
+  taskClaim(storage, input)
+);
+
+registerTool("task.heartbeat", "Renew a leased task claim during long-running execution.", taskHeartbeatSchema, (input) =>
+  taskHeartbeat(storage, input)
+);
+
+registerTool("task.complete", "Mark a running task as completed and release its lease.", taskCompleteSchema, (input) =>
+  taskComplete(storage, input)
+);
+
+registerTool("task.fail", "Mark a running task as failed and release its lease.", taskFailSchema, (input) =>
+  taskFail(storage, input)
+);
+
+registerTool("task.retry", "Requeue a failed task for retry with optional delay.", taskRetrySchema, (input) =>
+  taskRetry(storage, input)
 );
 
 registerTool(

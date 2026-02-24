@@ -15,6 +15,7 @@ AUTO_PLIST="${LAUNCH_DIR}/${AUTO_LABEL}.plist"
 WORKER_PLIST="${LAUNCH_DIR}/${WORKER_LABEL}.plist"
 
 MCP_PORT="${ANAMNESIS_MCP_HTTP_PORT:-8787}"
+ALLOWED_ORIGINS="${MCP_HTTP_ALLOWED_ORIGINS:-http://localhost,http://127.0.0.1}"
 INBOX_POLL_INTERVAL="${ANAMNESIS_INBOX_POLL_INTERVAL:-5}"
 INBOX_BATCH_SIZE="${ANAMNESIS_INBOX_BATCH_SIZE:-3}"
 NODE_BIN="$(command -v node || true)"
@@ -27,6 +28,22 @@ if [[ -z "${PYTHON_BIN}" ]]; then
   echo "error: python3 not found in PATH" >&2
   exit 2
 fi
+
+TOKEN_FILE="${REPO_ROOT}/data/imprint/http_bearer_token"
+HTTP_BEARER_TOKEN="${MCP_HTTP_BEARER_TOKEN:-${ANAMNESIS_MCP_HTTP_BEARER_TOKEN:-}}"
+if [[ -z "${HTTP_BEARER_TOKEN}" && -f "${TOKEN_FILE}" ]]; then
+  HTTP_BEARER_TOKEN="$(cat "${TOKEN_FILE}")"
+fi
+if [[ -z "${HTTP_BEARER_TOKEN}" ]]; then
+  HTTP_BEARER_TOKEN="$(${PYTHON_BIN} - <<'PY'
+import secrets
+print(secrets.token_hex(24))
+PY
+)"
+fi
+mkdir -p "$(dirname "${TOKEN_FILE}")"
+printf '%s' "${HTTP_BEARER_TOKEN}" > "${TOKEN_FILE}"
+chmod 600 "${TOKEN_FILE}" >/dev/null 2>&1 || true
 
 mkdir -p "${LAUNCH_DIR}" "${LOG_DIR}"
 
@@ -58,6 +75,10 @@ cat >"${MCP_PLIST}" <<PLIST
       <string>127.0.0.1</string>
       <key>MCP_HTTP_PORT</key>
       <string>${MCP_PORT}</string>
+      <key>MCP_HTTP_ALLOWED_ORIGINS</key>
+      <string>${ALLOWED_ORIGINS}</string>
+      <key>MCP_HTTP_BEARER_TOKEN</key>
+      <string>${HTTP_BEARER_TOKEN}</string>
       <key>PATH</key>
       <string>${PATH}</string>
     </dict>
@@ -202,5 +223,6 @@ echo "  \"domain\": \"${DOMAIN}\"," >&2
 echo "  \"mcp_label\": \"${MCP_LABEL}\"," >&2
 echo "  \"auto_snapshot_label\": \"${AUTO_LABEL}\"," >&2
 echo "  \"worker_label\": \"${WORKER_LABEL}\"," >&2
-echo "  \"mcp_port\": ${MCP_PORT}" >&2
+echo "  \"mcp_port\": ${MCP_PORT}," >&2
+echo "  \"http_token_file\": \"${TOKEN_FILE}\"" >&2
 echo "}" >&2

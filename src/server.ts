@@ -41,6 +41,19 @@ import { incidentOpen, incidentOpenSchema, incidentTimeline, incidentTimelineSch
 import { queryPlan, queryPlanSchema } from "./tools/query_plan.js";
 import { migrationStatus, migrationStatusSchema } from "./tools/migration.js";
 import { runIdempotentMutation } from "./tools/mutation.js";
+import {
+  imprintAutoSnapshotControl,
+  imprintAutoSnapshotSchema,
+  imprintBootstrap,
+  imprintBootstrapSchema,
+  imprintProfileGet,
+  imprintProfileGetSchema,
+  imprintProfileSet,
+  imprintProfileSetSchema,
+  imprintSnapshot,
+  imprintSnapshotSchema,
+  initializeImprintAutoSnapshotDaemon,
+} from "./tools/imprint.js";
 import { startStdioTransport } from "./transports/stdio.js";
 import { startHttpTransport } from "./transports/http.js";
 import { truncate } from "./utils.js";
@@ -59,10 +72,13 @@ const storage = new Storage(storagePath);
 storage.init();
 initializeAutoSquishDaemon(storage);
 
+const SERVER_NAME = "anamnesis";
+const SERVER_VERSION = "0.2.0";
+
 const server = new Server(
   {
-    name: "anamnesis",
-    version: "0.2.0",
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
   },
   {
     capabilities: {
@@ -104,6 +120,59 @@ registerTool("memory.search", "Search long-term memory using lexical matching.",
 
 registerTool("memory.get", "Fetch a memory by id for deterministic debugging.", memoryGetSchema, (input) =>
   getMemory(storage, input)
+);
+
+registerTool(
+  "imprint.profile_set",
+  "Upsert durable local identity/profile instructions for autonomous agents.",
+  imprintProfileSetSchema,
+  (input) => imprintProfileSet(storage, input)
+);
+
+registerTool(
+  "imprint.profile_get",
+  "Read the durable local identity/profile instructions.",
+  imprintProfileGetSchema,
+  (input) => imprintProfileGet(storage, input)
+);
+
+registerTool(
+  "imprint.snapshot",
+  "Capture a local continuity snapshot (storage/tool/profile context) to SQLite and optional JSON.",
+  imprintSnapshotSchema,
+  (input) =>
+    imprintSnapshot(storage, input, {
+      repo_root: repoRoot,
+      server_name: SERVER_NAME,
+      server_version: SERVER_VERSION,
+      get_tool_names: () => Array.from(toolRegistry.keys()),
+    })
+);
+
+registerTool(
+  "imprint.bootstrap",
+  "Generate deterministic startup context from local profile, memories, transcript lines, and snapshots.",
+  imprintBootstrapSchema,
+  (input) =>
+    imprintBootstrap(storage, input, {
+      repo_root: repoRoot,
+      server_name: SERVER_NAME,
+      server_version: SERVER_VERSION,
+      get_tool_names: () => Array.from(toolRegistry.keys()),
+    })
+);
+
+registerTool(
+  "imprint.auto_snapshot",
+  "Manage interval-based continuity snapshots (status/start/stop/run_once).",
+  imprintAutoSnapshotSchema,
+  (input) =>
+    imprintAutoSnapshotControl(storage, input, {
+      repo_root: repoRoot,
+      server_name: SERVER_NAME,
+      server_version: SERVER_VERSION,
+      get_tool_names: () => Array.from(toolRegistry.keys()),
+    })
 );
 
 registerTool("transcript.log", "Log raw transcript lines into working memory.", transcriptLogSchema, (input) =>
@@ -321,6 +390,13 @@ registerTool("query.plan", "Produce a confidence-scored query plan with evidence
 registerTool("migration.status", "Read applied schema migration versions and metadata.", migrationStatusSchema, () =>
   migrationStatus(storage)
 );
+
+initializeImprintAutoSnapshotDaemon(storage, {
+  repo_root: repoRoot,
+  server_name: SERVER_NAME,
+  server_version: SERVER_VERSION,
+  get_tool_names: () => Array.from(toolRegistry.keys()),
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: Array.from(toolRegistry.values()).map((entry) => entry.tool),

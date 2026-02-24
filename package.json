@@ -12,7 +12,13 @@
     "start": "node dist/server.js",
     "start:stdio": "node dist/server.js",
     "start:http": "MCP_HTTP=1 node dist/server.js --http --http-port 8787",
-    "mvp:smoke": "./scripts/mvp_smoke.sh"
+    "mvp:smoke": "./scripts/mvp_smoke.sh",
+    "imprint:bootstrap": "./scripts/imprint_bootstrap.sh",
+    "launchd:install": "./scripts/launchd_install.sh",
+    "launchd:uninstall": "./scripts/launchd_uninstall.sh",
+    "agents:on": "./scripts/agents_switch.sh on",
+    "agents:off": "./scripts/agents_switch.sh off",
+    "agents:status": "./scripts/agents_switch.sh status"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",

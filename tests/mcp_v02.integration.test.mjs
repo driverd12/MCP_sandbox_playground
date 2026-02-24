@@ -15,6 +15,11 @@ const EXPECTED_TOOLS = [
   "health.policy",
   "health.storage",
   "health.tools",
+  "imprint.auto_snapshot",
+  "imprint.bootstrap",
+  "imprint.profile_get",
+  "imprint.profile_set",
+  "imprint.snapshot",
   "incident.open",
   "incident.timeline",
   "knowledge.decay",
@@ -52,6 +57,8 @@ const MUTATION_REQUIRED_TOOLS = [
   "adr.create",
   "decision.link",
   "incident.open",
+  "imprint.profile_set",
+  "imprint.snapshot",
   "knowledge.decay",
   "knowledge.promote",
   "lock.acquire",
@@ -148,6 +155,72 @@ test("MCP v0.2 integration and safety invariants", async () => {
     });
     assert.equal(memoryGet.found, true);
     assert.equal(memoryGet.memory.id, note.id);
+
+    const imprintProfileId = `imprint-${testId}`;
+    const imprintProfile = await callTool(client, "imprint.profile_set", {
+      mutation: nextMutation(testId, "imprint.profile_set", () => mutationCounter++),
+      profile_id: imprintProfileId,
+      title: "Integration Test Imprint",
+      mission: "Preserve local continuity for autonomous workflows.",
+      principles: [
+        "Prefer deterministic local-first operations.",
+        "Preserve idempotency for all mutating tool paths.",
+      ],
+      hard_constraints: ["Never write operational logs to stdout."],
+      preferred_models: ["llama3.2:3b"],
+      project_roots: [REPO_ROOT],
+      notes: `profile for ${testId}`,
+      source_client: "codex-tests",
+    });
+    assert.equal(imprintProfile.ok, true);
+    assert.equal(imprintProfile.profile.profile_id, imprintProfileId);
+
+    const imprintProfileGet = await callTool(client, "imprint.profile_get", {
+      profile_id: imprintProfileId,
+    });
+    assert.equal(imprintProfileGet.found, true);
+    assert.equal(imprintProfileGet.profile.profile_id, imprintProfileId);
+
+    const imprintSnapshot = await callTool(client, "imprint.snapshot", {
+      mutation: nextMutation(testId, "imprint.snapshot", () => mutationCounter++),
+      profile_id: imprintProfileId,
+      summary: "integration continuity checkpoint",
+      tags: ["integration", "continuity"],
+      include_recent_memories: 5,
+      include_recent_transcript_lines: 5,
+      write_file: false,
+      promote_summary: false,
+      source_client: "codex-tests",
+    });
+    assert.equal(imprintSnapshot.ok, true);
+    assert.ok(imprintSnapshot.snapshot_id);
+    assert.equal(imprintSnapshot.snapshot_path, null);
+
+    const imprintBootstrap = await callTool(client, "imprint.bootstrap", {
+      profile_id: imprintProfileId,
+      max_memories: 5,
+      max_transcript_lines: 5,
+      max_snapshots: 5,
+    });
+    assert.equal(imprintBootstrap.profile_found, true);
+    assert.match(imprintBootstrap.bootstrap_text, /Anamnesis Imprint Bootstrap/);
+    assert.match(imprintBootstrap.bootstrap_text, /Integration Test Imprint/);
+
+    const imprintAutoSnapshotRunOnce = await callTool(client, "imprint.auto_snapshot", {
+      action: "run_once",
+      mutation: nextMutation(testId, "imprint.auto_snapshot-run-once", () => mutationCounter++),
+      profile_id: imprintProfileId,
+      include_recent_memories: 3,
+      include_recent_transcript_lines: 3,
+      write_file: false,
+      promote_summary: false,
+    });
+    assert.equal(typeof imprintAutoSnapshotRunOnce.tick.ok, "boolean");
+
+    const imprintAutoSnapshotStatus = await callTool(client, "imprint.auto_snapshot", {
+      action: "status",
+    });
+    assert.equal(typeof imprintAutoSnapshotStatus.running, "boolean");
 
     const mutationCheckReplaySafe = await callTool(client, "mutation.check", {
       tool_name: "memory.append",
@@ -629,16 +702,18 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.equal(healthStorage.ok, true);
     assert.equal(path.resolve(healthStorage.db_path), path.resolve(dbPath));
     assert.equal(healthStorage.db_exists, true);
-    assert.ok(healthStorage.schema_version >= 2);
+    assert.ok(healthStorage.schema_version >= 3);
     assert.equal(typeof healthStorage.table_counts.schema_migrations, "number");
     assert.equal(typeof healthStorage.table_counts.daemon_configs, "number");
+    assert.equal(typeof healthStorage.table_counts.imprint_profiles, "number");
+    assert.equal(typeof healthStorage.table_counts.imprint_snapshots, "number");
 
     const healthPolicy = await callTool(client, "health.policy", {});
     assert.equal(healthPolicy.ok, true);
     assert.ok(healthPolicy.enforced_rules.length >= 3);
 
     const migrationStatus = await callTool(client, "migration.status", {});
-    assert.ok(migrationStatus.schema_version >= 2);
+    assert.ok(migrationStatus.schema_version >= 3);
     assert.ok(Array.isArray(migrationStatus.applied_versions));
     assert.ok(
       migrationStatus.applied_versions.some((entry) => entry.version === 1),
@@ -647,6 +722,10 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(
       migrationStatus.applied_versions.some((entry) => entry.version === 2),
       "Expected migration version 2 to be present"
+    );
+    assert.ok(
+      migrationStatus.applied_versions.some((entry) => entry.version === 3),
+      "Expected migration version 3 to be present"
     );
     assert.equal(typeof migrationStatus.recorded_count, "number");
     assert.equal(typeof migrationStatus.inferred_count, "number");

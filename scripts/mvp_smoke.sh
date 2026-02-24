@@ -138,6 +138,42 @@ try {
     action: "status",
   });
 
+  const imprintProfileId = `smoke-profile-${runId}`;
+  const imprintProfile = await callTool("imprint.profile_set", {
+    mutation: mutation("imprint.profile_set"),
+    profile_id: imprintProfileId,
+    title: "MVP Smoke Imprint",
+    mission: "Keep local continuity durable across sessions.",
+    principles: [
+      "Prefer local-first execution",
+      "Use idempotent mutations for side effects",
+      "Avoid stdout operational logs",
+    ],
+    hard_constraints: ["Do not exfiltrate local context"],
+    preferred_models: ["llama3.2:3b"],
+    project_roots: [process.cwd()],
+    source_client: "mvp_smoke.sh",
+  });
+
+  const imprintSnapshot = await callTool("imprint.snapshot", {
+    mutation: mutation("imprint.snapshot"),
+    profile_id: imprintProfileId,
+    summary: "mvp smoke continuity checkpoint",
+    tags: ["smoke", "mvp"],
+    include_recent_memories: 10,
+    include_recent_transcript_lines: 10,
+    write_file: false,
+    promote_summary: false,
+    source_client: "mvp_smoke.sh",
+  });
+
+  const imprintBootstrap = await callTool("imprint.bootstrap", {
+    profile_id: imprintProfileId,
+    max_memories: 10,
+    max_transcript_lines: 10,
+    max_snapshots: 5,
+  });
+
   console.log(
     JSON.stringify(
       {
@@ -151,6 +187,9 @@ try {
         memory_found: memory.found ?? false,
         auto_squish_running: autoStatus.running ?? false,
         retention_candidates: retentionDryRun.candidate_count ?? 0,
+        imprint_profile_id: imprintProfile.profile_id ?? null,
+        imprint_snapshot_id: imprintSnapshot.snapshot_id ?? null,
+        imprint_bootstrap_profile_found: imprintBootstrap.profile_found ?? false,
       },
       null,
       2

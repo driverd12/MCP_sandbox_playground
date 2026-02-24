@@ -73,6 +73,7 @@ npm test
 ## Tool Set
 
 - `memory.append`, `memory.get`, `memory.search`
+- `imprint.profile_set`, `imprint.profile_get`, `imprint.snapshot`, `imprint.bootstrap`, `imprint.auto_snapshot`
 - `transcript.log`, `transcript.auto_squish`, `transcript.pending_runs`, `transcript.retention`, `transcript.run_timeline`, `transcript.squish`, `transcript.append`, `transcript.summarize`
 - `adr.create`
 - `who_knows`, `knowledge.query`
@@ -114,6 +115,36 @@ Optional env overrides:
 - `MCP_SMOKE_RUN_ID` (default auto-generated)
 - `MCP_SMOKE_STDIO_COMMAND` (default `node`)
 - `MCP_SMOKE_STDIO_ARGS` (default `dist/server.js`)
+
+## Imprint Bootstrap
+
+Run one-shot profile/snapshot/bootstrap capture:
+
+```bash
+./scripts/imprint_bootstrap.sh
+```
+
+Or via npm:
+
+```bash
+npm run imprint:bootstrap
+```
+
+## Launchd Auto-Start + Switches
+
+Install login-time services for local MCP HTTP and imprint auto-snapshot:
+
+```bash
+npm run launchd:install
+```
+
+Toggle runtime switches:
+
+```bash
+npm run agents:on
+npm run agents:off
+npm run agents:status
+```
 
 ## Auto Squish + Retention
 

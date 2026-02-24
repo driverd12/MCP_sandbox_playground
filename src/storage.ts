@@ -120,6 +120,47 @@ export type TranscriptAutoSquishStateRecord = {
   updated_at: string;
 };
 
+export type ImprintAutoSnapshotStateRecord = {
+  enabled: boolean;
+  profile_id: string | null;
+  interval_seconds: number;
+  include_recent_memories: number;
+  include_recent_transcript_lines: number;
+  write_file: boolean;
+  promote_summary: boolean;
+  updated_at: string;
+};
+
+export type ImprintProfileRecord = {
+  profile_id: string;
+  created_at: string;
+  updated_at: string;
+  title: string;
+  mission: string;
+  principles: string[];
+  hard_constraints: string[];
+  preferred_models: string[];
+  project_roots: string[];
+  notes: string | null;
+  source_client: string | null;
+  source_model: string | null;
+  source_agent: string | null;
+};
+
+export type ImprintSnapshotRecord = {
+  id: string;
+  created_at: string;
+  profile_id: string | null;
+  summary: string | null;
+  tags: string[];
+  source_client: string | null;
+  source_model: string | null;
+  source_agent: string | null;
+  state: Record<string, unknown>;
+  snapshot_path: string | null;
+  memory_id: number | null;
+};
+
 export type MigrationStatusRecord = {
   schema_version: number;
   applied_versions: Array<{
@@ -158,6 +199,11 @@ export class Storage {
         version: 2,
         name: "add-daemon-config-storage",
         run: () => this.applyDaemonConfigMigration(),
+      },
+      {
+        version: 3,
+        name: "add-imprint-schema",
+        run: () => this.applyImprintSchemaMigration(),
       },
     ]);
   }
@@ -425,6 +471,22 @@ export class Storage {
     return result;
   }
 
+  listRecentMemories(limit: number): MemoryRecord[] {
+    if (limit <= 0) {
+      return [];
+    }
+    const boundedLimit = Math.max(1, Math.min(500, limit));
+    const rows = this.db
+      .prepare(
+        `SELECT id, content, keywords, created_at, last_accessed_at, decay_score
+         FROM memories
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(boundedLimit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapMemoryRow(row));
+  }
+
   decayNotes(params: {
     older_than_iso: string;
     from_tiers: TrustTier[];
@@ -595,6 +657,38 @@ export class Storage {
     return result;
   }
 
+  listRecentTranscriptLines(params: {
+    limit: number;
+    include_squished?: boolean;
+  }): TranscriptLineRecord[] {
+    if (params.limit <= 0) {
+      return [];
+    }
+    const boundedLimit = Math.max(1, Math.min(2000, params.limit));
+    const includeSquished = params.include_squished ?? true;
+    const rows = this.db
+      .prepare(
+        `SELECT id, run_id, role, content, timestamp, is_squished
+         FROM transcript_lines
+         ORDER BY timestamp DESC
+         LIMIT ?`
+      )
+      .all(boundedLimit * 4) as Array<Record<string, unknown>>;
+
+    const result: TranscriptLineRecord[] = [];
+    for (const row of rows) {
+      const line = mapTranscriptLineRow(row);
+      if (!includeSquished && line.is_squished) {
+        continue;
+      }
+      result.push(line);
+      if (result.length >= boundedLimit) {
+        break;
+      }
+    }
+    return result;
+  }
+
   markTranscriptLinesSquished(lineIds: number[]): { updated_count: number } {
     if (lineIds.length === 0) {
       return { updated_count: 0 };
@@ -753,6 +847,300 @@ export class Storage {
       ...normalized,
       updated_at: now,
     };
+  }
+
+  getImprintAutoSnapshotState(): ImprintAutoSnapshotStateRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT enabled, config_json, updated_at
+         FROM daemon_configs
+         WHERE daemon_key = ?`
+      )
+      .get("imprint.auto_snapshot") as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+
+    const config = parseJsonObject(row.config_json);
+    return {
+      enabled: Number(row.enabled ?? 0) === 1,
+      profile_id: asNullableString(config.profile_id),
+      interval_seconds: parseBoundedInt(config.interval_seconds, 900, 30, 86400),
+      include_recent_memories: parseBoundedInt(config.include_recent_memories, 20, 0, 200),
+      include_recent_transcript_lines: parseBoundedInt(config.include_recent_transcript_lines, 40, 0, 1000),
+      write_file: parseBoolean(config.write_file, true),
+      promote_summary: parseBoolean(config.promote_summary, false),
+      updated_at: String(row.updated_at ?? ""),
+    };
+  }
+
+  setImprintAutoSnapshotState(params: {
+    enabled: boolean;
+    profile_id?: string;
+    interval_seconds: number;
+    include_recent_memories: number;
+    include_recent_transcript_lines: number;
+    write_file: boolean;
+    promote_summary: boolean;
+  }): ImprintAutoSnapshotStateRecord {
+    const now = new Date().toISOString();
+    const normalized = {
+      enabled: Boolean(params.enabled),
+      profile_id: params.profile_id ? params.profile_id.trim() || null : null,
+      interval_seconds: parseBoundedInt(params.interval_seconds, 900, 30, 86400),
+      include_recent_memories: parseBoundedInt(params.include_recent_memories, 20, 0, 200),
+      include_recent_transcript_lines: parseBoundedInt(params.include_recent_transcript_lines, 40, 0, 1000),
+      write_file: Boolean(params.write_file),
+      promote_summary: Boolean(params.promote_summary),
+    };
+    const configJson = stableStringify({
+      profile_id: normalized.profile_id,
+      interval_seconds: normalized.interval_seconds,
+      include_recent_memories: normalized.include_recent_memories,
+      include_recent_transcript_lines: normalized.include_recent_transcript_lines,
+      write_file: normalized.write_file,
+      promote_summary: normalized.promote_summary,
+    });
+
+    this.db
+      .prepare(
+        `INSERT INTO daemon_configs (daemon_key, enabled, config_json, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(daemon_key) DO UPDATE SET
+           enabled = excluded.enabled,
+           config_json = excluded.config_json,
+           updated_at = excluded.updated_at`
+      )
+      .run("imprint.auto_snapshot", normalized.enabled ? 1 : 0, configJson, now);
+
+    return {
+      ...normalized,
+      updated_at: now,
+    };
+  }
+
+  upsertImprintProfile(params: {
+    profile_id: string;
+    title: string;
+    mission: string;
+    principles: string[];
+    hard_constraints?: string[];
+    preferred_models?: string[];
+    project_roots?: string[];
+    notes?: string;
+    source_client?: string;
+    source_model?: string;
+    source_agent?: string;
+  }): { profile_id: string; created: boolean; created_at: string; updated_at: string } {
+    const profileId = params.profile_id.trim();
+    if (!profileId) {
+      throw new Error("profile_id is required");
+    }
+    const now = new Date().toISOString();
+    const existing = this.db
+      .prepare(`SELECT profile_id, created_at FROM imprint_profiles WHERE profile_id = ?`)
+      .get(profileId) as Record<string, unknown> | undefined;
+
+    const title = params.title.trim();
+    const mission = params.mission.trim();
+    if (!title || !mission) {
+      throw new Error("title and mission are required");
+    }
+
+    const principles = dedupeNonEmpty(params.principles);
+    const hardConstraints = dedupeNonEmpty(params.hard_constraints ?? []);
+    const preferredModels = dedupeNonEmpty(params.preferred_models ?? []);
+    const projectRoots = dedupeNonEmpty(params.project_roots ?? []);
+
+    if (!existing) {
+      this.db
+        .prepare(
+          `INSERT INTO imprint_profiles (
+             profile_id, created_at, updated_at, title, mission,
+             principles_json, hard_constraints_json, preferred_models_json, project_roots_json,
+             notes, source_client, source_model, source_agent
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          profileId,
+          now,
+          now,
+          title,
+          mission,
+          stableStringify(principles),
+          stableStringify(hardConstraints),
+          stableStringify(preferredModels),
+          stableStringify(projectRoots),
+          params.notes?.trim() || null,
+          params.source_client ?? null,
+          params.source_model ?? null,
+          params.source_agent ?? null
+        );
+      return {
+        profile_id: profileId,
+        created: true,
+        created_at: now,
+        updated_at: now,
+      };
+    }
+
+    const createdAt = String(existing.created_at ?? now);
+    this.db
+      .prepare(
+        `UPDATE imprint_profiles
+         SET updated_at = ?, title = ?, mission = ?,
+             principles_json = ?, hard_constraints_json = ?, preferred_models_json = ?, project_roots_json = ?,
+             notes = ?, source_client = ?, source_model = ?, source_agent = ?
+         WHERE profile_id = ?`
+      )
+      .run(
+        now,
+        title,
+        mission,
+        stableStringify(principles),
+        stableStringify(hardConstraints),
+        stableStringify(preferredModels),
+        stableStringify(projectRoots),
+        params.notes?.trim() || null,
+        params.source_client ?? null,
+        params.source_model ?? null,
+        params.source_agent ?? null,
+        profileId
+      );
+    return {
+      profile_id: profileId,
+      created: false,
+      created_at: createdAt,
+      updated_at: now,
+    };
+  }
+
+  getImprintProfile(profileId = "default"): ImprintProfileRecord | null {
+    const normalized = profileId.trim();
+    if (!normalized) {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT profile_id, created_at, updated_at, title, mission,
+                principles_json, hard_constraints_json, preferred_models_json, project_roots_json,
+                notes, source_client, source_model, source_agent
+         FROM imprint_profiles
+         WHERE profile_id = ?`
+      )
+      .get(normalized) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return mapImprintProfileRow(row);
+  }
+
+  insertImprintSnapshot(params: {
+    id: string;
+    profile_id?: string;
+    summary?: string;
+    tags?: string[];
+    source_client?: string;
+    source_model?: string;
+    source_agent?: string;
+    state: Record<string, unknown>;
+    snapshot_path?: string;
+    memory_id?: number;
+  }): { id: string; created_at: string } {
+    const id = params.id.trim();
+    if (!id) {
+      throw new Error("snapshot id is required");
+    }
+    const createdAt = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO imprint_snapshots (
+           id, created_at, profile_id, summary, tags_json, source_client, source_model, source_agent,
+           state_json, snapshot_path, memory_id
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        id,
+        createdAt,
+        params.profile_id?.trim() || null,
+        params.summary?.trim() || null,
+        stableStringify(dedupeNonEmpty(params.tags ?? [])),
+        params.source_client ?? null,
+        params.source_model ?? null,
+        params.source_agent ?? null,
+        stableStringify(params.state),
+        params.snapshot_path ?? null,
+        params.memory_id ?? null
+      );
+    return { id, created_at: createdAt };
+  }
+
+  getImprintSnapshotById(snapshotId: string): ImprintSnapshotRecord | null {
+    const normalized = snapshotId.trim();
+    if (!normalized) {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT id, created_at, profile_id, summary, tags_json, source_client, source_model, source_agent,
+                state_json, snapshot_path, memory_id
+         FROM imprint_snapshots
+         WHERE id = ?`
+      )
+      .get(normalized) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return mapImprintSnapshotRow(row);
+  }
+
+  listImprintSnapshots(params: {
+    limit: number;
+    profile_id?: string;
+  }): ImprintSnapshotRecord[] {
+    const boundedLimit = Math.max(1, Math.min(200, params.limit));
+    const profileId = params.profile_id?.trim();
+    const rows = profileId
+      ? (this.db
+          .prepare(
+            `SELECT id, created_at, profile_id, summary, tags_json, source_client, source_model, source_agent,
+                    state_json, snapshot_path, memory_id
+             FROM imprint_snapshots
+             WHERE profile_id = ?
+             ORDER BY created_at DESC
+             LIMIT ?`
+          )
+          .all(profileId, boundedLimit) as Array<Record<string, unknown>>)
+      : (this.db
+          .prepare(
+            `SELECT id, created_at, profile_id, summary, tags_json, source_client, source_model, source_agent,
+                    state_json, snapshot_path, memory_id
+             FROM imprint_snapshots
+             ORDER BY created_at DESC
+             LIMIT ?`
+          )
+          .all(boundedLimit) as Array<Record<string, unknown>>);
+    return rows.map((row) => mapImprintSnapshotRow(row));
+  }
+
+  getLatestImprintSnapshot(profileId?: string): ImprintSnapshotRecord | null {
+    const snapshots = this.listImprintSnapshots({
+      limit: 1,
+      profile_id: profileId,
+    });
+    return snapshots[0] ?? null;
+  }
+
+  countImprintSnapshots(profileId?: string): number {
+    const normalized = profileId?.trim();
+    const row = normalized
+      ? (this.db
+          .prepare(`SELECT COUNT(*) AS count FROM imprint_snapshots WHERE profile_id = ?`)
+          .get(normalized) as Record<string, unknown>)
+      : (this.db
+          .prepare(`SELECT COUNT(*) AS count FROM imprint_snapshots`)
+          .get() as Record<string, unknown>);
+    return Number(row.count ?? 0);
   }
 
   getTranscriptById(transcriptId: string): TranscriptRecord | null {
@@ -1379,6 +1767,8 @@ export class Storage {
       "incident_events",
       "schema_migrations",
       "daemon_configs",
+      "imprint_profiles",
+      "imprint_snapshots",
     ] as const;
     const counts: Record<string, number> = {};
     for (const table of tables) {
@@ -1618,6 +2008,43 @@ export class Storage {
     `);
   }
 
+  private applyImprintSchemaMigration(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS imprint_profiles (
+        profile_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        title TEXT NOT NULL,
+        mission TEXT NOT NULL,
+        principles_json TEXT NOT NULL,
+        hard_constraints_json TEXT NOT NULL,
+        preferred_models_json TEXT NOT NULL,
+        project_roots_json TEXT NOT NULL,
+        notes TEXT,
+        source_client TEXT,
+        source_model TEXT,
+        source_agent TEXT
+      );
+      CREATE TABLE IF NOT EXISTS imprint_snapshots (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        profile_id TEXT,
+        summary TEXT,
+        tags_json TEXT NOT NULL,
+        source_client TEXT,
+        source_model TEXT,
+        source_agent TEXT,
+        state_json TEXT NOT NULL,
+        snapshot_path TEXT,
+        memory_id INTEGER
+      );
+    `);
+
+    this.ensureIndex("idx_imprint_profiles_updated", "imprint_profiles", "updated_at DESC");
+    this.ensureIndex("idx_imprint_snapshots_created", "imprint_snapshots", "created_at DESC");
+    this.ensureIndex("idx_imprint_snapshots_profile", "imprint_snapshots", "profile_id, created_at DESC");
+  }
+
   private ensureColumn(table: string, column: string, type: string): void {
     const rows = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<Record<string, unknown>>;
     const exists = rows.some((row) => String(row.name) === column);
@@ -1683,6 +2110,40 @@ function mapMemoryRow(row: Record<string, unknown>): MemoryRecord {
   };
 }
 
+function mapImprintProfileRow(row: Record<string, unknown>): ImprintProfileRecord {
+  return {
+    profile_id: String(row.profile_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    updated_at: String(row.updated_at ?? ""),
+    title: String(row.title ?? ""),
+    mission: String(row.mission ?? ""),
+    principles: safeParseJsonArray(row.principles_json),
+    hard_constraints: safeParseJsonArray(row.hard_constraints_json),
+    preferred_models: safeParseJsonArray(row.preferred_models_json),
+    project_roots: safeParseJsonArray(row.project_roots_json),
+    notes: asNullableString(row.notes),
+    source_client: asNullableString(row.source_client),
+    source_model: asNullableString(row.source_model),
+    source_agent: asNullableString(row.source_agent),
+  };
+}
+
+function mapImprintSnapshotRow(row: Record<string, unknown>): ImprintSnapshotRecord {
+  return {
+    id: String(row.id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    profile_id: asNullableString(row.profile_id),
+    summary: asNullableString(row.summary),
+    tags: safeParseJsonArray(row.tags_json),
+    source_client: asNullableString(row.source_client),
+    source_model: asNullableString(row.source_model),
+    source_agent: asNullableString(row.source_agent),
+    state: parseJsonObject(row.state_json),
+    snapshot_path: asNullableString(row.snapshot_path),
+    memory_id: row.memory_id === null || row.memory_id === undefined ? null : Number(row.memory_id),
+  };
+}
+
 function normalizeTrustTier(value: unknown): TrustTier {
   const normalized = String(value ?? "raw");
   if (normalized === "verified" || normalized === "policy-backed" || normalized === "deprecated") {
@@ -1706,6 +2167,17 @@ function normalizeKeywords(keywords: string[] | undefined): string[] {
   const unique = new Set<string>();
   for (const keyword of keywords) {
     const normalized = keyword.trim().toLowerCase();
+    if (normalized) {
+      unique.add(normalized);
+    }
+  }
+  return Array.from(unique);
+}
+
+function dedupeNonEmpty(values: string[]): string[] {
+  const unique = new Set<string>();
+  for (const value of values) {
+    const normalized = value.trim();
     if (normalized) {
       unique.add(normalized);
     }
@@ -1760,6 +2232,25 @@ function parseJsonUnknown(value: string | null): unknown {
   } catch {
     return value;
   }
+}
+
+function parseBoolean(value: unknown, fallback: boolean): boolean {
+  if (typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return value !== 0;
+  }
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+      return true;
+    }
+    if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+      return false;
+    }
+  }
+  return fallback;
 }
 
 function hashPayload(value: unknown): string {

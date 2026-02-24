@@ -16,6 +16,10 @@ Anamnesis is designed as a "Shared Apartment" for agents. Different clients and 
 - Interval backlog drain daemon (`transcript.auto_squish`)
 - Auto-squish daemon config persisted across server restarts
 - Retention policy control for transcript working memory (`transcript.retention`)
+- Durable Imprint profile + continuity snapshots (`imprint.profile_set`, `imprint.snapshot`, `imprint.bootstrap`)
+- Interval-based Imprint snapshot daemon (`imprint.auto_snapshot`)
+- Launchd auto-start support for MCP HTTP server + Imprint auto-snapshot
+- Agent on/off switch (`scripts/agents_switch.sh`) for start/stop/status control
 - ADR creation helper (`adr.create`) writing to `./docs/adrs/`
 - Policy/preflight/postflight safety tools
 - Run timeline ledgering + lock leasing
@@ -62,6 +66,41 @@ npm test
 This loop is fully local-first and idempotent for mutating tools.
 Run the baseline smoke check with `npm run mvp:smoke`.
 
+## Imprint Continuity
+
+Bootstrap a durable local profile + snapshot in one command:
+
+```bash
+npm run imprint:bootstrap
+```
+
+This runs `imprint.profile_set`, `imprint.snapshot`, and `imprint.bootstrap` against your live server transport (`stdio` by default).
+
+`agent_loop.py` now loads `imprint.bootstrap` at startup by default, so local Llama planning starts from persisted context.
+Disable it with `--no-imprint-bootstrap`.
+
+## Always-On Mode
+
+Install launchd services (auto-start on login):
+
+```bash
+npm run launchd:install
+```
+
+Control local agent switches:
+
+```bash
+npm run agents:on
+npm run agents:off
+npm run agents:status
+```
+
+Switch mapping:
+
+- `eyes`: local MCP server context visibility
+- `ears`: local MCP intake/transport availability
+- `fingers`: local automated agent execution capability
+
 ## Agent Playbook
 
 - Use `transcript.pending_runs` to discover runs that still need squishing.
@@ -71,6 +110,10 @@ Run the baseline smoke check with `npm run mvp:smoke`.
 - Use `migration.status` to confirm applied schema versions independently of health checks.
 - Use `memory.get` to inspect exact long-term records by id when triaging behavior.
 - Use `knowledge.promote` with `source_type` set to `memory` or `transcript_line` to elevate proven details.
+- Use `imprint.profile_set` once per project/workspace to persist operating doctrine for all future agents.
+- Use `imprint.snapshot` before handoff to persist current local state as a continuity checkpoint.
+- Use `imprint.bootstrap` at session start to rehydrate mission, recent memory, and pending work in one read.
+- Use `imprint.auto_snapshot` (`status`, `run_once`, `start`, `stop`) for periodic continuity capture.
 - Run `./scripts/mvp_smoke.sh` before handoff to verify end-to-end health (default `stdio`, optional `http`).
 
 Suggested loop for multi-agent collaboration:

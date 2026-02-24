@@ -18,6 +18,7 @@ Anamnesis is designed as a "Shared Apartment" for agents. Different clients and 
 - Retention policy control for transcript working memory (`transcript.retention`)
 - Durable Imprint profile + continuity snapshots (`imprint.profile_set`, `imprint.snapshot`, `imprint.bootstrap`)
 - Interval-based Imprint snapshot daemon (`imprint.auto_snapshot`)
+- Local inbox queue + worker daemon for unprompted workload execution (`data/imprint/inbox`, `imprint.inbox.enqueue`)
 - Launchd auto-start support for MCP HTTP server + Imprint auto-snapshot
 - Agent on/off switch (`scripts/agents_switch.sh`) for start/stop/status control
 - ADR creation helper (`adr.create`) writing to `./docs/adrs/`
@@ -79,6 +80,27 @@ This runs `imprint.profile_set`, `imprint.snapshot`, and `imprint.bootstrap` aga
 `agent_loop.py` now loads `imprint.bootstrap` at startup by default, so local Llama planning starts from persisted context.
 Disable it with `--no-imprint-bootstrap`.
 
+## Inbox Worker
+
+Drop a task into local inbox:
+
+```bash
+npm run inbox:enqueue -- --objective "Run tests and summarize failures"
+```
+
+Run worker manually:
+
+```bash
+npm run inbox:worker
+```
+
+Inbox paths:
+
+- `./data/imprint/inbox/pending` (new tasks)
+- `./data/imprint/inbox/processing` (claimed in-flight tasks)
+- `./data/imprint/inbox/done` (completed task + result JSON)
+- `./data/imprint/inbox/failed` (failed task + result JSON)
+
 ## Always-On Mode
 
 Install launchd services (auto-start on login):
@@ -114,6 +136,8 @@ Switch mapping:
 - Use `imprint.snapshot` before handoff to persist current local state as a continuity checkpoint.
 - Use `imprint.bootstrap` at session start to rehydrate mission, recent memory, and pending work in one read.
 - Use `imprint.auto_snapshot` (`status`, `run_once`, `start`, `stop`) for periodic continuity capture.
+- Use `imprint.inbox.enqueue` (or `npm run inbox:enqueue`) to submit background workloads.
+- Use `imprint.inbox.list` to inspect backlog and task outcomes.
 - Run `./scripts/mvp_smoke.sh` before handoff to verify end-to-end health (default `stdio`, optional `http`).
 
 Suggested loop for multi-agent collaboration:

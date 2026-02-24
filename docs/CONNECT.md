@@ -73,6 +73,7 @@ npm test
 ## Tool Set
 
 - `memory.append`, `memory.get`, `memory.search`
+- `imprint.inbox.enqueue`, `imprint.inbox.list`
 - `imprint.profile_set`, `imprint.profile_get`, `imprint.snapshot`, `imprint.bootstrap`, `imprint.auto_snapshot`
 - `transcript.log`, `transcript.auto_squish`, `transcript.pending_runs`, `transcript.retention`, `transcript.run_timeline`, `transcript.squish`, `transcript.append`, `transcript.summarize`
 - `adr.create`
@@ -144,6 +145,12 @@ Toggle runtime switches:
 npm run agents:on
 npm run agents:off
 npm run agents:status
+```
+
+Enqueue inbox tasks manually:
+
+```bash
+npm run inbox:enqueue -- --objective "Run npm test and summarize failures"
 ```
 
 ## Auto Squish + Retention

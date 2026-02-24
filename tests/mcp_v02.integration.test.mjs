@@ -17,6 +17,8 @@ const EXPECTED_TOOLS = [
   "health.tools",
   "imprint.auto_snapshot",
   "imprint.bootstrap",
+  "imprint.inbox.enqueue",
+  "imprint.inbox.list",
   "imprint.profile_get",
   "imprint.profile_set",
   "imprint.snapshot",
@@ -59,6 +61,7 @@ const MUTATION_REQUIRED_TOOLS = [
   "incident.open",
   "imprint.profile_set",
   "imprint.snapshot",
+  "imprint.inbox.enqueue",
   "knowledge.decay",
   "knowledge.promote",
   "lock.acquire",
@@ -80,6 +83,7 @@ test("MCP v0.2 integration and safety invariants", async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-v02-test-"));
   const dbPath = path.join(tempDir, "hub.sqlite");
   const adrFilesToRemove = new Set();
+  const inboxFilesToRemove = new Set();
   let mutationCounter = 0;
 
   const env = inheritedEnv({
@@ -221,6 +225,31 @@ test("MCP v0.2 integration and safety invariants", async () => {
       action: "status",
     });
     assert.equal(typeof imprintAutoSnapshotStatus.running, "boolean");
+
+    const inboxTask = await callTool(client, "imprint.inbox.enqueue", {
+      mutation: nextMutation(testId, "imprint.inbox.enqueue", () => mutationCounter++),
+      objective: `Run dry-run workload for ${testId}`,
+      project_dir: REPO_ROOT,
+      dry_run: true,
+      imprint_profile_id: imprintProfileId,
+      source: "integration-suite",
+      metadata: { test_id: testId },
+    });
+    assert.equal(inboxTask.ok, true);
+    assert.equal(inboxTask.status, "pending");
+    assert.ok(inboxTask.task_id);
+    if (inboxTask.path) {
+      inboxFilesToRemove.add(inboxTask.path);
+    }
+
+    const inboxPending = await callTool(client, "imprint.inbox.list", {
+      status: "pending",
+      limit: 200,
+    });
+    assert.ok(
+      inboxPending.tasks.some((task) => task.task_id === inboxTask.task_id),
+      "Expected enqueued task in pending inbox list"
+    );
 
     const mutationCheckReplaySafe = await callTool(client, "mutation.check", {
       tool_name: "memory.append",
@@ -748,6 +777,11 @@ test("MCP v0.2 integration and safety invariants", async () => {
     for (const adrPath of adrFilesToRemove) {
       if (fs.existsSync(adrPath)) {
         fs.unlinkSync(adrPath);
+      }
+    }
+    for (const inboxPath of inboxFilesToRemove) {
+      if (fs.existsSync(inboxPath)) {
+        fs.unlinkSync(inboxPath);
       }
     }
     fs.rmSync(tempDir, { recursive: true, force: true });

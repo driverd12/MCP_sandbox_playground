@@ -41,6 +41,7 @@ import { incidentOpen, incidentOpenSchema, incidentTimeline, incidentTimelineSch
 import { queryPlan, queryPlanSchema } from "./tools/query_plan.js";
 import { migrationStatus, migrationStatusSchema } from "./tools/migration.js";
 import { runIdempotentMutation } from "./tools/mutation.js";
+import { inboxEnqueue, inboxEnqueueSchema, inboxList, inboxListSchema } from "./tools/inbox.js";
 import {
   imprintAutoSnapshotControl,
   imprintAutoSnapshotSchema,
@@ -120,6 +121,27 @@ registerTool("memory.search", "Search long-term memory using lexical matching.",
 
 registerTool("memory.get", "Fetch a memory by id for deterministic debugging.", memoryGetSchema, (input) =>
   getMemory(storage, input)
+);
+
+registerTool(
+  "imprint.inbox.enqueue",
+  "Enqueue a local inbox task for continuous autonomous execution.",
+  inboxEnqueueSchema,
+  (input) =>
+    runIdempotentMutation({
+      storage,
+      tool_name: "imprint.inbox.enqueue",
+      mutation: input.mutation,
+      payload: input,
+      execute: () => inboxEnqueue(repoRoot, input),
+    })
+);
+
+registerTool(
+  "imprint.inbox.list",
+  "List local inbox tasks by status for debugging and triage.",
+  inboxListSchema,
+  (input) => inboxList(repoRoot, input)
 );
 
 registerTool(

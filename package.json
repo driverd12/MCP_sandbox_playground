@@ -12,6 +12,8 @@
     "start": "node dist/server.js",
     "start:stdio": "node dist/server.js",
     "start:http": "MCP_HTTP=1 node dist/server.js --http --http-port 8787",
+    "inbox:worker": "python3 ./scripts/imprint_inbox_worker.py --repo-root .",
+    "inbox:enqueue": "node ./scripts/inbox_enqueue.mjs",
     "mvp:smoke": "./scripts/mvp_smoke.sh",
     "imprint:bootstrap": "./scripts/imprint_bootstrap.sh",
     "launchd:install": "./scripts/launchd_install.sh",

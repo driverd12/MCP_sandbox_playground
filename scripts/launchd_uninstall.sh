@@ -7,9 +7,11 @@ DOMAIN="gui/$(id -u)"
 
 MCP_LABEL="com.anamnesis.mcp.server"
 AUTO_LABEL="com.anamnesis.imprint.autosnapshot"
+WORKER_LABEL="com.anamnesis.imprint.inboxworker"
 
 MCP_PLIST="${LAUNCH_DIR}/${MCP_LABEL}.plist"
 AUTO_PLIST="${LAUNCH_DIR}/${AUTO_LABEL}.plist"
+WORKER_PLIST="${LAUNCH_DIR}/${WORKER_LABEL}.plist"
 
 "${REPO_ROOT}/scripts/imprint_auto_snapshot_ctl.sh" stop >/dev/null 2>&1 || true
 
@@ -25,4 +27,10 @@ if [[ -f "${AUTO_PLIST}" ]]; then
   rm -f "${AUTO_PLIST}"
 fi
 
-echo "{\"ok\":true,\"removed\":[\"${MCP_LABEL}\",\"${AUTO_LABEL}\"]}" >&2
+if [[ -f "${WORKER_PLIST}" ]]; then
+  launchctl bootout "${DOMAIN}" "${WORKER_PLIST}" >/dev/null 2>&1 || true
+  launchctl disable "${DOMAIN}/${WORKER_LABEL}" >/dev/null 2>&1 || true
+  rm -f "${WORKER_PLIST}"
+fi
+
+echo "{\"ok\":true,\"removed\":[\"${MCP_LABEL}\",\"${AUTO_LABEL}\",\"${WORKER_LABEL}\"]}" >&2

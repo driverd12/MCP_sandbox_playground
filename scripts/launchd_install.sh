@@ -8,14 +8,23 @@ DOMAIN="gui/$(id -u)"
 
 MCP_LABEL="com.anamnesis.mcp.server"
 AUTO_LABEL="com.anamnesis.imprint.autosnapshot"
+WORKER_LABEL="com.anamnesis.imprint.inboxworker"
 
 MCP_PLIST="${LAUNCH_DIR}/${MCP_LABEL}.plist"
 AUTO_PLIST="${LAUNCH_DIR}/${AUTO_LABEL}.plist"
+WORKER_PLIST="${LAUNCH_DIR}/${WORKER_LABEL}.plist"
 
 MCP_PORT="${ANAMNESIS_MCP_HTTP_PORT:-8787}"
+INBOX_POLL_INTERVAL="${ANAMNESIS_INBOX_POLL_INTERVAL:-5}"
+INBOX_BATCH_SIZE="${ANAMNESIS_INBOX_BATCH_SIZE:-3}"
 NODE_BIN="$(command -v node || true)"
 if [[ -z "${NODE_BIN}" ]]; then
   echo "error: node not found in PATH" >&2
+  exit 2
+fi
+PYTHON_BIN="$(command -v python3 || true)"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "error: python3 not found in PATH" >&2
   exit 2
 fi
 
@@ -107,30 +116,91 @@ cat >"${AUTO_PLIST}" <<PLIST
 </plist>
 PLIST
 
-chmod 644 "${MCP_PLIST}" "${AUTO_PLIST}"
+cat >"${WORKER_PLIST}" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>${WORKER_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>${PYTHON_BIN}</string>
+      <string>${REPO_ROOT}/scripts/imprint_inbox_worker.py</string>
+      <string>--repo-root</string>
+      <string>${REPO_ROOT}</string>
+      <string>--poll-interval</string>
+      <string>${INBOX_POLL_INTERVAL}</string>
+      <string>--batch-size</string>
+      <string>${INBOX_BATCH_SIZE}</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>${REPO_ROOT}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PATH</key>
+      <string>${PATH}</string>
+      <key>PYTHONUNBUFFERED</key>
+      <string>1</string>
+      <key>ANAMNESIS_IMPRINT_PROFILE_ID</key>
+      <string>${ANAMNESIS_IMPRINT_PROFILE_ID:-default}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/inbox-worker.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/inbox-worker.err.log</string>
+  </dict>
+</plist>
+PLIST
+
+chmod 644 "${MCP_PLIST}" "${AUTO_PLIST}" "${WORKER_PLIST}"
 
 cd "${REPO_ROOT}"
 npm run build >/dev/null
 
 launchctl bootout "${DOMAIN}" "${MCP_PLIST}" >/dev/null 2>&1 || true
 launchctl bootout "${DOMAIN}" "${AUTO_PLIST}" >/dev/null 2>&1 || true
+launchctl bootout "${DOMAIN}" "${WORKER_PLIST}" >/dev/null 2>&1 || true
 
 launchctl bootstrap "${DOMAIN}" "${MCP_PLIST}"
 launchctl bootstrap "${DOMAIN}" "${AUTO_PLIST}"
+launchctl bootstrap "${DOMAIN}" "${WORKER_PLIST}"
 
 launchctl enable "${DOMAIN}/${MCP_LABEL}" >/dev/null 2>&1 || true
 launchctl enable "${DOMAIN}/${AUTO_LABEL}" >/dev/null 2>&1 || true
+launchctl enable "${DOMAIN}/${WORKER_LABEL}" >/dev/null 2>&1 || true
 launchctl kickstart -k "${DOMAIN}/${MCP_LABEL}" >/dev/null 2>&1 || true
 launchctl kickstart -k "${DOMAIN}/${AUTO_LABEL}" >/dev/null 2>&1 || true
+launchctl kickstart -k "${DOMAIN}/${WORKER_LABEL}" >/dev/null 2>&1 || true
+
+for _ in 1 2 3 4 5; do
+  if "${REPO_ROOT}/scripts/imprint_auto_snapshot_ctl.sh" start >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
 
 echo "Installed launchd agents:" >&2
 echo "- ${MCP_PLIST}" >&2
 echo "- ${AUTO_PLIST}" >&2
+echo "- ${WORKER_PLIST}" >&2
 
 echo "{" >&2
 echo "  \"ok\": true," >&2
 echo "  \"domain\": \"${DOMAIN}\"," >&2
 echo "  \"mcp_label\": \"${MCP_LABEL}\"," >&2
 echo "  \"auto_snapshot_label\": \"${AUTO_LABEL}\"," >&2
+echo "  \"worker_label\": \"${WORKER_LABEL}\"," >&2
 echo "  \"mcp_port\": ${MCP_PORT}" >&2
 echo "}" >&2

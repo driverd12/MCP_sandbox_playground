@@ -65,6 +65,7 @@ type appConfig struct {
 	executeAllowAgents           map[string]bool
 	executeApprovalPhrase        string
 	pollInterval                 time.Duration
+	launcher                     bool
 	altScreen                    bool
 	sessionSeed                  string
 }
@@ -915,15 +916,18 @@ type model struct {
 	messages    []triChatMessage
 	reliability reliabilitySnapshot
 
-	ready         bool
-	startupErr    error
-	statusLine    string
-	logs          []string
-	activeTab     tabID
-	settingsIndex int
-	inflight      bool
-	refreshing    bool
-	lastRefresh   time.Time
+	ready          bool
+	startupErr     error
+	statusLine     string
+	logs           []string
+	activeTab      tabID
+	settingsIndex  int
+	launcherActive bool
+	launcherIndex  int
+	launcherItems  []string
+	inflight       bool
+	refreshing     bool
+	lastRefresh    time.Time
 
 	width  int
 	height int
@@ -961,21 +965,26 @@ type actionDoneMsg struct {
 type tickMsg time.Time
 
 type uiTheme struct {
-	root         lipgloss.Style
-	header       lipgloss.Style
-	tabActive    lipgloss.Style
-	tabInactive  lipgloss.Style
-	panel        lipgloss.Style
-	panelTitle   lipgloss.Style
-	footer       lipgloss.Style
-	status       lipgloss.Style
-	errorStatus  lipgloss.Style
-	inputPanel   lipgloss.Style
-	chatAgent    map[string]lipgloss.Style
-	helpText     lipgloss.Style
-	settingKey   lipgloss.Style
-	settingValue lipgloss.Style
-	settingPick  lipgloss.Style
+	root           lipgloss.Style
+	header         lipgloss.Style
+	tabActive      lipgloss.Style
+	tabInactive    lipgloss.Style
+	panel          lipgloss.Style
+	panelTitle     lipgloss.Style
+	footer         lipgloss.Style
+	status         lipgloss.Style
+	errorStatus    lipgloss.Style
+	inputPanel     lipgloss.Style
+	chatAgent      map[string]lipgloss.Style
+	helpText       lipgloss.Style
+	settingKey     lipgloss.Style
+	settingValue   lipgloss.Style
+	settingPick    lipgloss.Style
+	launcherFrame  lipgloss.Style
+	launcherTitle  lipgloss.Style
+	launcherAccent lipgloss.Style
+	launcherOption lipgloss.Style
+	launcherSelect lipgloss.Style
 }
 
 func newTheme() uiTheme {
@@ -1032,6 +1041,24 @@ func newTheme() uiTheme {
 		settingKey:   lipgloss.NewStyle().Foreground(blue),
 		settingValue: lipgloss.NewStyle().Foreground(text),
 		settingPick:  lipgloss.NewStyle().Foreground(pink).Bold(true),
+		launcherFrame: lipgloss.NewStyle().
+			Background(panelBg).
+			BorderStyle(lipgloss.ThickBorder()).
+			BorderForeground(pink).
+			Padding(1, 2),
+		launcherTitle: lipgloss.NewStyle().
+			Foreground(blue).
+			Bold(true),
+		launcherAccent: lipgloss.NewStyle().
+			Foreground(mint).
+			Bold(true),
+		launcherOption: lipgloss.NewStyle().
+			Foreground(text),
+		launcherSelect: lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#22062f")).
+			Background(pink).
+			Bold(true).
+			Padding(0, 1),
 		chatAgent: map[string]lipgloss.Style{
 			"user":          lipgloss.NewStyle().Foreground(mint).Bold(true),
 			"codex":         lipgloss.NewStyle().Foreground(pink).Bold(true),
@@ -1047,8 +1074,12 @@ func newModel(cfg appConfig) model {
 	input := textinput.New()
 	input.Prompt = "❯ "
 	input.CharLimit = 4000
-	input.Placeholder = "Type a prompt to fan out to codex/cursor/local-imprint, or use /help"
-	input.Focus()
+	input.Placeholder = "Type normally to fan out to codex/cursor/local-imprint. Slash commands are optional."
+	if cfg.launcher {
+		input.Blur()
+	} else {
+		input.Focus()
+	}
 
 	sp := spinner.New()
 	sp.Spinner = spinner.Points
@@ -1075,21 +1106,30 @@ func newModel(cfg appConfig) model {
 	}
 
 	return model{
-		cfg:         cfg,
-		settings:    settings,
-		caller:      caller,
-		mutation:    newMutationFactory(cfg.sessionSeed),
-		orch:        newOrchestrator(cfg),
-		threadID:    cfg.threadID,
-		threadTitle: cfg.threadTitle,
-		statusLine:  "starting...",
-		logs:        []string{},
-		activeTab:   tabChat,
-		input:       input,
-		timeline:    viewport.New(0, 0),
-		sidebar:     viewport.New(0, 0),
-		spinner:     sp,
-		theme:       newTheme(),
+		cfg:            cfg,
+		settings:       settings,
+		caller:         caller,
+		mutation:       newMutationFactory(cfg.sessionSeed),
+		orch:           newOrchestrator(cfg),
+		threadID:       cfg.threadID,
+		threadTitle:    cfg.threadTitle,
+		statusLine:     "starting...",
+		logs:           []string{},
+		activeTab:      tabChat,
+		launcherActive: cfg.launcher,
+		launcherIndex:  0,
+		launcherItems: []string{
+			"Start Tri-Chat",
+			"Open Reliability",
+			"Open Settings",
+			"Open Help",
+			"Quit",
+		},
+		input:    input,
+		timeline: viewport.New(0, 0),
+		sidebar:  viewport.New(0, 0),
+		spinner:  sp,
+		theme:    newTheme(),
 	}
 }
 
@@ -1698,6 +1738,56 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.launcherActive {
+			switch msg.String() {
+			case "up", "k":
+				m.launcherIndex = (m.launcherIndex + len(m.launcherItems) - 1) % len(m.launcherItems)
+			case "down", "j":
+				m.launcherIndex = (m.launcherIndex + 1) % len(m.launcherItems)
+			case "esc":
+				m.launcherActive = false
+				m.activeTab = tabChat
+				m.input.Focus()
+				m.statusLine = "launcher skipped · chat ready"
+				m.renderPanes()
+			case "q":
+				return m, tea.Quit
+			case "enter":
+				switch m.launcherIndex {
+				case 0:
+					m.launcherActive = false
+					m.activeTab = tabChat
+					m.input.Focus()
+					if m.ready {
+						m.statusLine = "tri-chat ready"
+					} else {
+						m.statusLine = "starting tri-chat..."
+					}
+					m.renderPanes()
+				case 1:
+					m.launcherActive = false
+					m.activeTab = tabReliability
+					m.input.Blur()
+					m.statusLine = "reliability panel"
+					m.renderPanes()
+				case 2:
+					m.launcherActive = false
+					m.activeTab = tabSettings
+					m.input.Blur()
+					m.statusLine = "settings panel"
+					m.renderPanes()
+				case 3:
+					m.launcherActive = false
+					m.activeTab = tabHelp
+					m.input.Blur()
+					m.statusLine = "help panel"
+					m.renderPanes()
+				case 4:
+					return m, tea.Quit
+				}
+			}
+			return m, tea.Batch(cmds...)
+		}
 
 		switch msg.String() {
 		case "tab":
@@ -1916,6 +2006,9 @@ func (m model) View() string {
 			)
 		return m.theme.root.Render(errorPanel)
 	}
+	if m.launcherActive {
+		return m.theme.root.Render(m.renderLauncher())
+	}
 
 	header := m.renderHeader()
 	content := m.renderContent()
@@ -1924,6 +2017,60 @@ func (m model) View() string {
 
 	out := lipgloss.JoinVertical(lipgloss.Left, header, content, input, footer)
 	return m.theme.root.Render(out)
+}
+
+func (m *model) renderLauncher() string {
+	contentWidth := maxInt(44, minInt(96, m.width-4))
+	if contentWidth <= 0 {
+		contentWidth = 72
+	}
+
+	bootLine := m.theme.launcherAccent.Render("Status:") + " "
+	if m.ready {
+		bootLine += "connected to Anamnesis runtime"
+	} else {
+		bootLine += m.spinner.View() + " booting local apartment runtime"
+	}
+
+	var options strings.Builder
+	for idx, item := range m.launcherItems {
+		line := fmt.Sprintf(" %d. %s", idx+1, item)
+		if idx == m.launcherIndex {
+			options.WriteString(m.theme.launcherSelect.Render(line))
+		} else {
+			options.WriteString(m.theme.launcherOption.Render(line))
+		}
+		options.WriteString("\n")
+	}
+
+	art := []string{
+		"    /\\_/\\        /\\_/\\        /\\_/\\",
+		"   ( o.o )      ( o.o )      ( o.o )",
+		"    > ^ <        > ^ <        > ^ <",
+	}
+
+	body := strings.Join([]string{
+		m.theme.launcherTitle.Render("TriChat"),
+		m.theme.helpText.Render("Retro launcher for your three-agent terminal apartment"),
+		"",
+		m.theme.launcherAccent.Render(strings.Join(art, "\n")),
+		"",
+		bootLine,
+		m.theme.helpText.Render("Thread: " + nullCoalesce(m.threadID, "starting...")),
+		"",
+		strings.TrimRight(options.String(), "\n"),
+		"",
+		m.theme.helpText.Render("Keys: ↑/↓ choose · Enter launch · Esc skip to chat · q quit"),
+	}, "\n")
+
+	panel := m.theme.launcherFrame.Width(contentWidth).Render(body)
+	return lipgloss.Place(
+		maxInt(contentWidth+2, m.width-2),
+		maxInt(16, m.height-2),
+		lipgloss.Center,
+		lipgloss.Center,
+		panel,
+	)
 }
 
 func (m *model) renderHeader() string {
@@ -2200,6 +2347,7 @@ func (m *model) renderSettings() string {
 func (m *model) renderHelp() string {
 	lines := []string{
 		"Core Keys",
+		"- Launcher: Up/Down select, Enter launch, Esc skip to chat",
 		"- Tab / Shift+Tab: switch views",
 		"- Enter: send prompt (Chat tab)",
 		"- PgUp/PgDn: scroll timeline",
@@ -2279,6 +2427,10 @@ func parseFlags() appConfig {
 	flag.StringVar(&cfg.executeApprovalPhrase, "execute-approval-phrase", envOr("TRICHAT_EXECUTE_APPROVAL_PHRASE", "approve"), "Approval phrase for execute gate mode=approval")
 	pollIntervalSeconds := envOrInt("TRICHAT_TUI_POLL_INTERVAL", 2)
 	flag.IntVar(&pollIntervalSeconds, "poll-interval", pollIntervalSeconds, "Refresh interval seconds")
+	launcherDefault := envOrBool("TRICHAT_TUI_LAUNCHER", true)
+	flag.BoolVar(&cfg.launcher, "launcher", launcherDefault, "Show startup launcher menu")
+	noLauncher := envOrBool("TRICHAT_TUI_NO_LAUNCHER", false)
+	flag.BoolVar(&noLauncher, "no-launcher", noLauncher, "Disable launcher and open chat input immediately")
 	flag.BoolVar(&cfg.altScreen, "alt-screen", true, "Use alternate screen buffer")
 	flag.StringVar(&cfg.sessionSeed, "session-seed", "", "Optional idempotency seed")
 	flag.Parse()
@@ -2295,6 +2447,9 @@ func parseFlags() appConfig {
 	cfg.adapterCircuitThreshold = clampInt(cfg.adapterCircuitThreshold, 1, 10)
 	cfg.adapterCircuitRecoverySecond = clampInt(cfg.adapterCircuitRecoverySecond, 1, 600)
 	cfg.pollInterval = time.Duration(clampInt(pollIntervalSeconds, 1, 60)) * time.Second
+	if noLauncher {
+		cfg.launcher = false
+	}
 	cfg.executeGateMode = normalizeGateMode(cfg.executeGateMode)
 	cfg.executeAllowAgents = parseAllowlist(allowAgents)
 	if strings.TrimSpace(cfg.codexCommand) == "" {
@@ -2360,6 +2515,21 @@ func envOrInt(key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func envOrBool(key string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if value == "" {
+		return fallback
+	}
+	switch value {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func autoBridgeCommand(repoRoot, agentID string) string {

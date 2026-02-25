@@ -1,64 +1,217 @@
 # Anamnesis
+![Tri-Chat Icon](./tri-chat-icon.png)
 
-Anamnesis is a local-first MCP server for cross-IDE continuity, durable memory, run ledgers, policy checks, locks, incident timelines, and deterministic workflow simulation.
+Anamnesis is a local-first MCP runtime with durable memory, durable task orchestration, and a multi-agent terminal experience (`TriChat`) that lets you talk to `codex`, `cursor`, and `local-imprint` in one place.
 
-## Vision
+## Three Cats, One Apartment
+Anamnesis is built as a shared apartment for agents:
 
-Anamnesis is designed as a "Shared Apartment" for agents. Different clients and IDEs can enter the same local runtime, retain shared identity, and coordinate through durable memory rather than ephemeral chat logs. Raw interactions land in working memory (`transcript_lines`), then are squished into distilled long-term memory (`memories`) so context stays useful instead of growing without bound.
+- Every agent shares one local identity and one durable context source.
+- Raw chat and events land in working memory (`transcript_lines`, `trichat_messages`).
+- Important context is squished into long-term memory (`memories`).
+- Coordination is deterministic through SQLite, leases, timelines, and idempotent mutation journaling.
 
-## Features
+Local-first is non-negotiable: everything lives on your machine, centered on `./data/hub.sqlite`.
 
-- Local SQLite storage (`./data/hub.sqlite` by default)
-- Versioned SQLite migrations with `schema_migrations` + `PRAGMA user_version`
-- Idempotent mutation journal (`idempotency_key` + `side_effect_fingerprint`)
-- Shared memory and transcript tooling across clients
-- Transcript squishing loop (`transcript.log` -> `transcript.squish` -> `memory.search`)
-- Interval backlog drain daemon (`transcript.auto_squish`)
-- Auto-squish daemon config persisted across server restarts
-- Retention policy control for transcript working memory (`transcript.retention`)
-- Durable Imprint profile + continuity snapshots (`imprint.profile_set`, `imprint.snapshot`, `imprint.bootstrap`)
-- Interval-based Imprint snapshot daemon (`imprint.auto_snapshot`)
-- Local inbox queue + worker daemon for unprompted workload execution (`data/imprint/inbox`, `imprint.inbox.enqueue`)
-- Durable task orchestration with leases (`tasks`, `task_events`, `task_leases`, `task.*`)
-- Task reliability summary surface (`task.summary`) for live queue/lease visibility
-- Failed-task retry daemon with deterministic backoff (`task.auto_retry`)
-- Durable tri-chat message bus (`trichat.thread_*`, `trichat.message_post`, `trichat.timeline`)
-- Tri-chat retention controls to keep message history bounded (`trichat.retention`)
-- Tri-chat observability and housekeeping daemon (`trichat.summary`, `trichat.auto_retention`)
-- Persistent adapter breaker telemetry (`trichat.adapter_telemetry`) with trip history and last-open events
-- Plug-and-play bridge wrappers for Codex + Cursor CLIs (`./bridges/*.py`) with `trichat:bridges:doctor`
-- Launchd auto-start support for MCP HTTP server + Imprint auto-snapshot
-- Agent on/off switch (`scripts/agents_switch.sh`) for start/stop/status control
-- ADR creation helper (`adr.create`) writing to `./docs/adrs/`
-- Policy/preflight/postflight safety tools
-- Run timeline ledgering + lock leasing
-- Local retrieval and query planning
-- Incident tracking and timeline
+## What You Get
+- Local SQLite persistence (`./data/hub.sqlite` by default)
+- Versioned migrations (`schema_migrations` + `PRAGMA user_version`)
+- Idempotent side effects (`idempotency_key` + `side_effect_fingerprint`)
+- Durable transcript and memory loop (`transcript.log` -> `transcript.squish` -> `memory.search`)
+- Auto-squish daemon (`transcript.auto_squish`) + retention (`transcript.retention`)
+- Durable tri-agent message bus (`trichat.thread_*`, `trichat.message_post`, `trichat.timeline`)
+- Task queue with leases and full event history (`task.*`, `task.timeline`, `task.summary`)
+- Retry daemon with deterministic backoff (`task.auto_retry`)
+- Adapter circuit breakers with persisted telemetry (`trichat.adapter_telemetry`)
+- Imprint continuity (`imprint.profile_set`, `imprint.snapshot`, `imprint.bootstrap`)
+- Inbox worker for autonomous execution (`imprint.inbox.*`, `agent_loop.py`)
+- ADR support (`adr.create`) writing to `./docs/adrs/` and SQLite
 
 ## Quick Start
-
 ```bash
 npm ci
 npm run build
 npm run start:stdio
 ```
 
-Start TriChat (STDIO-backed MCP calls):
+In another terminal, launch the Bubble Tea interface:
 
 ```bash
-npm run trichat
+npm run trichat:tui
 ```
 
-Start TriChat against a live local HTTP MCP server:
+HTTP mode is also supported:
 
 ```bash
 npm run start:http
-npm run trichat:http
+npm run trichat:tui:http
 ```
 
-## Configuration
+## First Launch Flow (No Slash Commands Required)
+When TriChat starts, you get a launcher menu with:
 
-Copy and edit:
+1. `Start Tri-Chat`
+2. `Open Reliability`
+3. `Open Settings`
+4. `Open Help`
+5. `Quit`
+
+Then chat naturally. One prompt fans out to all three agents by default. Slash commands stay optional for control cases.
+
+Useful launcher controls:
+
+- `Up/Down`: pick menu item
+- `Enter`: launch selection
+- `Esc`: skip launcher and jump to chat
+- `q`: quit
+
+If you want to disable the launcher:
+
+```bash
+npm run trichat:tui -- --no-launcher
+```
+
+## One-Click macOS App
+Install a clickable app in `~/Applications/TriChat.app` with your icon:
+
+```bash
+npm run trichat:app:install -- --icon /absolute/path/to/tri-chat-icon.png
+```
+
+Notes:
+
+- Default terminal mode is `alacritty`.
+- The installer builds an `.icns` from your PNG and injects it into the app bundle.
+- You can copy/move `TriChat.app` into `/Applications` if you want a system-wide launcher.
+
+## TriChat Experience
+TriChat TUI gives you:
+
+- Live timeline pane (durable thread history)
+- Input bar for natural chat + optional slash commands
+- Reliability sidebar (task counts, daemons, lease owners, adapter trips)
+- Settings panel for fanout target, gate mode, failover timeouts, and circuit breaker tuning
+- Help panel with command reference
+
+Theme direction:
+
+- Cotton-candy cyber palette (pink / blue / mint accents)
+- Framed rounded panels for readability
+- Fast keyboard-only navigation for live workflows
+
+## Bridge Adapters (Cursor + Codex)
+TriChat auto-detects bridge wrappers from `./bridges`:
+
+- `bridges/codex_bridge.py`
+- `bridges/cursor_bridge.py`
+- `bridges/local-imprint_bridge.py` (optional)
+
+Validate adapters and local auth state:
+
+```bash
+npm run trichat:bridges:doctor
+```
+
+If needed, authenticate once:
+
+```bash
+codex login
+cursor-agent login
+```
+
+## Reliability Model
+The runtime is built to degrade gracefully instead of stalling:
+
+- Per-agent command/model circuit breakers
+- Recovery windows and auto-close behavior
+- Durable breaker state + trip history in SQLite
+- Automatic retry for failed tasks with backoff
+- Lease-based task claiming with heartbeat support
+- Message retention daemons to keep growth bounded
+
+## Core Operational Commands
+Health and checks:
+
+```bash
+npm test
+npm run mvp:smoke
+npm run trichat:smoke
+```
+
+Agent lifecycle:
+
+```bash
+npm run agents:on
+npm run agents:off
+npm run agents:status
+```
+
+Launchd services:
+
+```bash
+npm run launchd:install
+npm run launchd:uninstall
+```
+
+Imprint continuity:
+
+```bash
+npm run imprint:bootstrap
+python3 ./agent_loop.py --help
+```
+
+Inbox queue:
+
+```bash
+npm run inbox:enqueue -- --objective "Run tests and summarize failures"
+npm run inbox:worker
+```
+
+## High-Value MCP Tools
+Memory and transcripts:
+
+- `memory.append`
+- `memory.search`
+- `memory.get`
+- `transcript.log`
+- `transcript.run_timeline`
+- `transcript.squish`
+- `transcript.auto_squish`
+- `transcript.retention`
+
+Knowledge and governance:
+
+- `knowledge.promote` (`source_type`: `memory` or `transcript_line`)
+- `adr.create`
+- `migration.status`
+
+TriChat bus and telemetry:
+
+- `trichat.thread_open`
+- `trichat.thread_list`
+- `trichat.thread_get`
+- `trichat.message_post`
+- `trichat.timeline`
+- `trichat.summary`
+- `trichat.retention`
+- `trichat.auto_retention`
+- `trichat.adapter_telemetry`
+
+Tasks and execution:
+
+- `task.create`
+- `task.list`
+- `task.claim`
+- `task.heartbeat`
+- `task.complete`
+- `task.fail`
+- `task.retry`
+- `task.timeline`
+- `task.summary`
+- `task.auto_retry`
+
+## Configuration
+Copy env template:
 
 ```bash
 cp .env.example .env
@@ -70,217 +223,30 @@ Key env vars:
 - `MCP_HUB_DB_PATH` (legacy fallback)
 - `MCP_HTTP_BEARER_TOKEN`
 - `MCP_HTTP_ALLOWED_ORIGINS`
-- `ANAMNESIS_INBOX_POLL_INTERVAL` / `ANAMNESIS_INBOX_BATCH_SIZE`
-- `ANAMNESIS_INBOX_LEASE_SECONDS` / `ANAMNESIS_INBOX_HEARTBEAT_INTERVAL`
+- `TRICHAT_MCP_TRANSPORT` (`stdio` or `http`)
+- `TRICHAT_OLLAMA_MODEL`
+- `TRICHAT_TUI_LAUNCHER` (`true`/`false`)
+- `TRICHAT_EXECUTE_GATE_MODE` (`open`/`allowlist`/`approval`)
 
-## Test
+## Suggested Daily Loop
+1. Start server + TriChat.
+2. Chat naturally; let prompts fan out to all agents.
+3. Route concrete actions into durable tasks.
+4. Watch reliability sidebar for leases, retries, and adapter events.
+5. Periodically squish and retain old working memory.
+6. Snapshot imprint context before handoff.
 
-```bash
-npm test
-```
+## Repo Layout
+- `src/` TypeScript MCP server
+- `cmd/trichat-tui/` Bubble Tea terminal UI
+- `bridges/` Codex/Cursor/local adapter wrappers
+- `scripts/` smoke checks, installers, launch helpers
+- `docs/` architecture notes and ADRs
+- `data/` local SQLite DB and runtime state
+- `tests/` integration and invariants
 
-## MVP Workflow
-
-1. Log raw lines into working memory with `transcript.log`.
-2. Squish unsquished lines by run/session using `transcript.squish`.
-3. Query distilled results through `memory.search`, `who_knows`, or `retrieval.hybrid`.
-4. Persist architecture decisions with `adr.create`.
-5. Periodically drain and prune with `transcript.auto_squish` and `transcript.retention`.
-
-This loop is fully local-first and idempotent for mutating tools.
-Run the baseline smoke check with `npm run mvp:smoke`.
-
-## Imprint Continuity
-
-Bootstrap a durable local profile + snapshot in one command:
-
-```bash
-npm run imprint:bootstrap
-```
-
-This runs `imprint.profile_set`, `imprint.snapshot`, and `imprint.bootstrap` against your live server transport (`stdio` by default).
-
-`agent_loop.py` now loads `imprint.bootstrap` at startup by default, so local Llama planning starts from persisted context.
-Disable it with `--no-imprint-bootstrap`.
-
-## Inbox Worker
-
-Drop a task into local inbox:
-
-```bash
-npm run inbox:enqueue -- --objective "Run tests and summarize failures"
-```
-
-Run worker manually:
-
-```bash
-npm run inbox:worker
-```
-
-Worker behavior:
-
-- Claims durable tasks from SQLite with renewable leases.
-- Imports legacy file drops from `./data/imprint/inbox/pending` into durable tasks.
-- Archives execution payloads/results in `done` and `failed` for human debugging.
-
-Inbox paths:
-
-- `./data/imprint/inbox/pending` (new tasks)
-- `./data/imprint/inbox/processing` (legacy import staging)
-- `./data/imprint/inbox/done` (completed task + result JSON)
-- `./data/imprint/inbox/failed` (failed task + result JSON)
-
-## Always-On Mode
-
-Install launchd services (auto-start on login):
-
-```bash
-npm run launchd:install
-```
-
-Control local agent switches:
-
-```bash
-npm run agents:on
-npm run agents:off
-npm run agents:status
-```
-
-Switch mapping:
-
-- `eyes`: local MCP server context visibility
-- `ears`: local MCP intake/transport availability
-- `fingers`: local automated agent execution capability
-
-## Agent Playbook
-
-- Use `transcript.pending_runs` to discover runs that still need squishing.
-- Use `transcript.run_timeline` for deterministic debugging of a single run.
-- Use `transcript.auto_squish` in `status`, `run_once`, `start`, and `stop` modes to automate backlog draining.
-- Use `transcript.retention` with `dry_run: true` first, then apply deletion once candidates are verified.
-- Use `migration.status` to confirm applied schema versions independently of health checks.
-- Use `memory.get` to inspect exact long-term records by id when triaging behavior.
-- Use `knowledge.promote` with `source_type` set to `memory` or `transcript_line` to elevate proven details.
-- Use `imprint.profile_set` once per project/workspace to persist operating doctrine for all future agents.
-- Use `imprint.snapshot` before handoff to persist current local state as a continuity checkpoint.
-- Use `imprint.bootstrap` at session start to rehydrate mission, recent memory, and pending work in one read.
-- Use `imprint.auto_snapshot` (`status`, `run_once`, `start`, `stop`) for periodic continuity capture.
-- Use `imprint.inbox.enqueue` (or `npm run inbox:enqueue`) to submit background workloads.
-- Use `imprint.inbox.list` to inspect backlog and task outcomes.
-- Use `task.create`, `task.list`, and `task.claim` for durable queue orchestration.
-- Use `task.summary` for live reliability counts, running lease owners, and latest failure context.
-- Use `task.timeline` to inspect the exact event trail in `task_events`.
-- Use `task.heartbeat`, `task.complete`, `task.fail`, and `task.retry` for lease-aware lifecycle control.
-- Use `task.auto_retry` (`status`, `run_once`, `start`, `stop`) to requeue failed tasks with backoff.
-- Use `trichat.thread_open` / `trichat.thread_list` / `trichat.thread_get` to manage persistent tri-chat threads.
-- Use `trichat.message_post` and `trichat.timeline` to keep user/agent conversation state durable across restarts.
-- Use `trichat.summary` for tri-chat bus health telemetry.
-- Use `trichat.adapter_telemetry` for durable adapter circuit state, trip history, and recovery diagnostics.
-- Use `trichat.retention` (`dry_run` first) to prune old message-bus history when threads grow large.
-- Use `trichat.auto_retention` (`status`, `run_once`, `start`, `stop`) for interval-based tri-chat pruning.
-- Run `./scripts/mvp_smoke.sh` before handoff to verify end-to-end health (default `stdio`, optional `http`).
-
-## TriChat
-
-TriChat provides one terminal orchestrator that fans one prompt out to `codex`, `cursor`, and `local-imprint`, writes every turn into the durable message bus, and routes execution into durable tasks.
-
-Run:
-
-```bash
-python3 ./scripts/trichat.py --resume-latest --panel-on-start
-```
-
-Bubble Tea TUI (full-screen framed UI with timeline, slash bar, reliability sidebar, and settings menu):
-
-```bash
-npm run trichat:tui
-```
-
-TUI over HTTP transport:
-
-```bash
-npm run start:http
-npm run trichat:tui:http
-```
-
-TUI notes:
-
-- Requires Go (`go` in PATH). Install with Homebrew: `brew install go`.
-- Tabs: `Chat`, `Reliability`, `Settings`, `Help`.
-- `Chat` tab supports one-prompt fanout and slash commands.
-- `Settings` tab exposes live controls for fanout target, execute gate mode, polling interval, failover timeouts, and circuit breaker thresholds/recovery.
-- `Reliability` tab surfaces task counts, active lease owners, daemon statuses, and adapter telemetry/trip events.
-
-Install a one-click macOS app launcher (single icon) for TriChat:
-
-```bash
-npm run trichat:app:install -- --icon /absolute/path/to/three-cats.png
-```
-
-This creates `~/Applications/TriChat.app` and applies your icon image as the app icon.
-
-Bridge mode (optional):
-
-- TriChat and `trichat-tui` auto-discover `./bridges/codex_bridge.py` and `./bridges/cursor_bridge.py` with zero manual wiring.
-- Run `npm run trichat:bridges:doctor` to verify bridge wrappers + local CLI prerequisites (`codex`, `cursor-agent`).
-- If doctor reports auth failure, run `codex login` and/or `cursor-agent login` once.
-- Override bridge commands only when needed with `TRICHAT_CODEX_CMD` and/or `TRICHAT_CURSOR_CMD`.
-- If bridge commands fail for a turn, TriChat falls back to local Ollama adapters so all channels continue responding.
-- Per-agent command/model channels use circuit breakers with recovery windows so transient adapter failures degrade the turn instead of stalling it.
-- Tune failover behavior with `--adapter-failover-timeout`, `--adapter-circuit-threshold`, `--adapter-circuit-recovery-seconds`, and `--model-timeout`.
-
-Useful commands in TriChat:
-
-- `/plan`, `/propose`, `/agent <id> <msg>`, `/huddle <topic>`
-- `/adapters status|reset [all|codex|cursor|local-imprint]`
-- `/execute <agent> [objective]` (routes into `task.create`)
-- `/gate status|open|allowlist|approval`
-- `/gate allowlist <agent1,agent2,...>`
-- `/gate phrase <text>` (approval mode phrase)
-- `/panel`, `/tasks`, `/timeline <task_id>`, `/retry ...`
-- `/retentiond status|start|stop|run_once`
-- `/thread list|new|use|archive`
-- `/retention [days] [apply] [all]`
-
-`/execute` policy modes:
-
-- `open` (default): fully unconstrained routing to `task.create`.
-- `allowlist`: only allow `/execute` from configured agent IDs.
-- `approval`: require interactive operator confirmation before `task.create`.
-
-Configure gate mode at startup:
-
-```bash
-python3 ./scripts/trichat.py --execute-gate-mode open
-python3 ./scripts/trichat.py --execute-gate-mode allowlist --execute-allow-agents codex,local-imprint
-python3 ./scripts/trichat.py --execute-gate-mode approval --execute-approval-phrase approve
-```
-
-TriChat operational smoke check:
-
-```bash
-npm run trichat:smoke
-```
-
-Run smoke against a live local HTTP server:
-
-```bash
-TRICHAT_SMOKE_TRANSPORT=http \
-MCP_HTTP_BEARER_TOKEN="change-me" \
-npm run trichat:smoke
-```
-
-Suggested loop for multi-agent collaboration:
-
-1. Agent A logs raw observations with `transcript.log`.
-2. Agent B runs `transcript.auto_squish` (`run_once` or daemon `start`) and checks `transcript.pending_runs` until backlog is clear.
-3. Agent C searches with `retrieval.hybrid`, validates with `memory.get`, and promotes high-value items.
-4. Agent D applies `transcript.retention` after a `dry_run` review to keep raw backlog bounded.
-5. Any agent records decisions via `adr.create` for durable governance.
-
-## Transports
-
+## Transport Docs
 - STDIO: `npm run start:stdio`
 - HTTP: `npm run start:http`
 
-See `/docs/CONNECT.md` for full setup and client examples.
+More connection examples: `./docs/CONNECT.md`

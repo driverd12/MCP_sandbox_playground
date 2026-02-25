@@ -929,6 +929,7 @@ type model struct {
 	inflight       bool
 	refreshing     bool
 	lastRefresh    time.Time
+	quitConfirm    bool
 
 	width  int
 	height int
@@ -1764,6 +1765,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if m.quitConfirm {
+			switch msg.String() {
+			case "y", "Y", "enter":
+				return m, tea.Quit
+			case "n", "N", "esc":
+				m.quitConfirm = false
+				m.statusLine = "quit canceled"
+				m.renderPanes()
+				return m, tea.Batch(cmds...)
+			default:
+				return m, tea.Batch(cmds...)
+			}
+		}
 		if m.launcherActive {
 			switch msg.String() {
 			case "up", "k":
@@ -1777,7 +1791,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusLine = "launcher skipped · chat ready"
 				m.renderPanes()
 			case "q":
-				return m, tea.Quit
+				m.beginQuitConfirm()
+				return m, tea.Batch(cmds...)
 			case "enter":
 				switch m.launcherIndex {
 				case 0:
@@ -1809,13 +1824,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusLine = "help panel"
 					m.renderPanes()
 				case 4:
-					return m, tea.Quit
+					m.beginQuitConfirm()
+					return m, tea.Batch(cmds...)
 				}
 			}
 			return m, tea.Batch(cmds...)
 		}
 
 		switch msg.String() {
+		case "esc":
+			if m.activeTab == tabChat {
+				m.beginQuitConfirm()
+				return m, tea.Batch(cmds...)
+			}
+			m.launcherActive = true
+			m.launcherIndex = launcherIndexForTab(m.activeTab)
+			m.input.Blur()
+			m.statusLine = "launcher menu"
+			m.renderPanes()
+			return m, tea.Batch(cmds...)
 		case "tab":
 			m.activeTab = (m.activeTab + 1) % 4
 			if m.activeTab == tabChat {
@@ -1865,6 +1892,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "pgdown", "ctrl+f":
 				m.timeline.LineDown(8)
 				return m, tea.Batch(cmds...)
+			case "-", "_", "ctrl+u":
+				if strings.TrimSpace(m.input.Value()) == "" {
+					m.timeline.LineUp(8)
+					return m, tea.Batch(cmds...)
+				}
+			case "=", "+", "ctrl+d":
+				if strings.TrimSpace(m.input.Value()) == "" {
+					m.timeline.LineDown(8)
+					return m, tea.Batch(cmds...)
+				}
 			case "home":
 				m.timeline.GotoTop()
 				return m, tea.Batch(cmds...)
@@ -1889,9 +1926,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.renderPanes()
 		case tabReliability:
 			switch msg.String() {
-			case "pgup", "k":
+			case "pgup", "k", "-", "_", "ctrl+u":
 				m.sidebar.LineUp(4)
-			case "pgdown", "j":
+			case "pgdown", "j", "=", "+", "ctrl+d":
 				m.sidebar.LineDown(4)
 			}
 		}
@@ -1914,7 +1951,8 @@ func (m *model) handleSlash(raw string) tea.Cmd {
 		return nil
 	case "/quit", "/exit":
 		m.inflight = false
-		return tea.Quit
+		m.beginQuitConfirm()
+		return nil
 	case "/panel":
 		return m.refreshCmd()
 	case "/fanout":
@@ -2138,6 +2176,24 @@ func padRight(text string, width int) string {
 	return text + strings.Repeat(" ", width-len(text))
 }
 
+func launcherIndexForTab(tab tabID) int {
+	switch tab {
+	case tabReliability:
+		return 1
+	case tabSettings:
+		return 2
+	case tabHelp:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func (m *model) beginQuitConfirm() {
+	m.quitConfirm = true
+	m.statusLine = "ARE YOU SURE YOU WANT TO QUIT?"
+}
+
 func applyScanlineOverlay(text string, lineA lipgloss.Style, lineB lipgloss.Style) string {
 	lines := strings.Split(text, "\n")
 	maxWidth := 0
@@ -2235,7 +2291,11 @@ func (m *model) renderFooter() string {
 		statusStyle = m.theme.errorStatus
 	}
 	line := statusStyle.Render(compactSingleLine(m.statusLine, 180))
-	hints := m.theme.helpText.Render("Keys: Tab switch view · Enter send · PgUp/PgDn scroll · Ctrl+C quit")
+	hints := m.theme.helpText.Render("Keys: Tab switch view · Enter send · PgUp/PgDn or +/- scroll · Esc menu/quit prompt · Ctrl+C quit")
+	if m.quitConfirm {
+		line = m.theme.errorStatus.Render("ARE YOU SURE YOU WANT TO QUIT? [Y]es / [N]o")
+		hints = m.theme.helpText.Render("Retro prompt active · Enter or Y to quit · N or Esc to cancel")
+	}
 	return m.theme.footer.Width(contentWidth).Render(line + "\n" + hints)
 }
 
@@ -2436,7 +2496,9 @@ func (m *model) renderHelp() string {
 		"- Launcher: Up/Down select, Enter launch, Esc skip to chat",
 		"- Tab / Shift+Tab: switch views",
 		"- Enter: send prompt (Chat tab)",
-		"- PgUp/PgDn: scroll timeline",
+		"- Esc: from non-chat tabs, return to launcher menu",
+		"- Esc in chat: show retro quit confirmation",
+		"- PgUp/PgDn or +/- (and Ctrl+U/Ctrl+D): scroll timeline",
 		"- Ctrl+C: quit",
 		"",
 		"Slash Commands",

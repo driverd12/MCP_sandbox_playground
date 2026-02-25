@@ -2741,42 +2741,26 @@ export class Storage {
     agent_id?: string;
     channel?: TriChatAdapterChannel;
   }): TriChatAdapterTelemetrySummaryRecord {
-    const stateWhereClauses: string[] = [];
-    const stateValues: Array<string | number> = [];
     const eventWhereClauses: string[] = [];
     const eventValues: Array<string | number> = [];
 
     const agentId = params?.agent_id?.trim();
     if (agentId) {
-      stateWhereClauses.push("agent_id = ?");
-      stateValues.push(agentId);
       eventWhereClauses.push("agent_id = ?");
       eventValues.push(agentId);
     }
     if (params?.channel) {
       const channel = normalizeTriChatAdapterChannel(params.channel);
-      stateWhereClauses.push("channel = ?");
-      stateValues.push(channel);
       eventWhereClauses.push("channel = ?");
       eventValues.push(channel);
     }
 
-    const stateWhereSql = stateWhereClauses.length > 0 ? `WHERE ${stateWhereClauses.join(" AND ")}` : "";
     const eventWhereSql = eventWhereClauses.length > 0 ? `WHERE ${eventWhereClauses.join(" AND ")}` : "";
-
-    const stateAgg = this.db
-      .prepare(
-        `SELECT COUNT(*) AS total_channels,
-                SUM(CASE WHEN open = 1 THEN 1 ELSE 0 END) AS open_channels,
-                SUM(trip_count) AS total_trips,
-                SUM(success_count) AS total_successes,
-                SUM(turn_count) AS total_turns,
-                SUM(degraded_turn_count) AS total_degraded_turns,
-                MAX(updated_at) AS newest_state_at
-         FROM trichat_adapter_states
-         ${stateWhereSql}`
-      )
-      .get(...stateValues) as Record<string, unknown>;
+    const states = this.listTriChatAdapterStates({
+      agent_id: agentId,
+      channel: params?.channel,
+      limit: 5000,
+    });
 
     const eventAgg = this.db
       .prepare(
@@ -2787,41 +2771,71 @@ export class Storage {
       )
       .get(...eventValues) as Record<string, unknown>;
 
-    const perAgentRows = this.db
-      .prepare(
-        `SELECT agent_id,
-                COUNT(*) AS channel_count,
-                SUM(CASE WHEN open = 1 THEN 1 ELSE 0 END) AS open_channels,
-                SUM(trip_count) AS total_trips,
-                SUM(turn_count) AS total_turns,
-                SUM(degraded_turn_count) AS degraded_turns,
-                MAX(updated_at) AS updated_at
-         FROM trichat_adapter_states
-         ${stateWhereSql}
-         GROUP BY agent_id
-         ORDER BY agent_id ASC`
-      )
-      .all(...stateValues) as Array<Record<string, unknown>>;
+    let newestStateAt: string | null = null;
+    let openChannels = 0;
+    let totalTrips = 0;
+    let totalSuccesses = 0;
+    let totalTurns = 0;
+    let totalDegradedTurns = 0;
+    const perAgent = new Map<
+      string,
+      {
+        agent_id: string;
+        channel_count: number;
+        open_channels: number;
+        total_trips: number;
+        total_turns: number;
+        degraded_turns: number;
+        updated_at: string | null;
+      }
+    >();
+    for (const state of states) {
+      if (state.open) {
+        openChannels += 1;
+      }
+      totalTrips += state.trip_count;
+      totalSuccesses += state.success_count;
+      totalTurns += state.turn_count;
+      totalDegradedTurns += state.degraded_turn_count;
+      if (state.updated_at && (!newestStateAt || state.updated_at > newestStateAt)) {
+        newestStateAt = state.updated_at;
+      }
+      const current = perAgent.get(state.agent_id) ?? {
+        agent_id: state.agent_id,
+        channel_count: 0,
+        open_channels: 0,
+        total_trips: 0,
+        total_turns: 0,
+        degraded_turns: 0,
+        updated_at: null,
+      };
+      current.channel_count += 1;
+      if (state.open) {
+        current.open_channels += 1;
+      }
+      current.total_trips += state.trip_count;
+      current.total_turns += state.turn_count;
+      current.degraded_turns += state.degraded_turn_count;
+      if (state.updated_at && (!current.updated_at || state.updated_at > current.updated_at)) {
+        current.updated_at = state.updated_at;
+      }
+      perAgent.set(state.agent_id, current);
+    }
+    const perAgentRows = [...perAgent.values()].sort((left, right) =>
+      left.agent_id.localeCompare(right.agent_id)
+    );
 
     return {
-      total_channels: Number(stateAgg.total_channels ?? 0),
-      open_channels: Number(stateAgg.open_channels ?? 0),
-      total_trips: Number(stateAgg.total_trips ?? 0),
-      total_successes: Number(stateAgg.total_successes ?? 0),
-      total_turns: Number(stateAgg.total_turns ?? 0),
-      total_degraded_turns: Number(stateAgg.total_degraded_turns ?? 0),
-      newest_state_at: asNullableString(stateAgg.newest_state_at),
+      total_channels: states.length,
+      open_channels: openChannels,
+      total_trips: totalTrips,
+      total_successes: totalSuccesses,
+      total_turns: totalTurns,
+      total_degraded_turns: totalDegradedTurns,
+      newest_state_at: newestStateAt,
       newest_event_at: asNullableString(eventAgg.newest_event_at),
       newest_trip_opened_at: asNullableString(eventAgg.newest_trip_opened_at),
-      per_agent: perAgentRows.map((row) => ({
-        agent_id: String(row.agent_id ?? ""),
-        channel_count: Number(row.channel_count ?? 0),
-        open_channels: Number(row.open_channels ?? 0),
-        total_trips: Number(row.total_trips ?? 0),
-        total_turns: Number(row.total_turns ?? 0),
-        degraded_turns: Number(row.degraded_turns ?? 0),
-        updated_at: asNullableString(row.updated_at),
-      })),
+      per_agent: perAgentRows,
     };
   }
 
@@ -4091,12 +4105,14 @@ function mapTriChatMessageRow(row: Record<string, unknown>): TriChatMessageRecor
 }
 
 function mapTriChatAdapterStateRow(row: Record<string, unknown>): TriChatAdapterStateRecord {
+  const openUntil = asNullableString(row.open_until);
+  const rawOpen = Number(row.open ?? 0) === 1;
   return {
     agent_id: String(row.agent_id ?? ""),
     channel: normalizeTriChatAdapterChannel(row.channel),
     updated_at: String(row.updated_at ?? ""),
-    open: Number(row.open ?? 0) === 1,
-    open_until: asNullableString(row.open_until),
+    open: isTriChatCircuitOpen(rawOpen, openUntil),
+    open_until: openUntil,
     failure_count: Number(row.failure_count ?? 0),
     trip_count: Number(row.trip_count ?? 0),
     success_count: Number(row.success_count ?? 0),
@@ -4107,6 +4123,20 @@ function mapTriChatAdapterStateRow(row: Record<string, unknown>): TriChatAdapter
     last_result: asNullableString(row.last_result),
     metadata: parseJsonObject(row.metadata_json),
   };
+}
+
+function isTriChatCircuitOpen(open: boolean, openUntil: string | null): boolean {
+  if (!open) {
+    return false;
+  }
+  if (!openUntil) {
+    return true;
+  }
+  const untilEpoch = Date.parse(openUntil);
+  if (!Number.isFinite(untilEpoch)) {
+    return true;
+  }
+  return untilEpoch > Date.now();
 }
 
 function mapTriChatAdapterEventRow(row: Record<string, unknown>): TriChatAdapterEventRecord {

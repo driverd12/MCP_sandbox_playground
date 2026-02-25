@@ -1079,9 +1079,9 @@ func newTheme() uiTheme {
 		launcherReady: lipgloss.NewStyle().Foreground(mint).Bold(true),
 		launcherMuted: lipgloss.NewStyle().Foreground(muted),
 		launcherScanlineA: lipgloss.NewStyle().
-			Background(panelBg),
+			Background(lipgloss.Color("#150b2d")),
 		launcherScanlineB: lipgloss.NewStyle().
-			Background(lipgloss.Color("#21103f")),
+			Background(lipgloss.Color("#311a63")),
 		chatAgent: map[string]lipgloss.Style{
 			"user":          lipgloss.NewStyle().Foreground(mint).Bold(true),
 			"codex":         lipgloss.NewStyle().Foreground(pink).Bold(true),

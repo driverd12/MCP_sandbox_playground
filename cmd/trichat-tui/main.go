@@ -2070,16 +2070,19 @@ func (m model) View() string {
 			)
 		return m.theme.root.Render(errorPanel)
 	}
+	out := ""
 	if m.launcherActive {
-		return m.theme.root.Render(m.renderLauncher())
+		out = m.renderLauncher()
+	} else {
+		header := m.renderHeader()
+		content := m.renderContent()
+		input := m.renderInput()
+		footer := m.renderFooter()
+		out = lipgloss.JoinVertical(lipgloss.Left, header, content, input, footer)
 	}
-
-	header := m.renderHeader()
-	content := m.renderContent()
-	input := m.renderInput()
-	footer := m.renderFooter()
-
-	out := lipgloss.JoinVertical(lipgloss.Left, header, content, input, footer)
+	if m.quitConfirm {
+		out = m.renderQuitModal()
+	}
 	return m.theme.root.Render(out)
 }
 
@@ -2292,11 +2295,43 @@ func (m *model) renderFooter() string {
 	}
 	line := statusStyle.Render(compactSingleLine(m.statusLine, 180))
 	hints := m.theme.helpText.Render("Keys: Tab switch view · Enter send · PgUp/PgDn or +/- scroll · Esc menu/quit prompt · Ctrl+C quit")
-	if m.quitConfirm {
-		line = m.theme.errorStatus.Render("ARE YOU SURE YOU WANT TO QUIT? [Y]es / [N]o")
-		hints = m.theme.helpText.Render("Retro prompt active · Enter or Y to quit · N or Esc to cancel")
-	}
 	return m.theme.footer.Width(contentWidth).Render(line + "\n" + hints)
+}
+
+func (m *model) renderQuitModal() string {
+	canvasWidth := maxInt(40, m.width-4)
+	canvasHeight := maxInt(12, m.height-4)
+	modalWidth := clampInt(int(float64(canvasWidth)*0.56), 42, 78)
+	if modalWidth > canvasWidth-2 {
+		modalWidth = canvasWidth - 2
+	}
+	if modalWidth < 32 {
+		modalWidth = 32
+	}
+
+	title := m.theme.errorStatus.Render("EXIT ARCADE?")
+	subtitle := m.theme.helpText.Render("Are you sure you want to quit TriChat?")
+	prompt := m.theme.settingPick.Render("[Y / Enter] Quit") + "    " + m.theme.helpText.Render("[N / Esc] Return")
+	accent := m.theme.launcherAccent.Render("========================================")
+	body := strings.Join([]string{
+		title,
+		subtitle,
+		"",
+		accent,
+		m.theme.helpText.Render("Your thread and telemetry are already persisted."),
+		accent,
+		"",
+		prompt,
+	}, "\n")
+	panel := m.theme.launcherFrameAlt.Width(modalWidth).Render(body)
+	return lipgloss.Place(
+		canvasWidth,
+		canvasHeight,
+		lipgloss.Center,
+		lipgloss.Center,
+		panel,
+		lipgloss.WithWhitespaceBackground(lipgloss.Color("#120924")),
+	)
 }
 
 func (m *model) renderPanes() {

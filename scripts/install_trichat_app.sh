@@ -159,7 +159,10 @@ else
   cat > "${TMP_APPLESCRIPT}" <<EOF
 set repoPath to "${REPO_ROOT}"
 set launchCmd to "cd " & quoted form of repoPath & " && ${LAUNCH_SCRIPT}"
-do shell script "open -na Alacritty --args -e zsh -ilc " & quoted form of launchCmd
+set shellCmd to "if command -v alacritty >/dev/null 2>&1; then " & ¬
+  "nohup alacritty --working-directory " & quoted form of repoPath & " -e zsh -ilc " & quoted form of launchCmd & " >/dev/null 2>&1 & " & ¬
+  "else open -na Alacritty --args -e zsh -ilc " & quoted form of launchCmd & "; fi"
+do shell script shellCmd
 EOF
 fi
 

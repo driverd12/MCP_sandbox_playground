@@ -30,16 +30,16 @@ from uuid import uuid4
 OLLAMA_API_BASE = os.environ.get("TRICHAT_OLLAMA_API_BASE", "http://127.0.0.1:11434")
 
 DEFAULT_CODEX_PROMPT = (
-    "You are Codex in tri-chat mode. Respond with concrete, high-signal engineering advice "
-    "focused on implementation and reliability tradeoffs."
+    "You are Codex in tri-chat mode. Respond with concrete, high-signal engineering guidance. "
+    "Keep replies concise (max 6 lines) unless the user asks for depth. Avoid recap or scaffolding sections."
 )
 DEFAULT_CURSOR_PROMPT = (
     "You are Cursor in tri-chat mode. Respond with practical implementation guidance, "
-    "developer UX suggestions, and concise reasoning."
+    "developer UX suggestions, and concise reasoning. Keep replies to max 6 lines unless asked for detail."
 )
 DEFAULT_IMPRINT_PROMPT = (
-    "You are the local Imprint agent for Anamnesis. Favor deterministic local-first execution, "
-    "idempotent operations, and explicit next actions."
+    "You are the local Imprint agent for Anamnesis. Favor deterministic local-first execution and "
+    "idempotent operations. Reply concisely (max 6 lines) and avoid memory/transcript dumps unless requested."
 )
 
 EXECUTE_GATE_MODES = {"open", "allowlist", "approval"}
@@ -103,6 +103,18 @@ def parse_csv_set(raw: str) -> set[str]:
         if item and item.strip()
     }
     return values
+
+
+def is_smoke_thread(candidate: Dict[str, Any]) -> bool:
+    thread_id = str(candidate.get("thread_id") or "").strip().lower()
+    title = str(candidate.get("title") or "").strip().lower()
+    metadata = candidate.get("metadata") if isinstance(candidate.get("metadata"), dict) else {}
+    source = str(metadata.get("source") or "").strip().lower()
+    return (
+        thread_id.startswith("trichat-smoke-")
+        or "smoke" in title
+        or "trichat_smoke" in source
+    )
 
 
 def auto_bridge_command(repo_root: Path, agent_id: str) -> str:
@@ -579,10 +591,10 @@ class AgentAdapter:
     peer_context: Optional[str],
   ) -> List[Dict[str, str]]:
     history_lines = []
-    for item in history[-30:]:
+    for item in history[-14:]:
       agent_id = item.get("agent_id", "unknown")
       role = item.get("role", "assistant")
-      content = compact_single_line(str(item.get("content", "")), 300)
+      content = compact_single_line(str(item.get("content", "")), 180)
       history_lines.append(f"[{agent_id}/{role}] {content}")
     history_block = "\n".join(history_lines) if history_lines else "(no prior messages)"
 
@@ -592,11 +604,16 @@ class AgentAdapter:
       "",
       "Recent thread history:",
       history_block,
+      "",
+      "Output contract:",
+      "- reply in plain text with concise answer",
+      "- keep under 6 lines unless the user asks for deep detail",
+      "- do not include next-action scaffolding or thread recap",
     ]
     if peer_context:
       user_parts.extend(["", "Peer context:", peer_context.strip()])
     if bootstrap_text:
-      user_parts.extend(["", "Imprint bootstrap context:", truncate(bootstrap_text, 3000)])
+      user_parts.extend(["", "Imprint bootstrap context:", truncate(bootstrap_text, 1200)])
 
     return [
       {"role": "system", "content": self.config.system_prompt},
@@ -674,6 +691,12 @@ class AgentAdapter:
 class TriChatApp:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.args.model_timeout = min(120, max(1, int(self.args.model_timeout)))
+        self.args.bridge_timeout = min(180, max(1, int(self.args.bridge_timeout)))
+        self.args.adapter_failover_timeout = min(240, max(1, int(self.args.adapter_failover_timeout)))
+        min_failover_budget = max(self.args.model_timeout + 8, self.args.bridge_timeout + 5)
+        if self.args.adapter_failover_timeout < min_failover_budget:
+            self.args.adapter_failover_timeout = min_failover_budget
         self.repo_root = Path(args.repo_root).resolve()
         self.mcp = McpToolCaller(
             repo_root=self.repo_root,
@@ -800,15 +823,19 @@ class TriChatApp:
                 "trichat.thread_list",
                 {
                     "status": "active",
-                    "limit": 1,
+                    "limit": 25,
                 },
             )
             if isinstance(listing, dict):
                 threads = listing.get("threads", [])
                 if isinstance(threads, list) and threads:
-                    candidate = threads[0]
-                    if isinstance(candidate, dict):
-                        thread_id = candidate.get("thread_id")
+                    selected = None
+                    for candidate in threads:
+                        if isinstance(candidate, dict) and not is_smoke_thread(candidate):
+                            selected = candidate
+                            break
+                    if isinstance(selected, dict):
+                        thread_id = selected.get("thread_id")
                         if isinstance(thread_id, str) and thread_id:
                             self.thread_id = thread_id
                             self.mcp.call_tool(
@@ -2097,14 +2124,19 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--model-timeout",
         type=int,
-        default=int(os.environ.get("TRICHAT_MODEL_TIMEOUT", "20")),
+        default=int(os.environ.get("TRICHAT_MODEL_TIMEOUT", "30")),
         help="Per-request Ollama timeout seconds.",
     )
-    parser.add_argument("--bridge-timeout", type=int, default=45, help="Bridge command timeout seconds.")
+    parser.add_argument(
+        "--bridge-timeout",
+        type=int,
+        default=int(os.environ.get("TRICHAT_BRIDGE_TIMEOUT", "60")),
+        help="Bridge command timeout seconds.",
+    )
     parser.add_argument(
         "--adapter-failover-timeout",
         type=int,
-        default=int(os.environ.get("TRICHAT_ADAPTER_FAILOVER_TIMEOUT", "18")),
+        default=int(os.environ.get("TRICHAT_ADAPTER_FAILOVER_TIMEOUT", "75")),
         help="Turn budget per agent before forced degraded routing.",
     )
     parser.add_argument(

@@ -124,6 +124,19 @@ export type TriChatMessageRecord = {
   metadata: Record<string, unknown>;
 };
 
+export type TriChatBusEventRecord = {
+  event_seq: number;
+  event_id: string;
+  thread_id: string;
+  created_at: string;
+  source_agent: string | null;
+  source_client: string | null;
+  event_type: string;
+  role: string | null;
+  content: string | null;
+  metadata: Record<string, unknown>;
+};
+
 export type TriChatAdapterChannel = "command" | "model";
 
 export type TriChatAdapterStateRecord = {
@@ -397,6 +410,11 @@ export class Storage {
         version: 6,
         name: "add-trichat-adapter-telemetry-schema",
         run: () => this.applyTriChatAdapterTelemetryMigration(),
+      },
+      {
+        version: 7,
+        name: "add-trichat-unix-bus-schema",
+        run: () => this.applyTriChatBusMigration(),
       },
     ]);
     this.ensureRuntimeSchemaCompleteness();
@@ -2419,6 +2437,119 @@ export class Storage {
     return rows.reverse().map((row) => mapTriChatMessageRow(row));
   }
 
+  appendTriChatBusEvent(params: {
+    thread_id: string;
+    event_type: string;
+    created_at?: string;
+    source_agent?: string;
+    source_client?: string;
+    role?: string;
+    content?: string;
+    metadata?: Record<string, unknown>;
+    event_id?: string;
+  }): TriChatBusEventRecord {
+    const now = new Date().toISOString();
+    const threadId = params.thread_id.trim();
+    const eventType = params.event_type.trim();
+    if (!threadId || !eventType) {
+      throw new Error("thread_id and event_type are required");
+    }
+
+    const createdAt = normalizeIsoTimestamp(params.created_at, now);
+    const eventId = params.event_id?.trim() || crypto.randomUUID();
+    const sourceAgent = asNullableString(params.source_agent);
+    const sourceClient = asNullableString(params.source_client);
+    const role = asNullableString(params.role);
+    const content = asNullableString(params.content);
+    const metadata = params.metadata ?? {};
+
+    this.db
+      .prepare(
+        `INSERT INTO trichat_bus_events (
+           event_id, thread_id, created_at, source_agent, source_client, event_type, role, content, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        eventId,
+        threadId,
+        createdAt,
+        sourceAgent,
+        sourceClient,
+        eventType,
+        role,
+        content,
+        stableStringify(metadata)
+      );
+
+    const row = this.db
+      .prepare(
+        `SELECT event_seq, event_id, thread_id, created_at, source_agent, source_client, event_type, role, content, metadata_json
+         FROM trichat_bus_events
+         WHERE event_id = ?`
+      )
+      .get(eventId) as Record<string, unknown> | undefined;
+    if (!row) {
+      throw new Error(`Failed to read tri-chat bus event after insert: ${eventId}`);
+    }
+    return mapTriChatBusEventRow(row);
+  }
+
+  listTriChatBusEvents(params?: {
+    thread_id?: string;
+    source_agent?: string;
+    event_types?: string[];
+    since_seq?: number;
+    since?: string;
+    limit?: number;
+  }): TriChatBusEventRecord[] {
+    const whereClauses: string[] = [];
+    const values: Array<string | number> = [];
+
+    const threadId = params?.thread_id?.trim();
+    if (threadId) {
+      whereClauses.push("thread_id = ?");
+      values.push(threadId);
+    }
+    const sourceAgent = params?.source_agent?.trim();
+    if (sourceAgent) {
+      whereClauses.push("source_agent = ?");
+      values.push(sourceAgent);
+    }
+
+    const eventTypes = (params?.event_types ?? [])
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    if (eventTypes.length > 0) {
+      const placeholders = eventTypes.map(() => "?").join(", ");
+      whereClauses.push(`event_type IN (${placeholders})`);
+      values.push(...eventTypes);
+    }
+
+    const sinceSeq = parseBoundedInt(params?.since_seq, 0, 0, Number.MAX_SAFE_INTEGER);
+    if (sinceSeq > 0) {
+      whereClauses.push("event_seq > ?");
+      values.push(sinceSeq);
+    }
+
+    if (params?.since?.trim()) {
+      whereClauses.push("created_at > ?");
+      values.push(normalizeIsoTimestamp(params.since, params.since));
+    }
+
+    const limit = parseBoundedInt(params?.limit, 200, 1, 5000);
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT event_seq, event_id, thread_id, created_at, source_agent, source_client, event_type, role, content, metadata_json
+         FROM trichat_bus_events
+         ${whereSql}
+         ORDER BY event_seq DESC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    return rows.reverse().map((row) => mapTriChatBusEventRow(row));
+  }
+
   pruneTriChatMessages(params: {
     older_than_iso: string;
     thread_id?: string;
@@ -3471,6 +3602,7 @@ export class Storage {
       "task_artifacts",
       "trichat_threads",
       "trichat_messages",
+      "trichat_bus_events",
       "trichat_adapter_states",
       "trichat_adapter_events",
     ] as const;
@@ -3548,6 +3680,7 @@ export class Storage {
     this.applyTaskSchemaMigration();
     this.applyTriChatSchemaMigration();
     this.applyTriChatAdapterTelemetryMigration();
+    this.applyTriChatBusMigration();
   }
 
   private applyCoreSchemaMigration(): void {

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -79,6 +80,32 @@ def workspace_from_payload(payload: Dict[str, Any]) -> Path:
     return path
 
 
+def _is_executable(path: str) -> bool:
+    candidate = Path(path).expanduser()
+    return candidate.exists() and os.access(str(candidate), os.X_OK)
+
+
+def resolve_executable(preferred: str, fallbacks: Sequence[str] | None = None) -> str:
+    name = (preferred or "").strip()
+    if not name:
+        name = "python3"
+
+    # If caller passed a path-like command, use it when executable.
+    if "/" in name and _is_executable(name):
+        return str(Path(name).expanduser())
+
+    located = shutil.which(name)
+    if located:
+        return located
+
+    for entry in fallbacks or ():
+        candidate = str(Path(entry).expanduser())
+        if _is_executable(candidate):
+            return candidate
+
+    return name
+
+
 def build_prompt(payload: Dict[str, Any], *, bridge_name: str, max_history: int = 24) -> str:
     prompt = str(payload.get("prompt") or "").strip()
     history = payload.get("history") if isinstance(payload.get("history"), list) else []
@@ -97,6 +124,11 @@ def build_prompt(payload: Dict[str, Any], *, bridge_name: str, max_history: int 
 
     parts: List[str] = [
         f"TriChat adapter target: {bridge_name}",
+        "",
+        "Output contract:",
+        "- reply with direct plain-text answer only",
+        "- keep output concise (max 6 lines) unless user asks for detail",
+        "- do not include thread recap, next-action scaffolding, or debug dumps",
         "",
         "User request:",
         prompt or "(empty prompt)",
@@ -155,4 +187,3 @@ def emit_content(content: str, *, meta: Dict[str, Any] | None = None, max_chars:
 
 def emit_status(status: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(status, ensure_ascii=True, indent=2) + "\n")
-

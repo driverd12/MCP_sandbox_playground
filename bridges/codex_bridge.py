@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,10 +21,25 @@ from common import (
     parse_bool_env,
     parse_int_env,
     read_payload,
+    resolve_executable,
     run_command,
     strip_ansi,
     workspace_from_payload,
 )
+
+
+DEFAULT_CODEX_BIN = "codex"
+CODEX_FALLBACK_BINS = (
+    "/Applications/Codex.app/Contents/Resources/codex",
+    "~/.local/bin/codex",
+    "/opt/homebrew/bin/codex",
+    "/usr/local/bin/codex",
+)
+
+
+def resolve_codex_binary() -> str:
+    requested = (os.environ.get("TRICHAT_CODEX_BIN") or DEFAULT_CODEX_BIN).strip() or DEFAULT_CODEX_BIN
+    return resolve_executable(requested, CODEX_FALLBACK_BINS)
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -36,7 +50,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 
 def codex_command_base(workspace: Path, output_file: Path) -> List[str]:
-    codex_bin = (os.environ.get("TRICHAT_CODEX_BIN") or "codex").strip() or "codex"
+    codex_bin = resolve_codex_binary()
     command: List[str] = [
         codex_bin,
         "exec",
@@ -77,11 +91,13 @@ def codex_command_base(workspace: Path, output_file: Path) -> List[str]:
 
 
 def run_self_test() -> int:
-    codex_bin = (os.environ.get("TRICHAT_CODEX_BIN") or "codex").strip() or "codex"
-    codex_path = shutil.which(codex_bin)
+    requested_bin = (os.environ.get("TRICHAT_CODEX_BIN") or DEFAULT_CODEX_BIN).strip() or DEFAULT_CODEX_BIN
+    codex_bin = resolve_codex_binary()
+    codex_path = codex_bin if Path(codex_bin).exists() else None
     payload: Dict[str, Any] = {
         "bridge": "codex",
-        "binary": codex_bin,
+        "binary": requested_bin,
+        "resolved_binary": codex_bin,
         "binary_path": codex_path,
         "found": bool(codex_path),
     }

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +20,7 @@ from common import (
     parse_bool_env,
     parse_int_env,
     read_payload,
+    resolve_executable,
     run_command,
     strip_ansi,
     workspace_from_payload,
@@ -28,6 +28,18 @@ from common import (
 
 ALLOWED_MODES = {"ask", "plan"}
 ALLOWED_SANDBOX = {"enabled", "disabled"}
+DEFAULT_CURSOR_BIN = "cursor-agent"
+CURSOR_FALLBACK_BINS = (
+    "~/.local/bin/cursor-agent",
+    "/opt/homebrew/bin/cursor-agent",
+    "/usr/local/bin/cursor-agent",
+    "~/.local/bin/agent",
+)
+
+
+def resolve_cursor_binary() -> str:
+    requested = (os.environ.get("TRICHAT_CURSOR_BIN") or DEFAULT_CURSOR_BIN).strip() or DEFAULT_CURSOR_BIN
+    return resolve_executable(requested, CURSOR_FALLBACK_BINS)
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -38,7 +50,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 
 def cursor_command_base(workspace: Path, prompt: str) -> List[str]:
-    cursor_bin = (os.environ.get("TRICHAT_CURSOR_BIN") or "cursor-agent").strip() or "cursor-agent"
+    cursor_bin = resolve_cursor_binary()
     command: List[str] = [
         cursor_bin,
         "--print",
@@ -73,11 +85,13 @@ def cursor_command_base(workspace: Path, prompt: str) -> List[str]:
 
 
 def run_self_test() -> int:
-    cursor_bin = (os.environ.get("TRICHAT_CURSOR_BIN") or "cursor-agent").strip() or "cursor-agent"
-    cursor_path = shutil.which(cursor_bin)
+    requested_bin = (os.environ.get("TRICHAT_CURSOR_BIN") or DEFAULT_CURSOR_BIN).strip() or DEFAULT_CURSOR_BIN
+    cursor_bin = resolve_cursor_binary()
+    cursor_path = cursor_bin if Path(cursor_bin).exists() else None
     payload: Dict[str, Any] = {
         "bridge": "cursor",
-        "binary": cursor_bin,
+        "binary": requested_bin,
+        "resolved_binary": cursor_bin,
         "binary_path": cursor_path,
         "found": bool(cursor_path),
     }

@@ -7,6 +7,7 @@ export TRICHAT_SMOKE_ORIGIN="${TRICHAT_SMOKE_ORIGIN:-http://127.0.0.1}"
 export TRICHAT_SMOKE_STDIO_COMMAND="${TRICHAT_SMOKE_STDIO_COMMAND:-node}"
 export TRICHAT_SMOKE_STDIO_ARGS="${TRICHAT_SMOKE_STDIO_ARGS:-dist/server.js}"
 export TRICHAT_SMOKE_THREAD_ID="${TRICHAT_SMOKE_THREAD_ID:-trichat-smoke-$(date +%s)}"
+export TRICHAT_SMOKE_KEEP_ACTIVE="${TRICHAT_SMOKE_KEEP_ACTIVE:-0}"
 
 if [[ "${TRICHAT_SMOKE_TRANSPORT}" == "http" ]] && [[ -z "${MCP_HTTP_BEARER_TOKEN:-}" ]]; then
   echo "error: MCP_HTTP_BEARER_TOKEN is required when TRICHAT_SMOKE_TRANSPORT=http" >&2
@@ -20,6 +21,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 
 const transportMode = process.env.TRICHAT_SMOKE_TRANSPORT ?? "stdio";
 const threadId = process.env.TRICHAT_SMOKE_THREAD_ID;
+const keepActive = /^(1|true|yes|on)$/i.test(process.env.TRICHAT_SMOKE_KEEP_ACTIVE ?? "");
 const transport =
   transportMode === "http"
     ? new StreamableHTTPClientTransport(new URL(process.env.TRICHAT_SMOKE_URL), {
@@ -205,6 +207,18 @@ try {
     throw new Error("trichat.retention dry-run did not return candidate_count");
   }
 
+  if (!keepActive) {
+    await callTool("trichat.thread_open", {
+      mutation: mutation("trichat.thread_archive"),
+      thread_id: threadId,
+      status: "archived",
+      metadata: {
+        source: "scripts/trichat_smoke.sh",
+        archived: true,
+      },
+    });
+  }
+
   console.log(
     JSON.stringify(
       {
@@ -213,12 +227,13 @@ try {
         thread_id: threadId,
         timeline_count: timeline.count ?? timeline.messages.length,
         retention_candidates: retention.candidate_count,
-        thread_status: thread.thread?.status ?? null,
+        thread_status: keepActive ? thread.thread?.status ?? null : "archived",
         total_messages: summary.message_count,
         auto_retention_running: autoRetentionStatus.running,
         adapter_channels: adapterTelemetry.summary.total_channels,
         adapter_open_channels: adapterTelemetry.summary.open_channels,
         router_message_id: routerMessage?.message?.message_id ?? null,
+        smoke_keep_active: keepActive,
       },
       null,
       2

@@ -32,12 +32,17 @@ const (
 	defaultModel       = "llama3.2:3b"
 	defaultOllamaAPI   = "http://127.0.0.1:11434"
 	defaultThreadTitle = "TriChat TUI"
+	historyWindowSize  = 14
+	historyLineChars   = 180
+	bootstrapMaxChars  = 1200
+	timelineMaxLines   = 8
+	timelineMaxChars   = 900
 )
 
 const (
-	codePrompt    = "You are Codex in tri-chat mode. Respond with concrete, high-signal engineering advice focused on implementation and reliability tradeoffs."
-	cursorPrompt  = "You are Cursor in tri-chat mode. Respond with practical implementation guidance, developer UX suggestions, and concise reasoning."
-	imprintPrompt = "You are the local Imprint agent for Anamnesis. Favor deterministic local-first execution, idempotent operations, and explicit next actions."
+	codePrompt    = "You are Codex in tri-chat mode. Respond with concrete, high-signal engineering guidance. Keep replies concise: max 6 lines unless asked for depth. Do not include 'next actions', 'thread history', or other scaffolding."
+	cursorPrompt  = "You are Cursor in tri-chat mode. Respond with practical implementation guidance and concise reasoning. Keep replies to max 6 lines unless asked for details. Avoid meta-scaffolding sections."
+	imprintPrompt = "You are the local Imprint agent for Anamnesis. Favor deterministic local-first execution and idempotent operations. Reply in max 6 lines by default and do not dump memory/transcript blocks unless explicitly requested."
 )
 
 var safeToolPattern = regexp.MustCompile(`[^a-zA-Z0-9]+`)
@@ -782,11 +787,11 @@ func telemetryEvent(agentID, channel, eventType, errorText, openUntil string, de
 func buildOllamaMessages(systemPrompt, prompt string, history []triChatMessage, bootstrap string) []map[string]string {
 	historyLines := make([]string, 0, 30)
 	start := 0
-	if len(history) > 30 {
-		start = len(history) - 30
+	if len(history) > historyWindowSize {
+		start = len(history) - historyWindowSize
 	}
 	for _, msg := range history[start:] {
-		historyLines = append(historyLines, fmt.Sprintf("[%s/%s] %s", msg.AgentID, msg.Role, compactSingleLine(msg.Content, 300)))
+		historyLines = append(historyLines, fmt.Sprintf("[%s/%s] %s", msg.AgentID, msg.Role, compactSingleLine(msg.Content, historyLineChars)))
 	}
 	historyBlock := "(no prior messages)"
 	if len(historyLines) > 0 {
@@ -798,9 +803,14 @@ func buildOllamaMessages(systemPrompt, prompt string, history []triChatMessage, 
 		"",
 		"Recent thread history:",
 		historyBlock,
+		"",
+		"Output contract:",
+		"- reply in plain text with a concise answer",
+		"- keep under 6 lines unless the user asks for deep detail",
+		"- do not include boilerplate sections like next actions or thread recap",
 	}
 	if strings.TrimSpace(bootstrap) != "" {
-		parts = append(parts, "", "Imprint bootstrap context:", truncate(bootstrap, 3000))
+		parts = append(parts, "", "Imprint bootstrap context:", truncate(bootstrap, bootstrapMaxChars))
 	}
 	user := strings.TrimSpace(strings.Join(parts, "\n"))
 	return []map[string]string{
@@ -1128,6 +1138,12 @@ func newModel(cfg appConfig) model {
 		helper:   filepath.Join(cfg.repoRoot, "scripts", "mcp_tool_call.mjs"),
 		cfg:      cfg,
 	}
+	timeline := viewport.New(0, 0)
+	timeline.MouseWheelEnabled = true
+	timeline.MouseWheelDelta = 4
+	sidebar := viewport.New(0, 0)
+	sidebar.MouseWheelEnabled = true
+	sidebar.MouseWheelDelta = 4
 
 	return model{
 		cfg:            cfg,
@@ -1150,8 +1166,8 @@ func newModel(cfg appConfig) model {
 			"Quit",
 		},
 		input:    input,
-		timeline: viewport.New(0, 0),
-		sidebar:  viewport.New(0, 0),
+		timeline: timeline,
+		sidebar:  sidebar,
 		spinner:  sp,
 		theme:    newTheme(),
 	}
@@ -1205,7 +1221,7 @@ func (m model) initCmd() tea.Cmd {
 		}
 
 		if threadID == "" && cfg.resumeLatest {
-			payload, err := caller.callTool("trichat.thread_list", map[string]any{"status": "active", "limit": 1})
+			payload, err := caller.callTool("trichat.thread_list", map[string]any{"status": "active", "limit": 25})
 			if err == nil {
 				var listing struct {
 					Threads []triChatThread `json:"threads"`
@@ -1213,10 +1229,10 @@ func (m model) initCmd() tea.Cmd {
 				listing, _ = decodeAny[struct {
 					Threads []triChatThread `json:"threads"`
 				}](payload)
-				if len(listing.Threads) > 0 {
-					threadID = listing.Threads[0].ThreadID
-					if listing.Threads[0].Title != "" {
-						threadTitle = listing.Threads[0].Title
+				if selected, ok := pickResumeThread(listing.Threads); ok {
+					threadID = selected.ThreadID
+					if selected.Title != "" {
+						threadTitle = selected.Title
 					}
 				}
 			}
@@ -1287,6 +1303,29 @@ func missingTools(actual, required []string) []string {
 	return missing
 }
 
+func pickResumeThread(threads []triChatThread) (triChatThread, bool) {
+	for _, thread := range threads {
+		if !isSmokeThread(thread) {
+			return thread, true
+		}
+	}
+	return triChatThread{}, false
+}
+
+func isSmokeThread(thread triChatThread) bool {
+	threadID := strings.ToLower(strings.TrimSpace(thread.ThreadID))
+	if strings.HasPrefix(threadID, "trichat-smoke-") {
+		return true
+	}
+	title := strings.ToLower(strings.TrimSpace(thread.Title))
+	if strings.Contains(title, "smoke") {
+		return true
+	}
+	source, _ := thread.Metadata["source"].(string)
+	source = strings.ToLower(strings.TrimSpace(source))
+	return strings.Contains(source, "trichat_smoke")
+}
+
 func tickEvery(interval time.Duration) tea.Cmd {
 	if interval <= 0 {
 		interval = 2 * time.Second
@@ -1303,7 +1342,7 @@ func (m model) refreshCmd() tea.Cmd {
 		reliability := reliabilitySnapshot{}
 		timelinePayload, err := caller.callTool("trichat.timeline", map[string]any{
 			"thread_id": threadID,
-			"limit":     240,
+			"limit":     120,
 		})
 		if err != nil {
 			return refreshDoneMsg{err: err}
@@ -1404,7 +1443,7 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 		}](postResult)
 		userMessageID := posted.Message.MessageID
 
-		historyPayload, err := caller.callTool("trichat.timeline", map[string]any{"thread_id": threadID, "limit": 90})
+		historyPayload, err := caller.callTool("trichat.timeline", map[string]any{"thread_id": threadID, "limit": 48})
 		if err != nil {
 			return actionDoneMsg{err: err}
 		}
@@ -1755,6 +1794,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.launcherPulse = (m.launcherPulse + 1) % 24
 		}
 		cmds = append(cmds, cmd)
+	case tea.MouseMsg:
+		if m.launcherActive || m.startupErr != nil || m.quitConfirm {
+			break
+		}
+		switch m.activeTab {
+		case tabChat:
+			var cmd tea.Cmd
+			m.timeline, cmd = m.timeline.Update(msg)
+			cmds = append(cmds, cmd)
+		case tabReliability:
+			var cmd tea.Cmd
+			m.sidebar, cmd = m.sidebar.Update(msg)
+			cmds = append(cmds, cmd)
+		}
 	case tea.KeyMsg:
 		if key := msg.String(); key == "ctrl+c" {
 			return m, tea.Quit
@@ -1892,6 +1945,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "pgdown", "ctrl+f":
 				m.timeline.LineDown(8)
 				return m, tea.Batch(cmds...)
+			case "up":
+				if strings.TrimSpace(m.input.Value()) == "" {
+					m.timeline.LineUp(4)
+					return m, tea.Batch(cmds...)
+				}
+			case "down":
+				if strings.TrimSpace(m.input.Value()) == "" {
+					m.timeline.LineDown(4)
+					return m, tea.Batch(cmds...)
+				}
 			case "-", "_", "ctrl+u":
 				if strings.TrimSpace(m.input.Value()) == "" {
 					m.timeline.LineUp(8)
@@ -1926,9 +1989,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.renderPanes()
 		case tabReliability:
 			switch msg.String() {
-			case "pgup", "k", "-", "_", "ctrl+u":
+			case "pgup", "k", "up", "-", "_", "ctrl+u":
 				m.sidebar.LineUp(4)
-			case "pgdown", "j", "=", "+", "ctrl+d":
+			case "pgdown", "j", "down", "=", "+", "ctrl+d":
 				m.sidebar.LineDown(4)
 			}
 		}
@@ -2294,7 +2357,7 @@ func (m *model) renderFooter() string {
 		statusStyle = m.theme.errorStatus
 	}
 	line := statusStyle.Render(compactSingleLine(m.statusLine, 180))
-	hints := m.theme.helpText.Render("Keys: Tab switch view · Enter send · PgUp/PgDn or +/- scroll · Esc menu/quit prompt · Ctrl+C quit")
+	hints := m.theme.helpText.Render("Keys: Tab switch view · Enter send · PgUp/PgDn or Up/Down (input empty) or +/- scroll · Esc menu/quit prompt · Ctrl+C quit")
 	return m.theme.footer.Width(contentWidth).Render(line + "\n" + hints)
 }
 
@@ -2335,6 +2398,11 @@ func (m *model) renderQuitModal() string {
 }
 
 func (m *model) renderPanes() {
+	prevTimelineYOffset := m.timeline.YOffset
+	prevTimelineAtBottom := m.timeline.AtBottom()
+	prevSidebarYOffset := m.sidebar.YOffset
+	prevSidebarAtBottom := m.sidebar.AtBottom()
+
 	contentHeight := maxInt(8, m.height-12)
 	contentWidth := maxInt(40, m.width-4)
 	leftWidth := int(float64(contentWidth) * 0.66)
@@ -2350,8 +2418,17 @@ func (m *model) renderPanes() {
 	m.sidebar.Height = maxInt(5, contentHeight-3)
 
 	m.timeline.SetContent(m.renderTimeline())
-	m.timeline.GotoBottom()
+	if prevTimelineAtBottom {
+		m.timeline.GotoBottom()
+	} else {
+		m.timeline.SetYOffset(prevTimelineYOffset)
+	}
 	m.sidebar.SetContent(m.renderSidebar())
+	if prevSidebarAtBottom {
+		m.sidebar.GotoBottom()
+	} else {
+		m.sidebar.SetYOffset(prevSidebarYOffset)
+	}
 }
 
 func (m *model) resize() {
@@ -2365,6 +2442,10 @@ func (m *model) renderTimeline() string {
 	}
 	var b strings.Builder
 	for _, msg := range m.messages {
+		// System/router chatter is useful for audit trails but noisy in live chat.
+		if msg.Role == "system" {
+			continue
+		}
 		timestamp := shortTime(msg.CreatedAt)
 		agentLabel := msg.AgentID
 		if strings.TrimSpace(agentLabel) == "" {
@@ -2377,8 +2458,12 @@ func (m *model) renderTimeline() string {
 		header := fmt.Sprintf("%s [%s/%s]", timestamp, agentLabel, msg.Role)
 		b.WriteString(style.Render(header))
 		b.WriteString("\n")
-		b.WriteString(wrapText(msg.Content, maxInt(24, m.timeline.Width-2)))
+		preview := compactTimelineMessage(msg.Content, timelineMaxLines, timelineMaxChars)
+		b.WriteString(wrapText(preview, maxInt(24, m.timeline.Width-2)))
 		b.WriteString("\n\n")
+	}
+	if strings.TrimSpace(b.String()) == "" {
+		return "No user/assistant messages yet. Send a prompt to start tri-agent fanout."
 	}
 	return strings.TrimSpace(b.String())
 }
@@ -2533,8 +2618,9 @@ func (m *model) renderHelp() string {
 		"- Enter: send prompt (Chat tab)",
 		"- Esc: from non-chat tabs, return to launcher menu",
 		"- Esc in chat: show retro quit confirmation",
-		"- PgUp/PgDn or +/- (and Ctrl+U/Ctrl+D): scroll timeline",
+		"- Timeline scroll: PgUp/PgDn, Up/Down (input empty), +/- (or Ctrl+U/Ctrl+D)",
 		"- Ctrl+C: quit",
+		"- Chat timeline auto-hides system chatter and compacts long responses",
 		"",
 		"Slash Commands",
 		"- /fanout all|codex|cursor|local-imprint",
@@ -2599,9 +2685,9 @@ func parseFlags() appConfig {
 	flag.StringVar(&cfg.codexCommand, "codex-command", envOr("TRICHAT_CODEX_CMD", ""), "Optional command adapter for codex (auto-default: ./bridges/codex_bridge.py)")
 	flag.StringVar(&cfg.cursorCommand, "cursor-command", envOr("TRICHAT_CURSOR_CMD", ""), "Optional command adapter for cursor (auto-default: ./bridges/cursor_bridge.py)")
 	flag.StringVar(&cfg.imprintCommand, "imprint-command", envOr("TRICHAT_IMPRINT_CMD", ""), "Optional command adapter for local-imprint (auto-default: ./bridges/local-imprint_bridge.py if present)")
-	flag.IntVar(&cfg.modelTimeoutSeconds, "model-timeout", envOrInt("TRICHAT_MODEL_TIMEOUT", 20), "Per-request Ollama timeout seconds")
-	flag.IntVar(&cfg.bridgeTimeoutSeconds, "bridge-timeout", envOrInt("TRICHAT_BRIDGE_TIMEOUT", 45), "Bridge command timeout seconds")
-	flag.IntVar(&cfg.adapterFailoverTimeoutSecond, "adapter-failover-timeout", envOrInt("TRICHAT_ADAPTER_FAILOVER_TIMEOUT", 18), "Per-agent failover timeout seconds")
+	flag.IntVar(&cfg.modelTimeoutSeconds, "model-timeout", envOrInt("TRICHAT_MODEL_TIMEOUT", 30), "Per-request Ollama timeout seconds")
+	flag.IntVar(&cfg.bridgeTimeoutSeconds, "bridge-timeout", envOrInt("TRICHAT_BRIDGE_TIMEOUT", 60), "Bridge command timeout seconds")
+	flag.IntVar(&cfg.adapterFailoverTimeoutSecond, "adapter-failover-timeout", envOrInt("TRICHAT_ADAPTER_FAILOVER_TIMEOUT", 75), "Per-agent failover timeout seconds")
 	flag.IntVar(&cfg.adapterCircuitThreshold, "adapter-circuit-threshold", envOrInt("TRICHAT_ADAPTER_CIRCUIT_THRESHOLD", 2), "Consecutive failures before opening circuit")
 	flag.IntVar(&cfg.adapterCircuitRecoverySecond, "adapter-circuit-recovery-seconds", envOrInt("TRICHAT_ADAPTER_CIRCUIT_RECOVERY_SECONDS", 45), "Circuit recovery window seconds")
 	flag.StringVar(&cfg.executeGateMode, "execute-gate-mode", envOr("TRICHAT_EXECUTE_GATE_MODE", "open"), "execute gate mode (open|allowlist|approval)")
@@ -2629,6 +2715,10 @@ func parseFlags() appConfig {
 	cfg.adapterFailoverTimeoutSecond = clampInt(cfg.adapterFailoverTimeoutSecond, 1, 120)
 	cfg.adapterCircuitThreshold = clampInt(cfg.adapterCircuitThreshold, 1, 10)
 	cfg.adapterCircuitRecoverySecond = clampInt(cfg.adapterCircuitRecoverySecond, 1, 600)
+	minFailover := clampInt(maxInt(cfg.modelTimeoutSeconds+8, cfg.bridgeTimeoutSeconds+5), 1, 120)
+	if cfg.adapterFailoverTimeoutSecond < minFailover {
+		cfg.adapterFailoverTimeoutSecond = minFailover
+	}
 	cfg.pollInterval = time.Duration(clampInt(pollIntervalSeconds, 1, 60)) * time.Second
 	if noLauncher {
 		cfg.launcher = false
@@ -2830,6 +2920,38 @@ func wrapText(text string, width int) string {
 		wrapped = append(wrapped, current)
 	}
 	return strings.Join(wrapped, "\n")
+}
+
+func compactTimelineMessage(text string, maxLines int, maxChars int) string {
+	normalized := strings.ReplaceAll(text, "\r\n", "\n")
+	normalized = strings.TrimSpace(normalized)
+	if normalized == "" {
+		return ""
+	}
+
+	rawLines := strings.Split(normalized, "\n")
+	lines := make([]string, 0, len(rawLines))
+	lastBlank := false
+	for _, line := range rawLines {
+		trimmed := strings.TrimRight(line, " \t")
+		isBlank := strings.TrimSpace(trimmed) == ""
+		if isBlank && lastBlank {
+			continue
+		}
+		lines = append(lines, trimmed)
+		lastBlank = isBlank
+	}
+
+	if maxLines > 0 && len(lines) > maxLines {
+		hidden := len(lines) - maxLines
+		lines = append(lines[:maxLines], fmt.Sprintf("[... %d lines hidden]", hidden))
+	}
+
+	joined := strings.TrimSpace(strings.Join(lines, "\n"))
+	if maxChars > 0 && len(joined) > maxChars {
+		return strings.TrimSpace(truncate(joined, maxChars-18) + "\n[... truncated]")
+	}
+	return joined
 }
 
 func truncate(text string, limit int) string {

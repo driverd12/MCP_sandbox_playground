@@ -132,6 +132,7 @@ triChatBusRuntime.initialize({
 
 const SERVER_NAME = "anamnesis";
 const SERVER_VERSION = "0.2.0";
+const CONSENSUS_ALERT_MIN_AGENTS = parseConsensusMinAgents(process.env.TRICHAT_CONSENSUS_ALERT_MIN_AGENTS);
 
 const server = new Server(
   {
@@ -452,6 +453,22 @@ registerTool("trichat.message_post", "Append a message into a tri-chat thread ti
     mutation: input.mutation,
     payload: input,
     execute: () => {
+      let consensusBefore: unknown = null;
+      let consensusAfter: unknown = null;
+      let consensusAlertEvent: unknown = null;
+      let consensusAlertWarning: string | null = null;
+      try {
+        consensusBefore = trichatConsensus(storage, {
+          thread_id: input.thread_id,
+          limit: 300,
+          min_agents: CONSENSUS_ALERT_MIN_AGENTS,
+          recent_turn_limit: 3,
+        });
+      } catch (error) {
+        consensusAlertWarning = `consensus pre-check failed: ${error instanceof Error ? error.message : String(error)}`;
+        console.error(`[trichat.consensus] pre-check failed: ${consensusAlertWarning}`);
+      }
+
       const posted = trichatMessagePost(storage, input);
       let busEvent: unknown = null;
       let busWarning: string | null = null;
@@ -462,10 +479,61 @@ registerTool("trichat.message_post", "Append a message into a tri-chat thread ti
         busWarning = error instanceof Error ? error.message : String(error);
         console.error(`[trichat.bus] message_post publish failed: ${busWarning}`);
       }
+
+      try {
+        consensusAfter = trichatConsensus(storage, {
+          thread_id: input.thread_id,
+          limit: 300,
+          min_agents: CONSENSUS_ALERT_MIN_AGENTS,
+          recent_turn_limit: 3,
+        });
+        const beforeLatest = getConsensusLatestTurn(consensusBefore);
+        const afterLatest = getConsensusLatestTurn(consensusAfter);
+        if (shouldEmitConsensusDisagreementAlert(beforeLatest, afterLatest)) {
+          const disagreementAgents = afterLatest?.disagreement_agents ?? [];
+          const majority = afterLatest?.majority_answer ?? "n/a";
+          const responseCount = afterLatest?.response_count ?? 0;
+          const requiredCount = afterLatest?.required_count ?? CONSENSUS_ALERT_MIN_AGENTS;
+          const userMessageId = afterLatest?.user_message_id ?? "unknown";
+          const content = truncate(
+            `consensus disagreement detected: user_turn=${userMessageId} disagreement_agents=${
+              disagreementAgents.join(",") || "unknown"
+            } majority=${majority} responses=${responseCount}/${requiredCount}`,
+            600
+          );
+          const publishResult = triChatBusRuntime.publish({
+            thread_id: input.thread_id,
+            event_type: "consensus.alert",
+            source_agent: "consensus-monitor",
+            source_client: "mcp:trichat.message_post",
+            role: "system",
+            content,
+            metadata: {
+              kind: "consensus.alert",
+              trigger_message_id: posted.message.message_id,
+              trigger_agent_id: posted.message.agent_id,
+              trigger_role: posted.message.role,
+              min_agents: CONSENSUS_ALERT_MIN_AGENTS,
+              before_latest: beforeLatest,
+              after_latest: afterLatest,
+            },
+          });
+          consensusAlertEvent = publishResult.event;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        consensusAlertWarning = consensusAlertWarning
+          ? `${consensusAlertWarning}; consensus post-check failed: ${message}`
+          : `consensus post-check failed: ${message}`;
+        console.error(`[trichat.consensus] post-check failed: ${message}`);
+      }
+
       return {
         ...posted,
         bus_event: busEvent,
         bus_warning: busWarning,
+        consensus_alert_event: consensusAlertEvent,
+        consensus_alert_warning: consensusAlertWarning,
       };
     },
   })
@@ -663,6 +731,90 @@ function getArgValue(args: string[], flag: string): string | undefined {
     return undefined;
   }
   return args[index + 1];
+}
+
+type ConsensusLatestTurnSnapshot = {
+  status: string;
+  user_message_id: string | null;
+  disagreement_agents: string[];
+  majority_answer: string | null;
+  response_count: number;
+  required_count: number;
+  user_excerpt: string | null;
+};
+
+function getConsensusLatestTurn(payload: unknown): ConsensusLatestTurnSnapshot | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+  const latestRaw = (payload as Record<string, unknown>).latest_turn;
+  if (!latestRaw || typeof latestRaw !== "object") {
+    return null;
+  }
+  const latest = latestRaw as Record<string, unknown>;
+  const status = typeof latest.status === "string" ? latest.status.trim().toLowerCase() : "";
+  if (!status) {
+    return null;
+  }
+  const userMessageId = typeof latest.user_message_id === "string" && latest.user_message_id.trim()
+    ? latest.user_message_id.trim()
+    : null;
+  const disagreementAgents = Array.isArray(latest.disagreement_agents)
+    ? latest.disagreement_agents
+        .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+        .filter((entry) => entry.length > 0)
+    : [];
+  const majorityAnswer = typeof latest.majority_answer === "string" && latest.majority_answer.trim()
+    ? latest.majority_answer.trim()
+    : null;
+  const responseCount =
+    typeof latest.response_count === "number" && Number.isFinite(latest.response_count)
+      ? Math.max(0, Math.trunc(latest.response_count))
+      : 0;
+  const requiredCount =
+    typeof latest.required_count === "number" && Number.isFinite(latest.required_count)
+      ? Math.max(0, Math.trunc(latest.required_count))
+      : 0;
+  const userExcerpt = typeof latest.user_excerpt === "string" && latest.user_excerpt.trim()
+    ? latest.user_excerpt.trim()
+    : null;
+  return {
+    status,
+    user_message_id: userMessageId,
+    disagreement_agents: disagreementAgents,
+    majority_answer: majorityAnswer,
+    response_count: responseCount,
+    required_count: requiredCount,
+    user_excerpt: userExcerpt,
+  };
+}
+
+function shouldEmitConsensusDisagreementAlert(
+  beforeLatest: ConsensusLatestTurnSnapshot | null,
+  afterLatest: ConsensusLatestTurnSnapshot | null
+): boolean {
+  if (!afterLatest || afterLatest.status !== "disagreement") {
+    return false;
+  }
+  if (!beforeLatest) {
+    return false;
+  }
+  if (beforeLatest.user_message_id !== afterLatest.user_message_id) {
+    return false;
+  }
+  return beforeLatest.status !== "disagreement";
+}
+
+function parseConsensusMinAgents(value: string | undefined): number {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return 3;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed)) {
+    return 3;
+  }
+  return parsed <= 2 ? 2 : 3;
 }
 
 function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {

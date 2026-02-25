@@ -519,7 +519,7 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.equal(triChatConsensusUserMessage.ok, true);
     assert.ok(triChatConsensusUserMessage.message.message_id);
 
-    await callTool(client, "trichat.message_post", {
+    const triChatConsensusCodex = await callTool(client, "trichat.message_post", {
       mutation: nextMutation(testId, "trichat.message_post-consensus-codex", () => mutationCounter++),
       thread_id: triChatThreadId,
       agent_id: "codex",
@@ -527,8 +527,9 @@ test("MCP v0.2 integration and safety invariants", async () => {
       content: "14",
       reply_to_message_id: triChatConsensusUserMessage.message.message_id,
     });
+    assert.equal(triChatConsensusCodex.ok, true);
 
-    await callTool(client, "trichat.message_post", {
+    const triChatConsensusCursor = await callTool(client, "trichat.message_post", {
       mutation: nextMutation(testId, "trichat.message_post-consensus-cursor", () => mutationCounter++),
       thread_id: triChatThreadId,
       agent_id: "cursor",
@@ -536,8 +537,27 @@ test("MCP v0.2 integration and safety invariants", async () => {
       content: "14",
       reply_to_message_id: triChatConsensusUserMessage.message.message_id,
     });
+    assert.equal(triChatConsensusCursor.ok, true);
 
-    await callTool(client, "trichat.message_post", {
+    const triChatConsensusDefaultThreshold = await callTool(client, "trichat.consensus", {
+      thread_id: triChatThreadId,
+      limit: 120,
+      min_agents: 3,
+      recent_turn_limit: 5,
+    });
+    assert.equal(triChatConsensusDefaultThreshold.mode, "basic");
+    assert.equal(triChatConsensusDefaultThreshold.latest_turn.status, "incomplete");
+
+    const triChatConsensusTwoAgents = await callTool(client, "trichat.consensus", {
+      thread_id: triChatThreadId,
+      limit: 120,
+      min_agents: 2,
+      recent_turn_limit: 5,
+    });
+    assert.equal(triChatConsensusTwoAgents.mode, "basic");
+    assert.equal(triChatConsensusTwoAgents.latest_turn.status, "consensus");
+
+    const triChatConsensusImprint = await callTool(client, "trichat.message_post", {
       mutation: nextMutation(testId, "trichat.message_post-consensus-imprint", () => mutationCounter++),
       thread_id: triChatThreadId,
       agent_id: "local-imprint",
@@ -545,10 +565,12 @@ test("MCP v0.2 integration and safety invariants", async () => {
       content: "20",
       reply_to_message_id: triChatConsensusUserMessage.message.message_id,
     });
+    assert.equal(triChatConsensusImprint.ok, true);
 
     const triChatConsensus = await callTool(client, "trichat.consensus", {
       thread_id: triChatThreadId,
       limit: 120,
+      min_agents: 3,
       recent_turn_limit: 5,
     });
     assert.equal(triChatConsensus.mode, "basic");
@@ -559,6 +581,8 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(triChatConsensus.latest_turn.answers.length >= 3);
     assert.ok(triChatConsensus.latest_turn.disagreement_agents.includes("local-imprint"));
     assert.equal(triChatConsensus.flagged, true);
+    assert.ok(triChatConsensusImprint.consensus_alert_event);
+    assert.equal(triChatConsensusImprint.consensus_alert_event.event_type, "consensus.alert");
 
     const triChatBusStatus = await callTool(client, "trichat.bus", {
       action: "status",
@@ -607,6 +631,10 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(
       triChatBusTail.events.some((event) => event.event_type === "integration.manual-event"),
       "Expected integration.manual-event in bus tail output"
+    );
+    assert.ok(
+      triChatBusTail.events.some((event) => event.event_type === "consensus.alert"),
+      "Expected consensus.alert in bus tail output after disagreement flip"
     );
 
     const triChatRetentionDryRun = await callTool(client, "trichat.retention", {

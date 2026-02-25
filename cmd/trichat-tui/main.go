@@ -70,6 +70,7 @@ type appConfig struct {
 	adapterFailoverTimeoutSecond int
 	adapterCircuitThreshold      int
 	adapterCircuitRecoverySecond int
+	consensusMinAgents           int
 	executeGateMode              string
 	executeAllowAgents           map[string]bool
 	executeApprovalPhrase        string
@@ -84,6 +85,7 @@ type runtimeSettings struct {
 	model                        string
 	fanoutTarget                 string
 	executeGateMode              string
+	consensusMinAgents           int
 	autoRefresh                  bool
 	pollInterval                 time.Duration
 	modelTimeoutSeconds          int
@@ -1243,6 +1245,7 @@ func newModel(cfg appConfig) model {
 		model:                        cfg.model,
 		fanoutTarget:                 "all",
 		executeGateMode:              cfg.executeGateMode,
+		consensusMinAgents:           cfg.consensusMinAgents,
 		autoRefresh:                  true,
 		pollInterval:                 cfg.pollInterval,
 		modelTimeoutSeconds:          cfg.modelTimeoutSeconds,
@@ -1461,6 +1464,7 @@ func tickEvery(interval time.Duration) tea.Cmd {
 func (m model) refreshCmd() tea.Cmd {
 	caller := m.caller
 	threadID := m.threadID
+	settings := m.settings
 	return func() tea.Msg {
 		reliability := reliabilitySnapshot{}
 		timelinePayload, err := caller.callTool("trichat.timeline", map[string]any{
@@ -1498,6 +1502,7 @@ func (m model) refreshCmd() tea.Cmd {
 		consensusPayload, err := caller.callTool("trichat.consensus", map[string]any{
 			"thread_id":         threadID,
 			"limit":             240,
+			"min_agents":        settings.consensusMinAgents,
 			"recent_turn_limit": 6,
 		})
 		if err == nil {
@@ -2351,6 +2356,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input, cmd = m.input.Update(msg)
 			cmds = append(cmds, cmd)
 		case tabSettings:
+			adjusted := false
 			switch msg.String() {
 			case "up", "k":
 				m.settingsIndex = maxInt(0, m.settingsIndex-1)
@@ -2358,8 +2364,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.settingsIndex = minInt(m.maxSettingsIndex(), m.settingsIndex+1)
 			case "left", "h", "-":
 				m.adjustSetting(-1)
+				adjusted = true
 			case "right", "l", "+":
 				m.adjustSetting(1)
+				adjusted = true
+			}
+			if adjusted && m.ready && !m.refreshing && !m.inflight {
+				m.refreshing = true
+				cmds = append(cmds, m.refreshCmd())
 			}
 			m.renderPanes()
 		case tabReliability:
@@ -3094,7 +3106,7 @@ func (m *model) renderReliabilityDetail() string {
 }
 
 func (m *model) maxSettingsIndex() int {
-	return 8
+	return 9
 }
 
 func (m *model) adjustSetting(delta int) {
@@ -3109,18 +3121,21 @@ func (m *model) adjustSetting(delta int) {
 		options := []string{"open", "allowlist", "approval"}
 		m.settings.executeGateMode = cycleString(options, m.settings.executeGateMode, delta)
 	case 2:
-		m.settings.pollInterval = time.Duration(clampInt(int(m.settings.pollInterval.Seconds())+delta, 1, 60)) * time.Second
+		options := []int{2, 3}
+		m.settings.consensusMinAgents = cycleInt(options, m.settings.consensusMinAgents, delta)
 	case 3:
-		m.settings.modelTimeoutSeconds = clampInt(m.settings.modelTimeoutSeconds+delta, 1, 120)
+		m.settings.pollInterval = time.Duration(clampInt(int(m.settings.pollInterval.Seconds())+delta, 1, 60)) * time.Second
 	case 4:
-		m.settings.bridgeTimeoutSeconds = clampInt(m.settings.bridgeTimeoutSeconds+delta, 1, 120)
+		m.settings.modelTimeoutSeconds = clampInt(m.settings.modelTimeoutSeconds+delta, 1, 120)
 	case 5:
-		m.settings.adapterFailoverTimeoutSecond = clampInt(m.settings.adapterFailoverTimeoutSecond+delta, 1, 120)
+		m.settings.bridgeTimeoutSeconds = clampInt(m.settings.bridgeTimeoutSeconds+delta, 1, 120)
 	case 6:
-		m.settings.adapterCircuitThreshold = clampInt(m.settings.adapterCircuitThreshold+delta, 1, 10)
+		m.settings.adapterFailoverTimeoutSecond = clampInt(m.settings.adapterFailoverTimeoutSecond+delta, 1, 120)
 	case 7:
-		m.settings.adapterCircuitRecoverySecond = clampInt(m.settings.adapterCircuitRecoverySecond+delta, 1, 600)
+		m.settings.adapterCircuitThreshold = clampInt(m.settings.adapterCircuitThreshold+delta, 1, 10)
 	case 8:
+		m.settings.adapterCircuitRecoverySecond = clampInt(m.settings.adapterCircuitRecoverySecond+delta, 1, 600)
+	case 9:
 		if delta != 0 {
 			m.settings.autoRefresh = !m.settings.autoRefresh
 		}
@@ -3137,6 +3152,7 @@ func (m *model) renderSettings() string {
 	}{
 		{"Fanout Target", m.settings.fanoutTarget, "all/codex/cursor/local-imprint"},
 		{"Execute Gate", m.settings.executeGateMode, "open/allowlist/approval"},
+		{"Consensus Min Agents", strconv.Itoa(m.settings.consensusMinAgents), "2 or 3 required responses for consensus/disagreement"},
 		{"Poll Interval", fmt.Sprintf("%ds", int(m.settings.pollInterval.Seconds())), "sidebar and timeline refresh interval"},
 		{"Model Timeout", fmt.Sprintf("%ds", m.settings.modelTimeoutSeconds), "per Ollama request timeout"},
 		{"Bridge Timeout", fmt.Sprintf("%ds", m.settings.bridgeTimeoutSeconds), "per command-adapter timeout"},
@@ -3176,6 +3192,7 @@ func (m *model) renderHelp() string {
 		"- Ctrl+C: quit",
 		"- Chat timeline auto-hides system chatter and compacts long responses",
 		"- Reliability sidebar includes consensus status and disagreement alerts",
+		"- Settings includes consensus threshold toggle (2 or 3 required agent responses)",
 		"- Live Bus Strip shows real-time adapter events (socket stream) before timeline persistence",
 		"",
 		"Slash Commands",
@@ -3246,6 +3263,7 @@ func parseFlags() appConfig {
 	flag.IntVar(&cfg.adapterFailoverTimeoutSecond, "adapter-failover-timeout", envOrInt("TRICHAT_ADAPTER_FAILOVER_TIMEOUT", 75), "Per-agent failover timeout seconds")
 	flag.IntVar(&cfg.adapterCircuitThreshold, "adapter-circuit-threshold", envOrInt("TRICHAT_ADAPTER_CIRCUIT_THRESHOLD", 2), "Consecutive failures before opening circuit")
 	flag.IntVar(&cfg.adapterCircuitRecoverySecond, "adapter-circuit-recovery-seconds", envOrInt("TRICHAT_ADAPTER_CIRCUIT_RECOVERY_SECONDS", 45), "Circuit recovery window seconds")
+	flag.IntVar(&cfg.consensusMinAgents, "consensus-min-agents", envOrInt("TRICHAT_CONSENSUS_MIN_AGENTS", 3), "Consensus threshold (2 or 3 agents)")
 	flag.StringVar(&cfg.executeGateMode, "execute-gate-mode", envOr("TRICHAT_EXECUTE_GATE_MODE", "open"), "execute gate mode (open|allowlist|approval)")
 	allowAgents := envOr("TRICHAT_EXECUTE_ALLOW_AGENTS", "codex,cursor,local-imprint")
 	flag.StringVar(&allowAgents, "execute-allow-agents", allowAgents, "Comma-separated execute allowlist")
@@ -3271,6 +3289,7 @@ func parseFlags() appConfig {
 	cfg.adapterFailoverTimeoutSecond = clampInt(cfg.adapterFailoverTimeoutSecond, 1, 120)
 	cfg.adapterCircuitThreshold = clampInt(cfg.adapterCircuitThreshold, 1, 10)
 	cfg.adapterCircuitRecoverySecond = clampInt(cfg.adapterCircuitRecoverySecond, 1, 600)
+	cfg.consensusMinAgents = clampInt(cfg.consensusMinAgents, 2, 3)
 	minFailover := clampInt(maxInt(cfg.modelTimeoutSeconds+8, cfg.bridgeTimeoutSeconds+5), 1, 120)
 	if cfg.adapterFailoverTimeoutSecond < minFailover {
 		cfg.adapterFailoverTimeoutSecond = minFailover
@@ -3568,6 +3587,24 @@ func compactSingleLine(text string, limit int) string {
 }
 
 func cycleString(options []string, current string, delta int) string {
+	if len(options) == 0 {
+		return current
+	}
+	idx := 0
+	for i, option := range options {
+		if option == current {
+			idx = i
+			break
+		}
+	}
+	idx = (idx + delta) % len(options)
+	if idx < 0 {
+		idx += len(options)
+	}
+	return options[idx]
+}
+
+func cycleInt(options []int, current int, delta int) int {
 	if len(options) == 0 {
 		return current
 	}

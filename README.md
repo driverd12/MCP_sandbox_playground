@@ -21,6 +21,7 @@ Local-first is non-negotiable: everything lives on your machine, centered on `./
 - Auto-squish daemon (`transcript.auto_squish`) + retention (`transcript.retention`)
 - Durable tri-agent message bus (`trichat.thread_*`, `trichat.message_post`, `trichat.timeline`)
 - Unix-socket live event bus for near-real-time adapter signaling (`trichat.bus`, default socket `./data/trichat.bus.sock`)
+- Automatic `consensus.alert` bus events when a thread flips into disagreement
 - Task queue with leases and full event history (`task.*`, `task.timeline`, `task.summary`)
 - Retry daemon with deterministic backoff (`task.auto_retry`)
 - Adapter circuit breakers with persisted telemetry (`trichat.adapter_telemetry`)
@@ -94,6 +95,7 @@ TriChat TUI gives you:
 - Reliability sidebar (task counts, daemons, lease owners, adapter trips)
 - Consensus status line with auto-flag on disagreement (latest tri-agent turn)
 - Settings panel for fanout target, gate mode, failover timeouts, and circuit breaker tuning
+- Settings toggle for consensus threshold (`min_agents=2` or `3`)
 - Help panel with command reference
 - Optional `/consensus` command in CLI mode for explicit turn-by-turn agreement inspection
 

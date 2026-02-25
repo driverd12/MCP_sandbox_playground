@@ -232,6 +232,8 @@ TriChat verifies required `trichat.*` + `task.*` tooling at startup and retries 
 Each adapter channel (bridge command + Ollama fallback) uses per-agent circuit breakers with recovery windows, so transient bridge/model failures degrade gracefully without stalling fanout turns.
 Circuit state and breaker events can be persisted via `trichat.adapter_telemetry` for restart-safe reliability diagnostics.
 Consensus analysis is available via `trichat.consensus`, allowing reliability views to auto-flag cross-agent disagreements per user turn.
+When a thread flips into disagreement, the server publishes `consensus.alert` on `trichat.bus` for adapter-side automation hooks.
+In TUI Settings, `Consensus Min Agents` toggles between `2` and `3` for live consensus calculations.
 The TUI exposes the same runtime path with an interactive split-pane UX (timeline, slash input, reliability sidebar, and settings menu).
 
 TriChat runtime commands for housekeeping:

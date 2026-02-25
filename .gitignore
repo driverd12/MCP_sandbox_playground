@@ -10,3 +10,4 @@ data/*.sqlite-journal
 data/imprint/
 coverage/
 trichat-tui
+__pycache__/

@@ -105,6 +105,30 @@ def parse_csv_set(raw: str) -> set[str]:
     return values
 
 
+def auto_bridge_command(repo_root: Path, agent_id: str) -> str:
+    bridge_script = repo_root / "bridges" / f"{agent_id}_bridge.py"
+    if not bridge_script.exists():
+        return ""
+    python_bin = os.environ.get("TRICHAT_BRIDGE_PYTHON") or sys.executable or "python3"
+    return f"{shlex.quote(python_bin)} {shlex.quote(str(bridge_script))}"
+
+
+def resolve_bridge_command(
+    repo_root: Path,
+    *,
+    agent_id: str,
+    explicit_value: Optional[str],
+    env_var_name: str,
+) -> str:
+    explicit = (explicit_value or "").strip()
+    if explicit:
+        return explicit
+    from_env = os.environ.get(env_var_name, "").strip()
+    if from_env:
+        return from_env
+    return auto_bridge_command(repo_root, agent_id)
+
+
 class McpToolCaller:
     def __init__(
         self,
@@ -246,6 +270,7 @@ class AgentConfig:
   system_prompt: str
   model: str
   command: Optional[str] = None
+  workspace: Optional[str] = None
 
 
 @dataclass
@@ -511,13 +536,16 @@ class AgentAdapter:
       "history": history,
       "bootstrap_text": bootstrap_text,
       "peer_context": peer_context or "",
+      "workspace": self.config.workspace or os.getcwd(),
       "timestamp": now_iso(),
     }
+    command_cwd = self.config.workspace or os.getcwd()
     proc = subprocess.run(
       shlex.split(self.config.command),
       input=json.dumps(payload, ensure_ascii=True),
       capture_output=True,
       text=True,
+      cwd=command_cwd,
       timeout=max(1, timeout_seconds),
       check=False,
     )
@@ -694,9 +722,24 @@ class TriChatApp:
         return ""
 
     def _build_agents(self) -> Dict[str, AgentAdapter]:
-        codex_command = self.args.codex_command or os.environ.get("TRICHAT_CODEX_CMD")
-        cursor_command = self.args.cursor_command or os.environ.get("TRICHAT_CURSOR_CMD")
-        imprint_command = self.args.imprint_command or os.environ.get("TRICHAT_IMPRINT_CMD")
+        codex_command = resolve_bridge_command(
+            self.repo_root,
+            agent_id="codex",
+            explicit_value=self.args.codex_command,
+            env_var_name="TRICHAT_CODEX_CMD",
+        )
+        cursor_command = resolve_bridge_command(
+            self.repo_root,
+            agent_id="cursor",
+            explicit_value=self.args.cursor_command,
+            env_var_name="TRICHAT_CURSOR_CMD",
+        )
+        imprint_command = resolve_bridge_command(
+            self.repo_root,
+            agent_id="local-imprint",
+            explicit_value=self.args.imprint_command,
+            env_var_name="TRICHAT_IMPRINT_CMD",
+        )
 
         configs = [
             AgentConfig(
@@ -704,18 +747,21 @@ class TriChatApp:
                 system_prompt=DEFAULT_CODEX_PROMPT,
                 model=self.args.model,
                 command=codex_command,
+                workspace=str(self.repo_root),
             ),
             AgentConfig(
                 agent_id="cursor",
                 system_prompt=DEFAULT_CURSOR_PROMPT,
                 model=self.args.model,
                 command=cursor_command,
+                workspace=str(self.repo_root),
             ),
             AgentConfig(
                 agent_id="local-imprint",
                 system_prompt=DEFAULT_IMPRINT_PROMPT,
                 model=self.args.model,
                 command=imprint_command,
+                workspace=str(self.repo_root),
             ),
         ]
         return {
@@ -1930,10 +1976,12 @@ class TriChatApp:
         print("=" * 72)
         print(f"Thread: {self.thread_id}")
         print(f"Repo:   {self.repo_root}")
-        print(
-            "Agents: codex, cursor, local-imprint "
-            "(set TRICHAT_CODEX_CMD / TRICHAT_CURSOR_CMD for bridge adapters)"
-        )
+        route_parts = []
+        for agent_id in ["codex", "cursor", "local-imprint"]:
+            adapter = self.agents.get(agent_id)
+            route_parts.append(f"{agent_id}={'bridge' if adapter and adapter.config.command else 'ollama'}")
+        print("Agents: " + ", ".join(route_parts))
+        print("Bridge auto-discovery: ./bridges/<agent>_bridge.py (override with TRICHAT_*_CMD)")
         print(
             "Execute gate: "
             f"{self.execute_gate_mode} "
@@ -1991,17 +2039,17 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--codex-command",
         default="",
-        help="Optional command adapter for codex (reads JSON from stdin, prints content).",
+        help="Optional command adapter for codex (auto-default: ./bridges/codex_bridge.py).",
     )
     parser.add_argument(
         "--cursor-command",
         default="",
-        help="Optional command adapter for cursor (reads JSON from stdin, prints content).",
+        help="Optional command adapter for cursor (auto-default: ./bridges/cursor_bridge.py).",
     )
     parser.add_argument(
         "--imprint-command",
         default="",
-        help="Optional command adapter for local-imprint (reads JSON from stdin, prints content).",
+        help="Optional command adapter for local-imprint (auto-default: ./bridges/local-imprint_bridge.py if present).",
     )
     parser.add_argument(
         "--transport",

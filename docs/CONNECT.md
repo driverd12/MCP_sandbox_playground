@@ -201,9 +201,15 @@ npm run trichat:tui:http
 
 Bridge adapters (optional):
 
-- `TRICHAT_CODEX_CMD`
-- `TRICHAT_CURSOR_CMD`
-- `TRICHAT_IMPRINT_CMD`
+- Auto-default wrappers:
+  - `./bridges/codex_bridge.py`
+  - `./bridges/cursor_bridge.py`
+- Validate bridge readiness:
+  - `npm run trichat:bridges:doctor`
+- Manual overrides (only if needed):
+  - `TRICHAT_CODEX_CMD`
+  - `TRICHAT_CURSOR_CMD`
+  - `TRICHAT_IMPRINT_CMD`
 
 Adapter contract:
 

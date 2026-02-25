@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -614,6 +615,7 @@ func (a *agentRuntime) respond(
 				"history":        history,
 				"bootstrap_text": bootstrapText,
 				"peer_context":   "",
+				"workspace":      cfg.repoRoot,
 				"timestamp":      time.Now().UTC().Format(time.RFC3339),
 			}, timeout)
 			if err == nil {
@@ -2221,6 +2223,7 @@ func (m *model) renderHelp() string {
 		"Visual Theme",
 		"- Neon cotton-candy palette (pink/blue/mint)",
 		"- Framed split panes with live timeline and reliability telemetry",
+		"- Bridge wrappers auto-load from ./bridges for codex/cursor (override with --codex-command / --cursor-command)",
 	}
 	return m.theme.helpText.Render(strings.Join(lines, "\n"))
 }
@@ -2262,9 +2265,9 @@ func parseFlags() appConfig {
 	flag.StringVar(&cfg.stdioCommand, "stdio-command", envOr("TRICHAT_MCP_STDIO_COMMAND", "node"), "stdio command for MCP helper")
 	flag.StringVar(&cfg.stdioArgs, "stdio-args", envOr("TRICHAT_MCP_STDIO_ARGS", "dist/server.js"), "stdio args for MCP helper")
 	flag.StringVar(&cfg.model, "model", envOr("TRICHAT_OLLAMA_MODEL", defaultModel), "Default Ollama model")
-	flag.StringVar(&cfg.codexCommand, "codex-command", envOr("TRICHAT_CODEX_CMD", ""), "Optional command adapter for codex")
-	flag.StringVar(&cfg.cursorCommand, "cursor-command", envOr("TRICHAT_CURSOR_CMD", ""), "Optional command adapter for cursor")
-	flag.StringVar(&cfg.imprintCommand, "imprint-command", envOr("TRICHAT_IMPRINT_CMD", ""), "Optional command adapter for local-imprint")
+	flag.StringVar(&cfg.codexCommand, "codex-command", envOr("TRICHAT_CODEX_CMD", ""), "Optional command adapter for codex (auto-default: ./bridges/codex_bridge.py)")
+	flag.StringVar(&cfg.cursorCommand, "cursor-command", envOr("TRICHAT_CURSOR_CMD", ""), "Optional command adapter for cursor (auto-default: ./bridges/cursor_bridge.py)")
+	flag.StringVar(&cfg.imprintCommand, "imprint-command", envOr("TRICHAT_IMPRINT_CMD", ""), "Optional command adapter for local-imprint (auto-default: ./bridges/local-imprint_bridge.py if present)")
 	flag.IntVar(&cfg.modelTimeoutSeconds, "model-timeout", envOrInt("TRICHAT_MODEL_TIMEOUT", 20), "Per-request Ollama timeout seconds")
 	flag.IntVar(&cfg.bridgeTimeoutSeconds, "bridge-timeout", envOrInt("TRICHAT_BRIDGE_TIMEOUT", 45), "Bridge command timeout seconds")
 	flag.IntVar(&cfg.adapterFailoverTimeoutSecond, "adapter-failover-timeout", envOrInt("TRICHAT_ADAPTER_FAILOVER_TIMEOUT", 18), "Per-agent failover timeout seconds")
@@ -2294,6 +2297,15 @@ func parseFlags() appConfig {
 	cfg.pollInterval = time.Duration(clampInt(pollIntervalSeconds, 1, 60)) * time.Second
 	cfg.executeGateMode = normalizeGateMode(cfg.executeGateMode)
 	cfg.executeAllowAgents = parseAllowlist(allowAgents)
+	if strings.TrimSpace(cfg.codexCommand) == "" {
+		cfg.codexCommand = autoBridgeCommand(cfg.repoRoot, "codex")
+	}
+	if strings.TrimSpace(cfg.cursorCommand) == "" {
+		cfg.cursorCommand = autoBridgeCommand(cfg.repoRoot, "cursor")
+	}
+	if strings.TrimSpace(cfg.imprintCommand) == "" {
+		cfg.imprintCommand = autoBridgeCommand(cfg.repoRoot, "local-imprint")
+	}
 	if cfg.executeApprovalPhrase == "" {
 		cfg.executeApprovalPhrase = "approve"
 	}
@@ -2350,12 +2362,71 @@ func envOrInt(key string, fallback int) int {
 	return parsed
 }
 
+func autoBridgeCommand(repoRoot, agentID string) string {
+	scriptPath := filepath.Join(repoRoot, "bridges", agentID+"_bridge.py")
+	if _, err := os.Stat(scriptPath); err != nil {
+		return ""
+	}
+	pythonBin := strings.TrimSpace(os.Getenv("TRICHAT_BRIDGE_PYTHON"))
+	if pythonBin == "" {
+		pythonBin = "python3"
+	}
+	return shellQuote(pythonBin) + " " + shellQuote(scriptPath)
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(value, " \t\n'\"\\$`") {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
+}
+
 func splitCommand(raw string) []string {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return nil
 	}
-	return strings.Fields(trimmed)
+	args := make([]string, 0, 8)
+	var current strings.Builder
+	inSingle := false
+	inDouble := false
+	escaped := false
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		args = append(args, current.String())
+		current.Reset()
+	}
+	for _, r := range trimmed {
+		switch {
+		case escaped:
+			current.WriteRune(r)
+			escaped = false
+		case r == '\\' && !inSingle:
+			escaped = true
+		case r == '\'' && !inDouble:
+			inSingle = !inSingle
+		case r == '"' && !inSingle:
+			inDouble = !inDouble
+		case unicode.IsSpace(r) && !inSingle && !inDouble:
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if escaped {
+		current.WriteRune('\\')
+	}
+	flush()
+	if inSingle || inDouble {
+		// Fallback for malformed quoted strings.
+		return strings.Fields(trimmed)
+	}
+	return args
 }
 
 func shortTime(iso string) string {

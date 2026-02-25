@@ -26,6 +26,7 @@ Anamnesis is designed as a "Shared Apartment" for agents. Different clients and 
 - Tri-chat retention controls to keep message history bounded (`trichat.retention`)
 - Tri-chat observability and housekeeping daemon (`trichat.summary`, `trichat.auto_retention`)
 - Persistent adapter breaker telemetry (`trichat.adapter_telemetry`) with trip history and last-open events
+- Plug-and-play bridge wrappers for Codex + Cursor CLIs (`./bridges/*.py`) with `trichat:bridges:doctor`
 - Launchd auto-start support for MCP HTTP server + Imprint auto-snapshot
 - Agent on/off switch (`scripts/agents_switch.sh`) for start/stop/status control
 - ADR creation helper (`adr.create`) writing to `./docs/adrs/`
@@ -212,8 +213,10 @@ TUI notes:
 
 Bridge mode (optional):
 
-- Set `TRICHAT_CODEX_CMD` and/or `TRICHAT_CURSOR_CMD` to command adapters that read JSON from stdin and print response text or `{"content":"..."}` JSON.
-- If bridge commands are not configured (or fail), TriChat falls back to local Ollama adapters so all three channels continue responding.
+- TriChat and `trichat-tui` auto-discover `./bridges/codex_bridge.py` and `./bridges/cursor_bridge.py` with zero manual wiring.
+- Run `npm run trichat:bridges:doctor` to verify bridge wrappers + local CLI prerequisites (`codex`, `cursor-agent`).
+- Override bridge commands only when needed with `TRICHAT_CODEX_CMD` and/or `TRICHAT_CURSOR_CMD`.
+- If bridge commands fail for a turn, TriChat falls back to local Ollama adapters so all channels continue responding.
 - Per-agent command/model channels use circuit breakers with recovery windows so transient adapter failures degrade the turn instead of stalling it.
 - Tune failover behavior with `--adapter-failover-timeout`, `--adapter-circuit-threshold`, `--adapter-circuit-recovery-seconds`, and `--model-timeout`.
 

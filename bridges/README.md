@@ -38,7 +38,13 @@ This verifies:
 
 - `codex` CLI presence and `codex exec --help`
 - `cursor-agent` CLI presence and `cursor-agent --help`
+- `codex login status` and `cursor-agent status` authentication readiness
 - wrapper self-tests
+
+If auth is missing, run:
+
+- `codex login`
+- `cursor-agent login`
 
 ## Useful Environment Variables
 

@@ -35,6 +35,27 @@ def run_help(command: str, args: list[str]) -> Dict[str, Any]:
     return result
 
 
+def run_status(command: str, args: list[str]) -> Dict[str, Any]:
+    path = shutil.which(command)
+    result: Dict[str, Any] = {
+        "command": command,
+        "path": path,
+        "available": bool(path),
+    }
+    if not path:
+        return result
+    proc = subprocess.run(
+        [command, *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = (proc.stdout or proc.stderr or "").strip()
+    result["returncode"] = proc.returncode
+    result["output"] = " ".join(output.split())[:220]
+    return result
+
+
 def run_wrapper_self_test(wrapper_path: Path) -> Dict[str, Any]:
     result: Dict[str, Any] = {
         "wrapper": str(wrapper_path),
@@ -78,8 +99,15 @@ def main() -> int:
 
     codex_info = run_help(codex_bin, ["exec", "--help"])
     cursor_info = run_help(cursor_bin, ["--help"])
+    codex_status = run_status(codex_bin, ["login", "status"])
+    cursor_status = run_status(cursor_bin, ["status"])
     codex_wrapper_info = run_wrapper_self_test(codex_wrapper)
     cursor_wrapper_info = run_wrapper_self_test(cursor_wrapper)
+
+    codex_auth_output = str(codex_status.get("output") or "").lower()
+    cursor_auth_output = str(cursor_status.get("output") or "").lower()
+    codex_authenticated = bool(codex_status.get("available")) and "logged in" in codex_auth_output and "not logged" not in codex_auth_output
+    cursor_authenticated = bool(cursor_status.get("available")) and "not logged in" not in cursor_auth_output and cursor_status.get("returncode") == 0
 
     recommended = {
         "TRICHAT_CODEX_CMD": os.environ.get("TRICHAT_CODEX_CMD") or auto_command(codex_wrapper),
@@ -89,6 +117,8 @@ def main() -> int:
     overall_ok = (
         bool(codex_info.get("found"))
         and bool(cursor_info.get("found"))
+        and codex_authenticated
+        and cursor_authenticated
         and bool(codex_wrapper_info.get("ok"))
         and bool(cursor_wrapper_info.get("ok"))
     )
@@ -97,6 +127,16 @@ def main() -> int:
         "repo_root": str(repo_root),
         "codex": codex_info,
         "cursor": cursor_info,
+        "auth": {
+            "codex": {
+                "authenticated": codex_authenticated,
+                "status": codex_status,
+            },
+            "cursor": {
+                "authenticated": cursor_authenticated,
+                "status": cursor_status,
+            },
+        },
         "wrappers": {
             "codex": codex_wrapper_info,
             "cursor": cursor_wrapper_info,

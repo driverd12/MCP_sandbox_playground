@@ -206,6 +206,9 @@ Bridge adapters (optional):
   - `./bridges/cursor_bridge.py`
 - Validate bridge readiness:
   - `npm run trichat:bridges:doctor`
+- If auth is missing:
+  - `codex login`
+  - `cursor-agent login`
 - Manual overrides (only if needed):
   - `TRICHAT_CODEX_CMD`
   - `TRICHAT_CURSOR_CMD`

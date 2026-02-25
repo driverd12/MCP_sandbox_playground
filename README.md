@@ -215,6 +215,7 @@ Bridge mode (optional):
 
 - TriChat and `trichat-tui` auto-discover `./bridges/codex_bridge.py` and `./bridges/cursor_bridge.py` with zero manual wiring.
 - Run `npm run trichat:bridges:doctor` to verify bridge wrappers + local CLI prerequisites (`codex`, `cursor-agent`).
+- If doctor reports auth failure, run `codex login` and/or `cursor-agent login` once.
 - Override bridge commands only when needed with `TRICHAT_CODEX_CMD` and/or `TRICHAT_CURSOR_CMD`.
 - If bridge commands fail for a turn, TriChat falls back to local Ollama adapters so all channels continue responding.
 - Per-agent command/model channels use circuit breakers with recovery windows so transient adapter failures degrade the turn instead of stalling it.

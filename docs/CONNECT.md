@@ -80,7 +80,7 @@ npm test
 - `who_knows`, `knowledge.query`
 - `policy.evaluate`
 - `run.begin`, `run.step`, `run.end`, `run.timeline`
-- `task.create`, `task.list`, `task.claim`, `task.heartbeat`, `task.complete`, `task.fail`, `task.retry`
+- `task.create`, `task.list`, `task.timeline`, `task.claim`, `task.heartbeat`, `task.complete`, `task.fail`, `task.retry`, `task.auto_retry`
 - `mutation.check`
 - `preflight.check`, `postflight.verify`
 - `lock.acquire`, `lock.release`
@@ -168,6 +168,21 @@ Safety defaults:
 - `transcript.retention` only deletes squished lines unless `include_unsquished: true`.
 - `transcript.auto_squish` requires mutation metadata for `start`, `stop`, and `run_once`.
 - `transcript.auto_squish` persists daemon state/config, so restart restores previous mode.
+
+## Task Auto Retry
+
+Recommended usage pattern:
+
+1. Use `task.auto_retry` with `action: "status"` to inspect daemon state.
+2. Use `task.auto_retry` with `action: "run_once"` for explicit failed-task backoff requeue.
+3. Use `task.auto_retry` with `action: "start"` for interval-based retrying.
+4. Use `task.timeline` to inspect full event trail for a task id.
+
+Safety defaults:
+
+- `task.auto_retry` only retries tasks currently in `failed` state.
+- Backoff is deterministic (`base_delay_seconds * 2^(attempt_count-1)`, capped by `max_delay_seconds`).
+- `task.auto_retry` persists daemon state/config, so restart restores previous mode.
 
 ## Data Migration
 

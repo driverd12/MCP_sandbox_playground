@@ -20,6 +20,7 @@ Anamnesis is designed as a "Shared Apartment" for agents. Different clients and 
 - Interval-based Imprint snapshot daemon (`imprint.auto_snapshot`)
 - Local inbox queue + worker daemon for unprompted workload execution (`data/imprint/inbox`, `imprint.inbox.enqueue`)
 - Durable task orchestration with leases (`tasks`, `task_events`, `task_leases`, `task.*`)
+- Failed-task retry daemon with deterministic backoff (`task.auto_retry`)
 - Launchd auto-start support for MCP HTTP server + Imprint auto-snapshot
 - Agent on/off switch (`scripts/agents_switch.sh`) for start/stop/status control
 - ADR creation helper (`adr.create`) writing to `./docs/adrs/`
@@ -148,7 +149,9 @@ Switch mapping:
 - Use `imprint.inbox.enqueue` (or `npm run inbox:enqueue`) to submit background workloads.
 - Use `imprint.inbox.list` to inspect backlog and task outcomes.
 - Use `task.create`, `task.list`, and `task.claim` for durable queue orchestration.
+- Use `task.timeline` to inspect the exact event trail in `task_events`.
 - Use `task.heartbeat`, `task.complete`, `task.fail`, and `task.retry` for lease-aware lifecycle control.
+- Use `task.auto_retry` (`status`, `run_once`, `start`, `stop`) to requeue failed tasks with backoff.
 - Run `./scripts/mvp_smoke.sh` before handoff to verify end-to-end health (default `stdio`, optional `http`).
 
 Suggested loop for multi-agent collaboration:

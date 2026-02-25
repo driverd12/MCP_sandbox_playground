@@ -55,8 +55,13 @@ import {
   taskHeartbeatSchema,
   taskList,
   taskListSchema,
+  taskTimeline,
+  taskTimelineSchema,
   taskRetry,
   taskRetrySchema,
+  taskAutoRetryControl,
+  taskAutoRetrySchema,
+  initializeTaskAutoRetryDaemon,
 } from "./tools/task.js";
 import {
   imprintAutoSnapshotControl,
@@ -88,6 +93,7 @@ const storagePath = storagePathEnv
 const storage = new Storage(storagePath);
 storage.init();
 initializeAutoSquishDaemon(storage);
+initializeTaskAutoRetryDaemon(storage);
 
 const SERVER_NAME = "anamnesis";
 const SERVER_VERSION = "0.2.0";
@@ -354,6 +360,10 @@ registerTool("task.list", "List durable local tasks with optional status filteri
   taskList(storage, input)
 );
 
+registerTool("task.timeline", "Read ordered task lifecycle events from task_events.", taskTimelineSchema, (input) =>
+  taskTimeline(storage, input)
+);
+
 registerTool("task.claim", "Claim the next available task using a renewable lease.", taskClaimSchema, (input) =>
   taskClaim(storage, input)
 );
@@ -372,6 +382,10 @@ registerTool("task.fail", "Mark a running task as failed and release its lease."
 
 registerTool("task.retry", "Requeue a failed task for retry with optional delay.", taskRetrySchema, (input) =>
   taskRetry(storage, input)
+);
+
+registerTool("task.auto_retry", "Manage failed-task auto-retry daemon with deterministic backoff.", taskAutoRetrySchema, (input) =>
+  taskAutoRetryControl(storage, input)
 );
 
 registerTool(

@@ -90,6 +90,18 @@ export type TaskLeaseRecord = {
   updated_at: string;
 };
 
+export type TaskEventRecord = {
+  id: string;
+  task_id: string;
+  created_at: string;
+  event_type: string;
+  from_status: TaskStatus | null;
+  to_status: TaskStatus | null;
+  worker_id: string | null;
+  summary: string | null;
+  details: Record<string, unknown>;
+};
+
 export type MutationMeta = {
   idempotency_key: string;
   side_effect_fingerprint: string;
@@ -165,6 +177,15 @@ export type ImprintAutoSnapshotStateRecord = {
   include_recent_transcript_lines: number;
   write_file: boolean;
   promote_summary: boolean;
+  updated_at: string;
+};
+
+export type TaskAutoRetryStateRecord = {
+  enabled: boolean;
+  interval_seconds: number;
+  batch_limit: number;
+  base_delay_seconds: number;
+  max_delay_seconds: number;
   updated_at: string;
 };
 
@@ -884,6 +905,72 @@ export class Storage {
            updated_at = excluded.updated_at`
       )
       .run("transcript.auto_squish", normalized.enabled ? 1 : 0, configJson, now);
+
+    return {
+      ...normalized,
+      updated_at: now,
+    };
+  }
+
+  getTaskAutoRetryState(): TaskAutoRetryStateRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT enabled, config_json, updated_at
+         FROM daemon_configs
+         WHERE daemon_key = ?`
+      )
+      .get("task.auto_retry") as Record<string, unknown> | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    const config = parseJsonObject(row.config_json);
+    const baseDelaySeconds = parseBoundedInt(config.base_delay_seconds, 30, 0, 86400);
+    const maxDelaySeconds = parseBoundedInt(config.max_delay_seconds, 3600, 0, 604800);
+    return {
+      enabled: Number(row.enabled ?? 0) === 1,
+      interval_seconds: parseBoundedInt(config.interval_seconds, 60, 5, 3600),
+      batch_limit: parseBoundedInt(config.batch_limit, 20, 1, 500),
+      base_delay_seconds: baseDelaySeconds,
+      max_delay_seconds: Math.max(baseDelaySeconds, maxDelaySeconds),
+      updated_at: String(row.updated_at ?? ""),
+    };
+  }
+
+  setTaskAutoRetryState(params: {
+    enabled: boolean;
+    interval_seconds: number;
+    batch_limit: number;
+    base_delay_seconds: number;
+    max_delay_seconds: number;
+  }): TaskAutoRetryStateRecord {
+    const now = new Date().toISOString();
+    const baseDelaySeconds = parseBoundedInt(params.base_delay_seconds, 30, 0, 86400);
+    const normalized = {
+      enabled: Boolean(params.enabled),
+      interval_seconds: parseBoundedInt(params.interval_seconds, 60, 5, 3600),
+      batch_limit: parseBoundedInt(params.batch_limit, 20, 1, 500),
+      base_delay_seconds: baseDelaySeconds,
+      max_delay_seconds: Math.max(baseDelaySeconds, parseBoundedInt(params.max_delay_seconds, 3600, 0, 604800)),
+    };
+    const configJson = stableStringify({
+      interval_seconds: normalized.interval_seconds,
+      batch_limit: normalized.batch_limit,
+      base_delay_seconds: normalized.base_delay_seconds,
+      max_delay_seconds: normalized.max_delay_seconds,
+    });
+
+    this.db
+      .prepare(
+        `INSERT INTO daemon_configs (daemon_key, enabled, config_json, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(daemon_key) DO UPDATE SET
+           enabled = excluded.enabled,
+           config_json = excluded.config_json,
+           updated_at = excluded.updated_at`
+      )
+      .run("task.auto_retry", normalized.enabled ? 1 : 0, configJson, now);
 
     return {
       ...normalized,
@@ -1789,6 +1876,56 @@ export class Storage {
       };
     });
     return retry();
+  }
+
+  listFailedTasksForAutoRetry(limit: number): Array<{
+    task_id: string;
+    attempt_count: number;
+    max_attempts: number;
+    finished_at: string | null;
+    last_error: string | null;
+  }> {
+    const boundedLimit = Math.max(1, Math.min(500, limit));
+    const rows = this.db
+      .prepare(
+        `SELECT t.task_id, t.attempt_count, t.max_attempts, t.finished_at, t.last_error
+         FROM tasks t
+         LEFT JOIN task_leases l ON l.task_id = t.task_id
+         WHERE t.status = 'failed'
+           AND t.attempt_count < t.max_attempts
+           AND (l.task_id IS NULL OR l.lease_expires_at <= ?)
+         ORDER BY
+           COALESCE(t.finished_at, t.updated_at) ASC,
+           t.updated_at ASC,
+           t.task_id ASC
+         LIMIT ?`
+      )
+      .all(new Date().toISOString(), boundedLimit) as Array<Record<string, unknown>>;
+    return rows.map((row) => ({
+      task_id: String(row.task_id ?? ""),
+      attempt_count: Number(row.attempt_count ?? 0),
+      max_attempts: Number(row.max_attempts ?? 0),
+      finished_at: asNullableString(row.finished_at),
+      last_error: asNullableString(row.last_error),
+    }));
+  }
+
+  getTaskTimeline(taskId: string, limit: number): TaskEventRecord[] {
+    const normalized = taskId.trim();
+    if (!normalized) {
+      return [];
+    }
+    const boundedLimit = Math.max(1, Math.min(500, limit));
+    const rows = this.db
+      .prepare(
+        `SELECT id, task_id, created_at, event_type, from_status, to_status, worker_id, summary, details_json
+         FROM task_events
+         WHERE task_id = ?
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(normalized, boundedLimit) as Array<Record<string, unknown>>;
+    return rows.reverse().map((row) => mapTaskEventRow(row));
   }
 
   getTranscriptById(transcriptId: string): TranscriptRecord | null {
@@ -2928,7 +3065,27 @@ function mapTaskRow(row: Record<string, unknown>): TaskRecord {
             created_at: leaseCreatedAt,
             updated_at: leaseUpdatedAt,
           }
-        : null,
+      : null,
+  };
+}
+
+function mapTaskEventRow(row: Record<string, unknown>): TaskEventRecord {
+  return {
+    id: String(row.id ?? ""),
+    task_id: String(row.task_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    event_type: String(row.event_type ?? ""),
+    from_status:
+      row.from_status === null || row.from_status === undefined
+        ? null
+        : normalizeTaskStatus(row.from_status),
+    to_status:
+      row.to_status === null || row.to_status === undefined
+        ? null
+        : normalizeTaskStatus(row.to_status),
+    worker_id: asNullableString(row.worker_id),
+    summary: asNullableString(row.summary),
+    details: parseJsonObject(row.details_json),
   };
 }
 

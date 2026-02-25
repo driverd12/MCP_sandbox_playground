@@ -49,7 +49,9 @@ const EXPECTED_TOOLS = [
   "task.fail",
   "task.heartbeat",
   "task.list",
+  "task.timeline",
   "task.retry",
+  "task.auto_retry",
   "simulate.workflow",
   "transcript.log",
   "transcript.auto_squish",
@@ -361,6 +363,66 @@ test("MCP v0.2 integration and safety invariants", async () => {
     });
     assert.equal(retriedTaskB.retried, true);
     assert.equal(retriedTaskB.task.status, "pending");
+
+    const taskTimelineB = await callTool(client, "task.timeline", {
+      task_id: durableTaskIdB,
+      limit: 50,
+    });
+    assert.ok(taskTimelineB.count >= 4);
+    const taskTimelineTypes = taskTimelineB.events.map((event) => event.event_type);
+    assert.ok(taskTimelineTypes.includes("created"));
+    assert.ok(taskTimelineTypes.includes("claimed"));
+    assert.ok(taskTimelineTypes.includes("failed"));
+    assert.ok(taskTimelineTypes.includes("retried"));
+
+    const durableTaskIdC = `task-${testId}-c`;
+    await callTool(client, "task.create", {
+      mutation: nextMutation(testId, "task.create-c", () => mutationCounter++),
+      task_id: durableTaskIdC,
+      objective: `Run failing branch for auto retry ${testId}`,
+      project_dir: REPO_ROOT,
+      payload: {
+        dry_run: true,
+      },
+      priority: 3,
+    });
+    await callTool(client, "task.claim", {
+      mutation: nextMutation(testId, "task.claim-c", () => mutationCounter++),
+      task_id: durableTaskIdC,
+      worker_id: workerId,
+      lease_seconds: 120,
+    });
+    await callTool(client, "task.fail", {
+      mutation: nextMutation(testId, "task.fail-c", () => mutationCounter++),
+      task_id: durableTaskIdC,
+      worker_id: workerId,
+      error: "auto retry candidate failure",
+      result: { exit_code: 2 },
+    });
+
+    const autoRetryRunOnce = await callTool(client, "task.auto_retry", {
+      action: "run_once",
+      mutation: nextMutation(testId, "task.auto_retry-run_once", () => mutationCounter++),
+      batch_limit: 25,
+      base_delay_seconds: 0,
+      max_delay_seconds: 0,
+    });
+    assert.ok(autoRetryRunOnce.tick);
+    assert.ok(autoRetryRunOnce.tick.retried_count >= 1);
+    assert.ok(
+      autoRetryRunOnce.tick.run_results.some(
+        (entry) => entry.task_id === durableTaskIdC && entry.retried === true
+      )
+    );
+
+    const pendingAfterAutoRetry = await callTool(client, "task.list", {
+      status: "pending",
+      limit: 200,
+    });
+    assert.ok(
+      pendingAfterAutoRetry.tasks.some((task) => task.task_id === durableTaskIdC),
+      "Expected failed task to be rescheduled to pending by task.auto_retry"
+    );
 
     const mutationCheckReplaySafe = await callTool(client, "mutation.check", {
       tool_name: "memory.append",

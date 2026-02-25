@@ -510,7 +510,14 @@ func breakerToStatePayload(agentID, channel, now string, turnCount, degraded int
 	return payload
 }
 
-func (o *orchestrator) fanout(prompt string, history []triChatMessage, cfg appConfig, settings runtimeSettings, target string) ([]agentResponse, []map[string]any) {
+func (o *orchestrator) fanout(
+	prompt string,
+	history []triChatMessage,
+	cfg appConfig,
+	settings runtimeSettings,
+	target string,
+	threadID string,
+) ([]agentResponse, []map[string]any) {
 	agents := fanoutTargets(target)
 	responses := make([]agentResponse, 0, len(agents))
 	events := make([]map[string]any, 0, 16)
@@ -526,7 +533,7 @@ func (o *orchestrator) fanout(prompt string, history []triChatMessage, cfg appCo
 		go func(runtime *agentRuntime) {
 			defer wg.Done()
 			command := commandForAgent(runtime.agentID, cfg)
-			response := runtime.respond(prompt, history, o.bootstrapText(), command, cfg, settings, o.ollamaAPI)
+			response := runtime.respond(prompt, history, o.bootstrapText(), command, cfg, settings, o.ollamaAPI, threadID)
 			results <- response
 		}(agent)
 	}
@@ -576,6 +583,7 @@ func (a *agentRuntime) respond(
 	cfg appConfig,
 	settings runtimeSettings,
 	ollamaAPI string,
+	threadID string,
 ) agentResponse {
 	start := time.Now()
 	deadline := start.Add(time.Duration(maxInt(1, settings.adapterFailoverTimeoutSecond)) * time.Second)
@@ -617,6 +625,7 @@ func (a *agentRuntime) respond(
 			timeout := minDuration(remaining, time.Duration(maxInt(1, settings.bridgeTimeoutSeconds))*time.Second)
 			content, err := callCommandAdapter(command, map[string]any{
 				"agent_id":       a.agentID,
+				"thread_id":      threadID,
 				"prompt":         prompt,
 				"history":        history,
 				"bootstrap_text": bootstrapText,
@@ -1452,7 +1461,7 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 			history.Messages = currentMessages
 		}
 
-		responses, events := orch.fanout(prompt, history.Messages, cfg, settings, target)
+		responses, events := orch.fanout(prompt, history.Messages, cfg, settings, target, threadID)
 		for _, response := range responses {
 			postArgs := map[string]any{
 				"mutation":            mutation.next("trichat.message_post"),

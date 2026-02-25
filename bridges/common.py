@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -187,3 +188,74 @@ def emit_content(content: str, *, meta: Dict[str, Any] | None = None, max_chars:
 
 def emit_status(status: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(status, ensure_ascii=True, indent=2) + "\n")
+
+
+def default_bus_socket_path() -> Path:
+    raw = (os.environ.get("TRICHAT_BUS_SOCKET_PATH") or "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return (Path(__file__).resolve().parents[1] / "data" / "trichat.bus.sock").resolve()
+
+
+def bus_request(command: Dict[str, Any], *, timeout_seconds: float = 1.5) -> Dict[str, Any]:
+    socket_path = default_bus_socket_path()
+    if not socket_path.exists():
+        raise BridgeError(f"trichat bus socket not found: {socket_path}")
+
+    payload = json.dumps(command, ensure_ascii=True) + "\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(max(0.2, float(timeout_seconds)))
+        try:
+            client.connect(str(socket_path))
+            client.sendall(payload.encode("utf-8"))
+        except OSError as error:
+            raise BridgeError(f"trichat bus connect/send failed: {error}") from error
+
+        data = b""
+        while b"\n" not in data:
+            try:
+                chunk = client.recv(8192)
+            except socket.timeout as error:
+                raise BridgeError("trichat bus request timed out waiting for response") from error
+            if not chunk:
+                break
+            data += chunk
+
+    line = data.decode("utf-8", errors="replace").splitlines()
+    if not line:
+        raise BridgeError("trichat bus returned empty response")
+    try:
+        parsed = json.loads(line[-1])
+    except json.JSONDecodeError as error:
+        raise BridgeError(f"trichat bus returned invalid JSON: {error}") from error
+    if not isinstance(parsed, dict):
+        raise BridgeError("trichat bus response must be a JSON object")
+    if str(parsed.get("kind") or "").strip().lower() == "error":
+        raise BridgeError(str(parsed.get("error") or "trichat bus returned error"))
+    return parsed
+
+
+def publish_bus_event(
+    *,
+    thread_id: str,
+    event_type: str,
+    source_agent: str,
+    source_client: str,
+    role: str = "system",
+    content: str = "",
+    metadata: Dict[str, Any] | None = None,
+    timeout_seconds: float = 1.5,
+) -> Dict[str, Any] | None:
+    if not thread_id.strip():
+        return None
+    command: Dict[str, Any] = {
+        "op": "publish",
+        "thread_id": thread_id.strip(),
+        "event_type": event_type.strip() or "adapter.event",
+        "source_agent": source_agent.strip() or "unknown-agent",
+        "source_client": source_client.strip() or "bridge",
+        "role": role.strip() or "system",
+        "content": content.strip(),
+        "metadata": metadata or {},
+    }
+    return bus_request(command, timeout_seconds=timeout_seconds)

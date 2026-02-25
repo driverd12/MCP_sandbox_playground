@@ -19,6 +19,7 @@ from common import (
     emit_status,
     parse_bool_env,
     parse_int_env,
+    publish_bus_event,
     read_payload,
     resolve_executable,
     run_command,
@@ -113,11 +114,37 @@ def run_self_test() -> int:
 
 def run_adapter() -> int:
     payload = read_payload()
+    thread_id = str(payload.get("thread_id") or "").strip()
+    bus_enabled = parse_bool_env("TRICHAT_BRIDGE_BUS_EVENTS", True) and bool(thread_id)
+    bus_warn = parse_bool_env("TRICHAT_BRIDGE_BUS_WARN", False)
+
+    def emit_bus(event_type: str, *, content: str = "", metadata: Dict[str, Any] | None = None) -> None:
+        if not bus_enabled:
+            return
+        try:
+            publish_bus_event(
+                thread_id=thread_id,
+                event_type=event_type,
+                source_agent="cursor",
+                source_client="bridge.cursor",
+                role="system",
+                content=content,
+                metadata=metadata,
+            )
+        except BridgeError as error:
+            if bus_warn:
+                print(f"[cursor-bridge] bus publish skipped: {error}", file=sys.stderr)
+
     if parse_bool_env("TRICHAT_BRIDGE_DRY_RUN", False):
         prompt = str(payload.get("prompt") or "").strip() or "(empty prompt)"
         emit_content(
             f"[dry-run] cursor bridge received prompt: {compact_single_line(prompt, 160)}",
             meta={"adapter": "cursor-bridge", "dry_run": True},
+        )
+        emit_bus(
+            "adapter.turn.dry_run",
+            content=compact_single_line(prompt, 180),
+            metadata={"adapter": "cursor-bridge"},
         )
         return 0
 
@@ -130,6 +157,15 @@ def run_adapter() -> int:
     max_chars = parse_int_env("TRICHAT_BRIDGE_MAX_CHARS", 12000, minimum=500, maximum=200000)
 
     command = cursor_command_base(workspace, prompt=prompt)
+    emit_bus(
+        "adapter.turn.started",
+        content=f"cursor command start ({command[0]})",
+        metadata={
+            "adapter": "cursor-bridge",
+            "workspace": str(workspace),
+            "timeout_seconds": timeout_seconds,
+        },
+    )
     proc = run_command(
         command,
         input_text="",
@@ -139,6 +175,16 @@ def run_adapter() -> int:
     if proc.returncode != 0:
         stderr_tail = compact_single_line(strip_ansi(proc.stderr), 320)
         stdout_tail = compact_single_line(strip_ansi(proc.stdout), 220)
+        emit_bus(
+            "adapter.turn.failed",
+            content=stderr_tail or stdout_tail or f"rc={proc.returncode}",
+            metadata={
+                "adapter": "cursor-bridge",
+                "return_code": proc.returncode,
+                "stderr": stderr_tail,
+                "stdout": stdout_tail,
+            },
+        )
         raise BridgeError(
             f"cursor-agent failed rc={proc.returncode} stderr={stderr_tail or '(empty)'} stdout={stdout_tail or '(empty)'}"
         )
@@ -156,6 +202,16 @@ def run_adapter() -> int:
             "timeout_seconds": timeout_seconds,
         },
         max_chars=max_chars,
+    )
+    emit_bus(
+        "adapter.turn.succeeded",
+        content=compact_single_line(content, 220),
+        metadata={
+            "adapter": "cursor-bridge",
+            "workspace": str(workspace),
+            "timeout_seconds": timeout_seconds,
+            "output_chars": len(content),
+        },
     )
     return 0
 

@@ -398,6 +398,7 @@ class AgentAdapter:
     history: List[Dict[str, Any]],
     bootstrap_text: str,
     peer_context: Optional[str] = None,
+    thread_id: Optional[str] = None,
   ) -> Tuple[str, Dict[str, Any]]:
     self.turn_count += 1
     started_at = time.monotonic()
@@ -429,6 +430,7 @@ class AgentAdapter:
             bootstrap_text,
             peer_context,
             timeout_seconds,
+            thread_id=thread_id,
           )
           recovered = self.command_breaker.record_success()
           if recovered:
@@ -541,9 +543,11 @@ class AgentAdapter:
     bootstrap_text: str,
     peer_context: Optional[str],
     timeout_seconds: int,
+    thread_id: Optional[str] = None,
   ) -> str:
     payload = {
       "agent_id": self.config.agent_id,
+      "thread_id": str(thread_id or "").strip(),
       "prompt": prompt,
       "history": history,
       "bootstrap_text": bootstrap_text,
@@ -1054,6 +1058,7 @@ class TriChatApp:
                     history,
                     self.bootstrap_text,
                     None,
+                    self.thread_id,
                 )
                 futures[future] = agent_id
 
@@ -1149,7 +1154,7 @@ class TriChatApp:
         )
         history = self.get_timeline(limit=60)
         try:
-            content, adapter_meta = adapter.respond(prompt, history, self.bootstrap_text, None)
+            content, adapter_meta = adapter.respond(prompt, history, self.bootstrap_text, None, self.thread_id)
         except Exception as error:  # noqa: BLE001
             content = f"[agent-error] {type(error).__name__}: {error}"
             adapter_meta = {"adapter": "error"}
@@ -1188,6 +1193,7 @@ class TriChatApp:
                         timeline,
                         self.bootstrap_text,
                         peer_context,
+                        self.thread_id,
                     )
                 except Exception as error:  # noqa: BLE001
                     content = f"[huddle-error] {type(error).__name__}: {error}"

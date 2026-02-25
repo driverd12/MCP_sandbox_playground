@@ -86,6 +86,7 @@ import {
   trichatTimeline,
   trichatTimelineSchema,
 } from "./tools/trichat.js";
+import { TriChatBusRuntime, trichatBusControl, trichatBusSchema } from "./tools/trichat_bus.js";
 import {
   imprintAutoSnapshotControl,
   imprintAutoSnapshotSchema,
@@ -118,6 +119,14 @@ storage.init();
 initializeAutoSquishDaemon(storage);
 initializeTaskAutoRetryDaemon(storage);
 initializeTriChatAutoRetentionDaemon(storage);
+const triChatBusRuntime = new TriChatBusRuntime(storage, {
+  socket_path: process.env.TRICHAT_BUS_SOCKET_PATH
+    ? path.resolve(process.env.TRICHAT_BUS_SOCKET_PATH)
+    : path.join(repoRoot, "data", "trichat.bus.sock"),
+});
+triChatBusRuntime.initialize({
+  auto_start: parseBooleanEnv(process.env.TRICHAT_BUS_AUTOSTART, true),
+});
 
 const SERVER_NAME = "anamnesis";
 const SERVER_VERSION = "0.2.0";
@@ -440,7 +449,23 @@ registerTool("trichat.message_post", "Append a message into a tri-chat thread ti
     tool_name: "trichat.message_post",
     mutation: input.mutation,
     payload: input,
-    execute: () => trichatMessagePost(storage, input),
+    execute: () => {
+      const posted = trichatMessagePost(storage, input);
+      let busEvent: unknown = null;
+      let busWarning: string | null = null;
+      try {
+        const publishResult = triChatBusRuntime.publishFromTriChatMessage(posted.message, "mcp:trichat.message_post");
+        busEvent = publishResult.event;
+      } catch (error) {
+        busWarning = error instanceof Error ? error.message : String(error);
+        console.error(`[trichat.bus] message_post publish failed: ${busWarning}`);
+      }
+      return {
+        ...posted,
+        bus_event: busEvent,
+        bus_warning: busWarning,
+      };
+    },
   })
 );
 
@@ -457,6 +482,13 @@ registerTool(
   "Record and read persistent tri-chat adapter circuit-breaker telemetry.",
   trichatAdapterTelemetrySchema,
   (input) => trichatAdapterTelemetry(storage, input)
+);
+
+registerTool(
+  "trichat.bus",
+  "Manage the unix-socket tri-chat live event bus (status/start/stop/publish/tail).",
+  trichatBusSchema,
+  (input) => trichatBusControl(storage, triChatBusRuntime, input)
 );
 
 registerTool("trichat.retention", "Apply retention policy to old tri-chat messages.", trichatRetentionSchema, (input) =>
@@ -622,6 +654,20 @@ function getArgValue(args: string[], flag: string): string | undefined {
     return undefined;
   }
   return args[index + 1];
+}
+
+function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) {
+    return fallback;
+  }
+  if (normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on") {
+    return true;
+  }
+  if (normalized === "0" || normalized === "false" || normalized === "no" || normalized === "off") {
+    return false;
+  }
+  return fallback;
 }
 
 main().catch((error) => {

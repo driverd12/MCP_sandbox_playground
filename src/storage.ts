@@ -4020,6 +4020,28 @@ export class Storage {
     this.ensureIndex("idx_trichat_adapter_events_type_created", "trichat_adapter_events", "event_type, created_at DESC");
   }
 
+  private applyTriChatBusMigration(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS trichat_bus_events (
+        event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT NOT NULL UNIQUE,
+        thread_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        source_agent TEXT,
+        source_client TEXT,
+        event_type TEXT NOT NULL,
+        role TEXT,
+        content TEXT,
+        metadata_json TEXT NOT NULL
+      );
+    `);
+
+    this.ensureIndex("idx_trichat_bus_events_thread_seq", "trichat_bus_events", "thread_id, event_seq DESC");
+    this.ensureIndex("idx_trichat_bus_events_created", "trichat_bus_events", "created_at DESC");
+    this.ensureIndex("idx_trichat_bus_events_type_seq", "trichat_bus_events", "event_type, event_seq DESC");
+    this.ensureIndex("idx_trichat_bus_events_agent_seq", "trichat_bus_events", "source_agent, event_seq DESC");
+  }
+
   private appendTaskEvent(params: {
     task_id: string;
     event_type: string;
@@ -4233,6 +4255,21 @@ function mapTriChatMessageRow(row: Record<string, unknown>): TriChatMessageRecor
     role: String(row.role ?? ""),
     content: String(row.content ?? ""),
     reply_to_message_id: asNullableString(row.reply_to_message_id),
+    metadata: parseJsonObject(row.metadata_json),
+  };
+}
+
+function mapTriChatBusEventRow(row: Record<string, unknown>): TriChatBusEventRecord {
+  return {
+    event_seq: Number(row.event_seq ?? 0),
+    event_id: String(row.event_id ?? ""),
+    thread_id: String(row.thread_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    source_agent: asNullableString(row.source_agent),
+    source_client: asNullableString(row.source_client),
+    event_type: String(row.event_type ?? ""),
+    role: asNullableString(row.role),
+    content: asNullableString(row.content),
     metadata: parseJsonObject(row.metadata_json),
   };
 }

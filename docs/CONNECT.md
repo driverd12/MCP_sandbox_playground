@@ -199,6 +199,14 @@ npm run start:http
 npm run trichat:tui:http
 ```
 
+Install a one-click macOS app launcher (single icon):
+
+```bash
+npm run trichat:app:install -- --icon /absolute/path/to/three-cats.png
+```
+
+This creates `~/Applications/TriChat.app`. Launching it opens TriChat in your terminal mode.
+
 Bridge adapters (optional):
 
 - Auto-default wrappers:

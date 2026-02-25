@@ -211,6 +211,14 @@ TUI notes:
 - `Settings` tab exposes live controls for fanout target, execute gate mode, polling interval, failover timeouts, and circuit breaker thresholds/recovery.
 - `Reliability` tab surfaces task counts, active lease owners, daemon statuses, and adapter telemetry/trip events.
 
+Install a one-click macOS app launcher (single icon) for TriChat:
+
+```bash
+npm run trichat:app:install -- --icon /absolute/path/to/three-cats.png
+```
+
+This creates `~/Applications/TriChat.app` and applies your icon image as the app icon.
+
 Bridge mode (optional):
 
 - TriChat and `trichat-tui` auto-discover `./bridges/codex_bridge.py` and `./bridges/cursor_bridge.py` with zero manual wiring.

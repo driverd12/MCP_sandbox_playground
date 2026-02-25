@@ -966,31 +966,33 @@ type actionDoneMsg struct {
 type tickMsg time.Time
 
 type uiTheme struct {
-	root           lipgloss.Style
-	header         lipgloss.Style
-	tabActive      lipgloss.Style
-	tabInactive    lipgloss.Style
-	panel          lipgloss.Style
-	panelTitle     lipgloss.Style
-	footer         lipgloss.Style
-	status         lipgloss.Style
-	errorStatus    lipgloss.Style
-	inputPanel     lipgloss.Style
-	chatAgent      map[string]lipgloss.Style
-	helpText       lipgloss.Style
-	settingKey     lipgloss.Style
-	settingValue   lipgloss.Style
-	settingPick    lipgloss.Style
-	launcherFrame  lipgloss.Style
-	launcherFrameAlt  lipgloss.Style
-	launcherTitle  lipgloss.Style
+	root               lipgloss.Style
+	header             lipgloss.Style
+	tabActive          lipgloss.Style
+	tabInactive        lipgloss.Style
+	panel              lipgloss.Style
+	panelTitle         lipgloss.Style
+	footer             lipgloss.Style
+	status             lipgloss.Style
+	errorStatus        lipgloss.Style
+	inputPanel         lipgloss.Style
+	chatAgent          map[string]lipgloss.Style
+	helpText           lipgloss.Style
+	settingKey         lipgloss.Style
+	settingValue       lipgloss.Style
+	settingPick        lipgloss.Style
+	launcherFrame      lipgloss.Style
+	launcherFrameAlt   lipgloss.Style
+	launcherTitle      lipgloss.Style
 	launcherTitlePulse lipgloss.Style
-	launcherAccent lipgloss.Style
-	launcherOption lipgloss.Style
-	launcherSelect lipgloss.Style
-	launcherBoot   lipgloss.Style
-	launcherReady  lipgloss.Style
-	launcherMuted  lipgloss.Style
+	launcherAccent     lipgloss.Style
+	launcherOption     lipgloss.Style
+	launcherSelect     lipgloss.Style
+	launcherBoot       lipgloss.Style
+	launcherReady      lipgloss.Style
+	launcherMuted      lipgloss.Style
+	launcherScanlineA  lipgloss.Style
+	launcherScanlineB  lipgloss.Style
 }
 
 func newTheme() uiTheme {
@@ -1076,6 +1078,10 @@ func newTheme() uiTheme {
 		launcherBoot:  lipgloss.NewStyle().Foreground(lipgloss.Color("#ffd166")).Bold(true),
 		launcherReady: lipgloss.NewStyle().Foreground(mint).Bold(true),
 		launcherMuted: lipgloss.NewStyle().Foreground(muted),
+		launcherScanlineA: lipgloss.NewStyle().
+			Background(panelBg),
+		launcherScanlineB: lipgloss.NewStyle().
+			Background(lipgloss.Color("#21103f")),
 		chatAgent: map[string]lipgloss.Style{
 			"user":          lipgloss.NewStyle().Foreground(mint).Bold(true),
 			"codex":         lipgloss.NewStyle().Foreground(pink).Bold(true),
@@ -2110,6 +2116,7 @@ func (m *model) renderLauncher() string {
 		"",
 		m.theme.launcherMuted.Render("Keys: up/down choose | enter launch | esc skip to chat | q quit"),
 	}, "\n")
+	body = applyScanlineOverlay(body, m.theme.launcherScanlineA, m.theme.launcherScanlineB)
 
 	panel := frameStyle.Width(contentWidth).Render(body)
 	return lipgloss.Place(
@@ -2129,6 +2136,27 @@ func padRight(text string, width int) string {
 		return text[:width]
 	}
 	return text + strings.Repeat(" ", width-len(text))
+}
+
+func applyScanlineOverlay(text string, lineA lipgloss.Style, lineB lipgloss.Style) string {
+	lines := strings.Split(text, "\n")
+	maxWidth := 0
+	for _, line := range lines {
+		maxWidth = maxInt(maxWidth, lipgloss.Width(line))
+	}
+	if maxWidth <= 0 {
+		return text
+	}
+	out := make([]string, 0, len(lines))
+	for idx, line := range lines {
+		padded := line + strings.Repeat(" ", maxInt(0, maxWidth-lipgloss.Width(line)))
+		if idx%2 == 0 {
+			out = append(out, lineA.Render(padded))
+		} else {
+			out = append(out, lineB.Render(padded))
+		}
+	}
+	return strings.Join(out, "\n")
 }
 
 func (m *model) renderHeader() string {

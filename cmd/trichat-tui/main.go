@@ -925,6 +925,7 @@ type model struct {
 	launcherActive bool
 	launcherIndex  int
 	launcherItems  []string
+	launcherPulse  int
 	inflight       bool
 	refreshing     bool
 	lastRefresh    time.Time
@@ -981,10 +982,15 @@ type uiTheme struct {
 	settingValue   lipgloss.Style
 	settingPick    lipgloss.Style
 	launcherFrame  lipgloss.Style
+	launcherFrameAlt  lipgloss.Style
 	launcherTitle  lipgloss.Style
+	launcherTitlePulse lipgloss.Style
 	launcherAccent lipgloss.Style
 	launcherOption lipgloss.Style
 	launcherSelect lipgloss.Style
+	launcherBoot   lipgloss.Style
+	launcherReady  lipgloss.Style
+	launcherMuted  lipgloss.Style
 }
 
 func newTheme() uiTheme {
@@ -1046,8 +1052,16 @@ func newTheme() uiTheme {
 			BorderStyle(lipgloss.ThickBorder()).
 			BorderForeground(pink).
 			Padding(1, 2),
+		launcherFrameAlt: lipgloss.NewStyle().
+			Background(panelBg).
+			BorderStyle(lipgloss.ThickBorder()).
+			BorderForeground(blue).
+			Padding(1, 2),
 		launcherTitle: lipgloss.NewStyle().
 			Foreground(blue).
+			Bold(true),
+		launcherTitlePulse: lipgloss.NewStyle().
+			Foreground(pink).
 			Bold(true),
 		launcherAccent: lipgloss.NewStyle().
 			Foreground(mint).
@@ -1059,6 +1073,9 @@ func newTheme() uiTheme {
 			Background(pink).
 			Bold(true).
 			Padding(0, 1),
+		launcherBoot:  lipgloss.NewStyle().Foreground(lipgloss.Color("#ffd166")).Bold(true),
+		launcherReady: lipgloss.NewStyle().Foreground(mint).Bold(true),
+		launcherMuted: lipgloss.NewStyle().Foreground(muted),
 		chatAgent: map[string]lipgloss.Style{
 			"user":          lipgloss.NewStyle().Foreground(mint).Bold(true),
 			"codex":         lipgloss.NewStyle().Foreground(pink).Bold(true),
@@ -1727,6 +1744,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
+		if m.launcherActive {
+			m.launcherPulse = (m.launcherPulse + 1) % 24
+		}
 		cmds = append(cmds, cmd)
 	case tea.KeyMsg:
 		if key := msg.String(); key == "ctrl+c" {
@@ -2020,21 +2040,43 @@ func (m model) View() string {
 }
 
 func (m *model) renderLauncher() string {
-	contentWidth := maxInt(44, minInt(96, m.width-4))
+	contentWidth := maxInt(48, minInt(100, m.width-4))
 	if contentWidth <= 0 {
 		contentWidth = 72
 	}
 
-	bootLine := m.theme.launcherAccent.Render("Status:") + " "
-	if m.ready {
-		bootLine += "connected to Anamnesis runtime"
-	} else {
-		bootLine += m.spinner.View() + " booting local apartment runtime"
+	pulseOn := ((m.launcherPulse / 2) % 2) == 0
+	titleStyle := m.theme.launcherTitle
+	frameStyle := m.theme.launcherFrame
+	if pulseOn {
+		titleStyle = m.theme.launcherTitlePulse
+		frameStyle = m.theme.launcherFrameAlt
 	}
+
+	innerWidth := clampInt(contentWidth-8, 34, 74)
+	rule := "+" + strings.Repeat("-", innerWidth) + "+"
+	headerA := "| " + padRight("TRI-CHAT ARCADE CONSOLE", innerWidth-2) + " |"
+	headerB := "| " + padRight("one prompt -> three agents", innerWidth-2) + " |"
+
+	statusLabel := "BOOTING"
+	statusStyle := m.theme.launcherBoot
+	statusDetail := "running startup pipeline: tool health -> thread open -> imprint bootstrap"
+	if m.ready {
+		statusLabel = "ONLINE"
+		statusStyle = m.theme.launcherReady
+		statusDetail = "anamnesis runtime synced. pick a pane or start chatting."
+	} else if strings.TrimSpace(m.statusLine) != "" && !strings.EqualFold(strings.TrimSpace(m.statusLine), "starting...") {
+		statusDetail = compactSingleLine(m.statusLine, 120)
+	}
+	bootLine := statusStyle.Render("["+statusLabel+"]") + " " + statusDetail
 
 	var options strings.Builder
 	for idx, item := range m.launcherItems {
-		line := fmt.Sprintf(" %d. %s", idx+1, item)
+		prefix := "   "
+		if idx == m.launcherIndex {
+			prefix = ">> "
+		}
+		line := fmt.Sprintf("%s%d. %s", prefix, idx+1, item)
 		if idx == m.launcherIndex {
 			options.WriteString(m.theme.launcherSelect.Render(line))
 		} else {
@@ -2050,20 +2092,26 @@ func (m *model) renderLauncher() string {
 	}
 
 	body := strings.Join([]string{
-		m.theme.launcherTitle.Render("TriChat"),
-		m.theme.helpText.Render("Retro launcher for your three-agent terminal apartment"),
+		titleStyle.Render("TriChat"),
+		m.theme.launcherMuted.Render("Retro launcher for your three-agent terminal apartment"),
+		"",
+		m.theme.launcherAccent.Render(rule),
+		m.theme.launcherAccent.Render(headerA),
+		m.theme.launcherAccent.Render(headerB),
+		m.theme.launcherAccent.Render(rule),
 		"",
 		m.theme.launcherAccent.Render(strings.Join(art, "\n")),
 		"",
-		bootLine,
-		m.theme.helpText.Render("Thread: " + nullCoalesce(m.threadID, "starting...")),
+		m.spinner.View() + " " + bootLine,
+		m.theme.launcherMuted.Render("Thread: " + nullCoalesce(m.threadID, "initializing...")),
+		m.theme.launcherMuted.Render("Roster: codex | cursor | local-imprint"),
 		"",
 		strings.TrimRight(options.String(), "\n"),
 		"",
-		m.theme.helpText.Render("Keys: ↑/↓ choose · Enter launch · Esc skip to chat · q quit"),
+		m.theme.launcherMuted.Render("Keys: up/down choose | enter launch | esc skip to chat | q quit"),
 	}, "\n")
 
-	panel := m.theme.launcherFrame.Width(contentWidth).Render(body)
+	panel := frameStyle.Width(contentWidth).Render(body)
 	return lipgloss.Place(
 		maxInt(contentWidth+2, m.width-2),
 		maxInt(16, m.height-2),
@@ -2071,6 +2119,16 @@ func (m *model) renderLauncher() string {
 		lipgloss.Center,
 		panel,
 	)
+}
+
+func padRight(text string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if len(text) >= width {
+		return text[:width]
+	}
+	return text + strings.Repeat(" ", width-len(text))
 }
 
 func (m *model) renderHeader() string {

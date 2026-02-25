@@ -20,6 +20,7 @@ Local-first is non-negotiable: everything lives on your machine, centered on `./
 - Durable transcript and memory loop (`transcript.log` -> `transcript.squish` -> `memory.search`)
 - Auto-squish daemon (`transcript.auto_squish`) + retention (`transcript.retention`)
 - Durable tri-agent message bus (`trichat.thread_*`, `trichat.message_post`, `trichat.timeline`)
+- Unix-socket live event bus for near-real-time adapter signaling (`trichat.bus`, default socket `./data/trichat.bus.sock`)
 - Task queue with leases and full event history (`task.*`, `task.timeline`, `task.summary`)
 - Retry daemon with deterministic backoff (`task.auto_retry`)
 - Adapter circuit breakers with persisted telemetry (`trichat.adapter_telemetry`)
@@ -191,6 +192,7 @@ TriChat bus and telemetry:
 - `trichat.thread_list`
 - `trichat.thread_get`
 - `trichat.message_post`
+- `trichat.bus` (`status|start|stop|publish|tail`)
 - `trichat.timeline`
 - `trichat.summary`
 - `trichat.retention`
@@ -227,6 +229,8 @@ Key env vars:
 - `TRICHAT_OLLAMA_MODEL`
 - `TRICHAT_TUI_LAUNCHER` (`true`/`false`)
 - `TRICHAT_EXECUTE_GATE_MODE` (`open`/`allowlist`/`approval`)
+- `TRICHAT_BUS_SOCKET_PATH` (Unix socket for live bus, default `./data/trichat.bus.sock`)
+- `TRICHAT_BUS_AUTOSTART` (`true`/`false`, default `true`)
 
 ## Suggested Daily Loop
 1. Start server + TriChat.

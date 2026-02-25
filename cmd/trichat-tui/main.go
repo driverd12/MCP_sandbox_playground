@@ -253,6 +253,21 @@ type adapterTelemetryStatusResp struct {
 	LastOpenEvents []adapterEvent `json:"last_open_events"`
 }
 
+type triChatBusStatusResp struct {
+	Running           bool   `json:"running"`
+	SocketPath        string `json:"socket_path"`
+	StartedAt         string `json:"started_at"`
+	LastError         string `json:"last_error"`
+	ClientCount       int    `json:"client_count"`
+	SubscriptionCount int    `json:"subscription_count"`
+	Metrics           struct {
+		TotalPublished int `json:"total_published"`
+		TotalDelivered int `json:"total_delivered"`
+		MessagesIn     int `json:"messages_in"`
+		MessagesOut    int `json:"messages_out"`
+	} `json:"metrics"`
+}
+
 type adapterState struct {
 	AgentID           string         `json:"agent_id"`
 	Channel           string         `json:"channel"`
@@ -288,6 +303,7 @@ type reliabilitySnapshot struct {
 	triRetention     daemonStatusResp
 	triSummary       triChatSummaryResp
 	adapterTelemetry adapterTelemetryStatusResp
+	busStatus        triChatBusStatusResp
 	updatedAt        time.Time
 }
 
@@ -1211,6 +1227,7 @@ func (m model) initCmd() tea.Cmd {
 			"trichat.thread_get",
 			"trichat.message_post",
 			"trichat.timeline",
+			"trichat.bus",
 			"trichat.summary",
 			"trichat.adapter_telemetry",
 			"task.summary",
@@ -1380,6 +1397,10 @@ func (m model) refreshCmd() tea.Cmd {
 		triSummaryPayload, err := caller.callTool("trichat.summary", map[string]any{"busiest_limit": 5})
 		if err == nil {
 			reliability.triSummary, _ = decodeAny[triChatSummaryResp](triSummaryPayload)
+		}
+		busStatusPayload, err := caller.callTool("trichat.bus", map[string]any{"action": "status"})
+		if err == nil {
+			reliability.busStatus, _ = decodeAny[triChatBusStatusResp](busStatusPayload)
 		}
 		telemetryPayload, err := caller.callTool("trichat.adapter_telemetry", map[string]any{
 			"action":         "status",
@@ -2491,6 +2512,12 @@ func (m *model) renderSidebar() string {
 		onOff(r.taskAutoRetry.Running), onOff(r.transcriptSquish.Running), onOff(r.triRetention.Running)))
 	b.WriteString(fmt.Sprintf("TriChat  threads=%d messages=%d\n",
 		r.triSummary.ThreadCounts.Total, r.triSummary.MessageCount))
+	b.WriteString(fmt.Sprintf("Bus  running=%s clients=%d subs=%d events=%d\n",
+		onOff(r.busStatus.Running),
+		r.busStatus.ClientCount,
+		r.busStatus.SubscriptionCount,
+		r.busStatus.Metrics.TotalPublished,
+	))
 	b.WriteString(fmt.Sprintf("Adapters  open=%d/%d trips=%d degraded=%d/%d\n",
 		r.adapterTelemetry.Summary.OpenChannels,
 		r.adapterTelemetry.Summary.TotalChannels,
@@ -2498,6 +2525,9 @@ func (m *model) renderSidebar() string {
 		r.adapterTelemetry.Summary.TotalDegradedTurns,
 		r.adapterTelemetry.Summary.TotalTurns,
 	))
+	if strings.TrimSpace(r.busStatus.LastError) != "" {
+		b.WriteString("Bus err  " + compactSingleLine(r.busStatus.LastError, 72) + "\n")
+	}
 	if strings.TrimSpace(r.adapterTelemetry.Summary.NewestTripOpenedAt) != "" {
 		b.WriteString("Last trip  " + r.adapterTelemetry.Summary.NewestTripOpenedAt + "\n")
 	}
@@ -2528,6 +2558,13 @@ func (m *model) renderSidebar() string {
 func (m *model) renderReliabilityDetail() string {
 	var b strings.Builder
 	b.WriteString(m.renderSidebar())
+	b.WriteString("\n\nBus detail:\n")
+	b.WriteString(fmt.Sprintf("- socket: %s\n", nullCoalesce(m.reliability.busStatus.SocketPath, "(unset)")))
+	b.WriteString(fmt.Sprintf("- io: in=%d out=%d delivered=%d\n",
+		m.reliability.busStatus.Metrics.MessagesIn,
+		m.reliability.busStatus.Metrics.MessagesOut,
+		m.reliability.busStatus.Metrics.TotalDelivered,
+	))
 	b.WriteString("\n\nRecent adapter events:\n")
 	if len(m.reliability.adapterTelemetry.RecentEvents) == 0 {
 		b.WriteString("(none)")

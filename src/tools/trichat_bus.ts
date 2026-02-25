@@ -350,12 +350,6 @@ export class TriChatBusRuntime {
     socket.on("close", () => {
       this.clients.delete(clientId);
     });
-
-    this.writeClient(client, {
-      kind: "welcome",
-      server_time: new Date().toISOString(),
-      status: this.status(),
-    });
   }
 
   private handleClientChunk(client: TriChatBusClient, chunk: string) {
@@ -417,11 +411,11 @@ export class TriChatBusRuntime {
       if (op === "tail") {
         const eventTypes = asStringArray(parsed.event_types);
         const events = this.tail({
-          thread_id: asOptionalString(parsed.thread_id),
-          source_agent: asOptionalString(parsed.source_agent),
+          thread_id: asOptionalString(parsed.thread_id) ?? undefined,
+          source_agent: asOptionalString(parsed.source_agent) ?? undefined,
           event_types: eventTypes.length > 0 ? eventTypes : undefined,
           since_seq: asOptionalInt(parsed.since_seq),
-          since: asOptionalString(parsed.since),
+          since: asOptionalString(parsed.since) ?? undefined,
           limit: asOptionalInt(parsed.limit),
         });
         this.writeClient(client, {
@@ -496,9 +490,9 @@ export class TriChatBusRuntime {
         const publishResult = this.publish({
           thread_id: threadId,
           event_type: eventType,
-          source_agent: asOptionalString(parsed.source_agent),
+          source_agent: asOptionalString(parsed.source_agent) ?? undefined,
           source_client: asOptionalString(parsed.source_client) ?? "socket:publish",
-          role: asOptionalString(parsed.role),
+          role: asOptionalString(parsed.role) ?? undefined,
           content: asOptionalString(parsed.content) ?? undefined,
           metadata,
           created_at: asOptionalString(parsed.created_at) ?? undefined,

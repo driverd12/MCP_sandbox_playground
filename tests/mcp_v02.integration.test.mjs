@@ -54,6 +54,7 @@ const EXPECTED_TOOLS = [
   "task.retry",
   "task.auto_retry",
   "trichat.adapter_telemetry",
+  "trichat.bus",
   "trichat.message_post",
   "trichat.auto_retention",
   "trichat.retention",
@@ -504,6 +505,55 @@ test("MCP v0.2 integration and safety invariants", async () => {
       triChatTimeline.messages.some(
         (message) => message.reply_to_message_id === triChatCursorMessage.message.message_id
       )
+    );
+
+    const triChatBusStatus = await callTool(client, "trichat.bus", {
+      action: "status",
+    });
+    assert.equal(typeof triChatBusStatus.running, "boolean");
+    assert.equal(typeof triChatBusStatus.socket_path, "string");
+    assert.ok(triChatBusStatus.socket_path.length > 0);
+
+    const triChatBusPublishMissingMutation = await callToolExpectError(client, "trichat.bus", {
+      action: "publish",
+      thread_id: triChatThreadId,
+      event_type: "integration.manual-event",
+      source_agent: "codex",
+    });
+    assert.match(triChatBusPublishMissingMutation, /mutation|required|invalid/i);
+
+    const triChatBusPublish = await callTool(client, "trichat.bus", {
+      action: "publish",
+      mutation: nextMutation(testId, "trichat.bus.publish", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      event_type: "integration.manual-event",
+      source_agent: "codex",
+      source_client: "mcp-v02.integration",
+      role: "system",
+      content: `integration bus event ${testId}`,
+      metadata: {
+        scope: "integration-test",
+      },
+    });
+    assert.equal(triChatBusPublish.action, "publish");
+    assert.equal(typeof triChatBusPublish.event.event_seq, "number");
+    assert.equal(triChatBusPublish.event.event_type, "integration.manual-event");
+
+    const triChatBusTail = await callTool(client, "trichat.bus", {
+      action: "tail",
+      thread_id: triChatThreadId,
+      since_seq: 0,
+      limit: 50,
+    });
+    assert.ok(Array.isArray(triChatBusTail.events));
+    assert.ok(triChatBusTail.events.length >= 1);
+    assert.ok(
+      triChatBusTail.events.some((event) => event.event_type === "trichat.message_post"),
+      "Expected trichat.message_post bus events in tail output"
+    );
+    assert.ok(
+      triChatBusTail.events.some((event) => event.event_type === "integration.manual-event"),
+      "Expected integration.manual-event in bus tail output"
     );
 
     const triChatRetentionDryRun = await callTool(client, "trichat.retention", {

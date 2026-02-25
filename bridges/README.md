@@ -6,12 +6,17 @@ Default wrappers:
 
 - `codex_bridge.py` -> calls `codex exec` non-interactively.
 - `cursor_bridge.py` -> calls `cursor-agent --print` non-interactively.
+- `trichat_bus_client.py` -> publish/subscribe CLI for the Unix socket live event bus.
 
 Both wrappers implement the adapter contract:
 
 - read one JSON payload from stdin
 - print JSON to stdout with a `content` field
 - write all operational/debug logs to stderr only
+
+When `thread_id` is present in the bridge payload, codex/cursor wrappers also emit
+best-effort live bus events (`adapter.turn.started|succeeded|failed`) over the local
+Unix socket.
 
 ## Auto-Wiring
 
@@ -76,3 +81,30 @@ Shared:
 - `TRICHAT_BRIDGE_PYTHON` (python interpreter used for auto command strings)
 - `TRICHAT_BRIDGE_MAX_CHARS` (default `12000`)
 - `TRICHAT_BRIDGE_DRY_RUN=1` (smoke payload handling without calling model CLIs)
+- `TRICHAT_BRIDGE_BUS_EVENTS` (default `1`, enable bridge -> bus publish)
+- `TRICHAT_BRIDGE_BUS_WARN` (default `0`, emit stderr warnings on bus publish failures)
+- `TRICHAT_BUS_SOCKET_PATH` (override Unix socket path; default `./data/trichat.bus.sock`)
+
+## Bus Client Examples
+
+Read bus status:
+
+```bash
+python3 ./bridges/trichat_bus_client.py status
+```
+
+Subscribe to live events for one thread:
+
+```bash
+python3 ./bridges/trichat_bus_client.py subscribe --thread-id trichat-123 --run-seconds 30
+```
+
+Publish an out-of-band event:
+
+```bash
+python3 ./bridges/trichat_bus_client.py publish \
+  --thread-id trichat-123 \
+  --event-type adapter.note \
+  --source-agent codex \
+  --content "manual adapter note"
+```

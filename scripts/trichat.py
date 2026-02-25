@@ -908,6 +908,7 @@ class TriChatApp:
             "trichat.thread_get",
             "trichat.message_post",
             "trichat.timeline",
+            "trichat.bus",
             "trichat.retention",
             "trichat.summary",
             "trichat.auto_retention",

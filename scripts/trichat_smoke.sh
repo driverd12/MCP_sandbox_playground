@@ -166,6 +166,44 @@ try {
     }
   }
 
+  const busStatus = await callTool("trichat.bus", {
+    action: "status",
+  });
+  if (typeof busStatus?.running !== "boolean") {
+    throw new Error("trichat.bus status missing running flag");
+  }
+
+  const busPublish = await callTool("trichat.bus", {
+    action: "publish",
+    mutation: mutation("trichat.bus.publish"),
+    thread_id: threadId,
+    event_type: "trichat-smoke.manual-event",
+    source_agent: "router",
+    source_client: "scripts/trichat_smoke.sh",
+    role: "system",
+    content: `TriChat smoke manual bus event for ${threadId}`,
+    metadata: { source: "trichat_smoke" },
+  });
+  if (!busPublish?.event?.event_id) {
+    throw new Error("trichat.bus publish did not return event_id");
+  }
+
+  const busTail = await callTool("trichat.bus", {
+    action: "tail",
+    thread_id: threadId,
+    limit: 50,
+  });
+  if (!Array.isArray(busTail?.events) || busTail.events.length < 1) {
+    throw new Error("trichat.bus tail returned no events");
+  }
+  const busEventTypes = new Set(busTail.events.map((entry) => entry.event_type));
+  if (!busEventTypes.has("trichat.message_post")) {
+    throw new Error("trichat.bus tail missing trichat.message_post events");
+  }
+  if (!busEventTypes.has("trichat-smoke.manual-event")) {
+    throw new Error("trichat.bus tail missing trichat-smoke.manual-event");
+  }
+
   const thread = await callTool("trichat.thread_get", {
     thread_id: threadId,
   });
@@ -229,6 +267,8 @@ try {
         retention_candidates: retention.candidate_count,
         thread_status: keepActive ? thread.thread?.status ?? null : "archived",
         total_messages: summary.message_count,
+        bus_running: busStatus.running,
+        bus_events: busTail.events.length,
         auto_retention_running: autoRetentionStatus.running,
         adapter_channels: adapterTelemetry.summary.total_channels,
         adapter_open_channels: adapterTelemetry.summary.open_channels,

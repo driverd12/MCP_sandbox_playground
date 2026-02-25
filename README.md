@@ -105,12 +105,18 @@ TriChat auto-detects bridge wrappers from `./bridges`:
 
 - `bridges/codex_bridge.py`
 - `bridges/cursor_bridge.py`
-- `bridges/local-imprint_bridge.py` (optional)
+- `bridges/local-imprint_bridge.py` (deterministic math assist + Ollama fallback)
 
 Validate adapters and local auth state:
 
 ```bash
 npm run trichat:bridges:doctor
+```
+
+Smoke-test deterministic imprint arithmetic (order-of-operations):
+
+```bash
+npm run imprint:math:smoke
 ```
 
 If needed, authenticate once:

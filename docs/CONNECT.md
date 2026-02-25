@@ -207,11 +207,12 @@ npm run trichat:app:install -- --icon /absolute/path/to/three-cats.png
 
 This creates `~/Applications/TriChat.app`. Launching it opens TriChat in your terminal mode.
 
-Bridge adapters (optional):
+Bridge adapters:
 
 - Auto-default wrappers:
   - `./bridges/codex_bridge.py`
   - `./bridges/cursor_bridge.py`
+  - `./bridges/local-imprint_bridge.py` (also supports `local_imprint_bridge.py`)
 - Validate bridge readiness:
   - `npm run trichat:bridges:doctor`
 - If auth is missing:
@@ -256,6 +257,12 @@ Run TriChat message-bus smoke check:
 
 ```bash
 npm run trichat:smoke
+```
+
+Run local-imprint arithmetic reliability smoke check:
+
+```bash
+npm run imprint:math:smoke
 ```
 
 Against a live HTTP MCP server:

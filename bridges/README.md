@@ -6,6 +6,7 @@ Default wrappers:
 
 - `codex_bridge.py` -> calls `codex exec` non-interactively.
 - `cursor_bridge.py` -> calls `cursor-agent --print` non-interactively.
+- `local-imprint_bridge.py` -> deterministic math assist + local Ollama fallback.
 - `trichat_bus_client.py` -> publish/subscribe CLI for the Unix socket live event bus.
 
 Both wrappers implement the adapter contract:
@@ -24,11 +25,13 @@ TriChat clients auto-discover wrappers at:
 
 - `./bridges/codex_bridge.py`
 - `./bridges/cursor_bridge.py`
+- `./bridges/local-imprint_bridge.py` (also supports `./bridges/local_imprint_bridge.py`)
 
 You can override with:
 
 - `TRICHAT_CODEX_CMD`
 - `TRICHAT_CURSOR_CMD`
+- `TRICHAT_IMPRINT_CMD`
 - CLI flags `--codex-command` / `--cursor-command`
 
 ## Bridge Doctor
@@ -43,6 +46,7 @@ This verifies:
 
 - `codex` CLI presence and `codex exec --help`
 - `cursor-agent` CLI presence and `cursor-agent --help`
+- `ollama` CLI presence and `ollama list` status
 - `codex login status` and `cursor-agent status` authentication readiness
 - wrapper self-tests
 
@@ -75,6 +79,15 @@ Cursor bridge:
 - `TRICHAT_CURSOR_FORCE` (default `1`)
 - `TRICHAT_CURSOR_APPROVE_MCPS` (default `1`)
 - `TRICHAT_CURSOR_EXTRA_ARGS`
+
+Local-imprint bridge:
+
+- `TRICHAT_IMPRINT_MODEL` (falls back to `TRICHAT_OLLAMA_MODEL`, default `llama3.2:3b`)
+- `TRICHAT_IMPRINT_TIMEOUT` (default `75`)
+- `TRICHAT_IMPRINT_SYSTEM_PROMPT`
+- `TRICHAT_IMPRINT_TEMPERATURE` (default `0.15`)
+- `TRICHAT_IMPRINT_MATH_ASSIST` (default `1`; deterministic arithmetic path)
+- `TRICHAT_IMPRINT_MATH_DECIMAL_PLACES` (default `12`)
 
 Shared:
 

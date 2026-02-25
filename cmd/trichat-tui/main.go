@@ -3145,7 +3145,7 @@ func parseFlags() appConfig {
 	flag.StringVar(&cfg.model, "model", envOr("TRICHAT_OLLAMA_MODEL", defaultModel), "Default Ollama model")
 	flag.StringVar(&cfg.codexCommand, "codex-command", envOr("TRICHAT_CODEX_CMD", ""), "Optional command adapter for codex (auto-default: ./bridges/codex_bridge.py)")
 	flag.StringVar(&cfg.cursorCommand, "cursor-command", envOr("TRICHAT_CURSOR_CMD", ""), "Optional command adapter for cursor (auto-default: ./bridges/cursor_bridge.py)")
-	flag.StringVar(&cfg.imprintCommand, "imprint-command", envOr("TRICHAT_IMPRINT_CMD", ""), "Optional command adapter for local-imprint (auto-default: ./bridges/local-imprint_bridge.py if present)")
+	flag.StringVar(&cfg.imprintCommand, "imprint-command", envOr("TRICHAT_IMPRINT_CMD", ""), "Optional command adapter for local-imprint (auto-default: ./bridges/local-imprint_bridge.py or ./bridges/local_imprint_bridge.py if present)")
 	flag.IntVar(&cfg.modelTimeoutSeconds, "model-timeout", envOrInt("TRICHAT_MODEL_TIMEOUT", 30), "Per-request Ollama timeout seconds")
 	flag.IntVar(&cfg.bridgeTimeoutSeconds, "bridge-timeout", envOrInt("TRICHAT_BRIDGE_TIMEOUT", 60), "Bridge command timeout seconds")
 	flag.IntVar(&cfg.adapterFailoverTimeoutSecond, "adapter-failover-timeout", envOrInt("TRICHAT_ADAPTER_FAILOVER_TIMEOUT", 75), "Per-agent failover timeout seconds")
@@ -3267,8 +3267,18 @@ func envOrBool(key string, fallback bool) bool {
 }
 
 func autoBridgeCommand(repoRoot, agentID string) string {
-	scriptPath := filepath.Join(repoRoot, "bridges", agentID+"_bridge.py")
-	if _, err := os.Stat(scriptPath); err != nil {
+	candidates := []string{
+		filepath.Join(repoRoot, "bridges", agentID+"_bridge.py"),
+		filepath.Join(repoRoot, "bridges", strings.ReplaceAll(agentID, "-", "_")+"_bridge.py"),
+	}
+	scriptPath := ""
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			scriptPath = candidate
+			break
+		}
+	}
+	if scriptPath == "" {
 		return ""
 	}
 	pythonBin := strings.TrimSpace(os.Getenv("TRICHAT_BRIDGE_PYTHON"))

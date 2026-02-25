@@ -129,6 +129,7 @@ def build_prompt(payload: Dict[str, Any], *, bridge_name: str, max_history: int 
         "Output contract:",
         "- reply with direct plain-text answer only",
         "- keep output concise (max 6 lines) unless user asks for detail",
+        "- for arithmetic, apply order of operations and verify the final numeric answer",
         "- do not include thread recap, next-action scaffolding, or debug dumps",
         "",
         "User request:",

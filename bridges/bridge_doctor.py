@@ -13,6 +13,13 @@ from pathlib import Path
 from typing import Any, Dict
 
 
+def first_existing(paths: list[Path]) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
+
+
 def run_help(command: str, args: list[str]) -> Dict[str, Any]:
     path = shutil.which(command)
     result: Dict[str, Any] = {
@@ -93,16 +100,25 @@ def main() -> int:
     bridges_dir = repo_root / "bridges"
     codex_wrapper = bridges_dir / "codex_bridge.py"
     cursor_wrapper = bridges_dir / "cursor_bridge.py"
+    imprint_wrapper = first_existing(
+        [
+            bridges_dir / "local-imprint_bridge.py",
+            bridges_dir / "local_imprint_bridge.py",
+        ]
+    )
 
     codex_bin = (os.environ.get("TRICHAT_CODEX_BIN") or "codex").strip() or "codex"
     cursor_bin = (os.environ.get("TRICHAT_CURSOR_BIN") or "cursor-agent").strip() or "cursor-agent"
 
     codex_info = run_help(codex_bin, ["exec", "--help"])
     cursor_info = run_help(cursor_bin, ["--help"])
+    ollama_info = run_help("ollama", ["--version"])
+    ollama_status = run_status("ollama", ["list"])
     codex_status = run_status(codex_bin, ["login", "status"])
     cursor_status = run_status(cursor_bin, ["status"])
     codex_wrapper_info = run_wrapper_self_test(codex_wrapper)
     cursor_wrapper_info = run_wrapper_self_test(cursor_wrapper)
+    imprint_wrapper_info = run_wrapper_self_test(imprint_wrapper)
 
     codex_auth_output = str(codex_status.get("output") or "").lower()
     cursor_auth_output = str(cursor_status.get("output") or "").lower()
@@ -112,6 +128,7 @@ def main() -> int:
     recommended = {
         "TRICHAT_CODEX_CMD": os.environ.get("TRICHAT_CODEX_CMD") or auto_command(codex_wrapper),
         "TRICHAT_CURSOR_CMD": os.environ.get("TRICHAT_CURSOR_CMD") or auto_command(cursor_wrapper),
+        "TRICHAT_IMPRINT_CMD": os.environ.get("TRICHAT_IMPRINT_CMD") or auto_command(imprint_wrapper),
     }
 
     overall_ok = (
@@ -121,12 +138,17 @@ def main() -> int:
         and cursor_authenticated
         and bool(codex_wrapper_info.get("ok"))
         and bool(cursor_wrapper_info.get("ok"))
+        and bool(imprint_wrapper_info.get("ok"))
     )
     payload = {
         "ok": overall_ok,
         "repo_root": str(repo_root),
         "codex": codex_info,
         "cursor": cursor_info,
+        "ollama": {
+            "binary": ollama_info,
+            "status": ollama_status,
+        },
         "auth": {
             "codex": {
                 "authenticated": codex_authenticated,
@@ -140,11 +162,13 @@ def main() -> int:
         "wrappers": {
             "codex": codex_wrapper_info,
             "cursor": cursor_wrapper_info,
+            "local-imprint": imprint_wrapper_info,
         },
         "recommended_commands": recommended,
         "notes": [
-            "TriChat and trichat-tui auto-load these wrappers when TRICHAT_CODEX_CMD/TRICHAT_CURSOR_CMD are unset.",
+            "TriChat and trichat-tui auto-load codex/cursor/local-imprint wrappers when TRICHAT_*_CMD overrides are unset.",
             "Use TRICHAT_BRIDGE_DRY_RUN=1 to smoke bridge payload parsing without hitting model providers.",
+            "local-imprint bridge uses deterministic arithmetic evaluation before Ollama fallback for math reliability.",
         ],
     }
     print(json.dumps(payload, indent=2))

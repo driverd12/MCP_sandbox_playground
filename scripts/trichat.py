@@ -31,15 +31,18 @@ OLLAMA_API_BASE = os.environ.get("TRICHAT_OLLAMA_API_BASE", "http://127.0.0.1:11
 
 DEFAULT_CODEX_PROMPT = (
     "You are Codex in tri-chat mode. Respond with concrete, high-signal engineering guidance. "
-    "Keep replies concise (max 6 lines) unless the user asks for depth. Avoid recap or scaffolding sections."
+    "Keep replies concise (max 6 lines) unless the user asks for depth. Avoid recap or scaffolding sections. "
+    "For arithmetic expressions, verify order-of-operations before giving the final value."
 )
 DEFAULT_CURSOR_PROMPT = (
     "You are Cursor in tri-chat mode. Respond with practical implementation guidance, "
-    "developer UX suggestions, and concise reasoning. Keep replies to max 6 lines unless asked for detail."
+    "developer UX suggestions, and concise reasoning. Keep replies to max 6 lines unless asked for detail. "
+    "For arithmetic expressions, verify order-of-operations before giving the final value."
 )
 DEFAULT_IMPRINT_PROMPT = (
     "You are the local Imprint agent for Anamnesis. Favor deterministic local-first execution and "
-    "idempotent operations. Reply concisely (max 6 lines) and avoid memory/transcript dumps unless requested."
+    "idempotent operations. Reply concisely (max 6 lines) and avoid memory/transcript dumps unless requested. "
+    "For arithmetic expressions, compute deterministically with strict order-of-operations."
 )
 
 EXECUTE_GATE_MODES = {"open", "allowlist", "approval"}
@@ -118,8 +121,17 @@ def is_smoke_thread(candidate: Dict[str, Any]) -> bool:
 
 
 def auto_bridge_command(repo_root: Path, agent_id: str) -> str:
-    bridge_script = repo_root / "bridges" / f"{agent_id}_bridge.py"
-    if not bridge_script.exists():
+    candidate_names = [
+        f"{agent_id}_bridge.py",
+        f"{agent_id.replace('-', '_')}_bridge.py",
+    ]
+    bridge_script = None
+    for name in candidate_names:
+        candidate = repo_root / "bridges" / name
+        if candidate.exists():
+            bridge_script = candidate
+            break
+    if bridge_script is None:
         return ""
     python_bin = os.environ.get("TRICHAT_BRIDGE_PYTHON") or sys.executable or "python3"
     return f"{shlex.quote(python_bin)} {shlex.quote(str(bridge_script))}"
@@ -2083,7 +2095,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--imprint-command",
         default="",
-        help="Optional command adapter for local-imprint (auto-default: ./bridges/local-imprint_bridge.py if present).",
+        help=(
+            "Optional command adapter for local-imprint "
+            "(auto-default: ./bridges/local-imprint_bridge.py or ./bridges/local_imprint_bridge.py if present)."
+        ),
     )
     parser.add_argument(
         "--transport",

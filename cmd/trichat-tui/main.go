@@ -2152,7 +2152,7 @@ func (m *model) renderLauncher() string {
 		"",
 		strings.TrimRight(options.String(), "\n"),
 		"",
-		m.theme.launcherMuted.Render("Keys: up/down choose | enter launch | esc skip to chat | q quit"),
+		m.theme.launcherMuted.Render("Keys: up/down choose | enter launch | esc skip to chat | q quit prompt"),
 	}, "\n")
 	body = applyScanlineOverlay(body, m.theme.launcherScanlineA, m.theme.launcherScanlineB)
 

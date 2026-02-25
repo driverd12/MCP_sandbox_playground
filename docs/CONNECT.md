@@ -82,7 +82,7 @@ npm test
 - `run.begin`, `run.step`, `run.end`, `run.timeline`
 - `task.create`, `task.list`, `task.timeline`, `task.claim`, `task.heartbeat`, `task.complete`, `task.fail`, `task.retry`, `task.auto_retry`
 - `task.summary`
-- `trichat.thread_open`, `trichat.thread_list`, `trichat.thread_get`, `trichat.message_post`, `trichat.timeline`, `trichat.retention`
+- `trichat.thread_open`, `trichat.thread_list`, `trichat.thread_get`, `trichat.message_post`, `trichat.timeline`, `trichat.summary`, `trichat.adapter_telemetry`, `trichat.retention`, `trichat.auto_retention`
 - `mutation.check`
 - `preflight.check`, `postflight.verify`
 - `lock.acquire`, `lock.release`
@@ -198,6 +198,14 @@ Adapter contract:
 - writes response text or JSON with `content` field to stdout
 
 TriChat verifies required `trichat.*` + `task.*` tooling at startup and retries MCP tool calls on transient failures.
+Each adapter channel (bridge command + Ollama fallback) uses per-agent circuit breakers with recovery windows, so transient bridge/model failures degrade gracefully without stalling fanout turns.
+Circuit state and breaker events can be persisted via `trichat.adapter_telemetry` for restart-safe reliability diagnostics.
+
+TriChat runtime commands for housekeeping:
+
+- `/adapters status|reset [all|codex|cursor|local-imprint]` for adapter breaker inspection/reset.
+- `/retention [days] [apply] [all]` for one-shot pruning (`dry_run` by default).
+- `/retentiond status|start|stop|run_once` for daemonized tri-chat retention.
 
 `/execute` gate modes:
 

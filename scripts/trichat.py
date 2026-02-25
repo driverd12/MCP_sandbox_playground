@@ -49,6 +49,35 @@ def now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+def epoch_to_iso(epoch_seconds: Optional[float]) -> Optional[str]:
+    if epoch_seconds is None:
+        return None
+    try:
+        value = float(epoch_seconds)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
+
+
+def iso_to_epoch(value: Optional[str]) -> float:
+    if not value:
+        return 0.0
+    text = value.strip()
+    if not text:
+        return 0.0
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
 def truncate(text: str, limit: int = 700) -> str:
     if len(text) <= limit:
         return text
@@ -165,21 +194,31 @@ class OllamaClient:
         self.model = model
         self.timeout_seconds = timeout_seconds
 
-    def chat(self, messages: List[Dict[str, str]], temperature: float = 0.2) -> str:
+    def chat(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.2,
+        timeout_seconds: Optional[int] = None,
+    ) -> str:
         payload = {
             "model": self.model,
             "stream": False,
             "messages": messages,
             "options": {"temperature": temperature},
         }
-        raw = self._request("/api/chat", payload)
+        raw = self._request("/api/chat", payload, timeout_seconds=timeout_seconds)
         message = raw.get("message", {}) if isinstance(raw, dict) else {}
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             raise RuntimeError("Ollama returned empty response content")
         return content.strip()
 
-    def _request(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _request(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        timeout_seconds: Optional[int] = None,
+    ) -> Dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url=f"{OLLAMA_API_BASE}{endpoint}",
@@ -187,8 +226,9 @@ class OllamaClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
+        timeout = max(1, int(timeout_seconds or self.timeout_seconds))
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 text = resp.read().decode("utf-8", errors="replace")
         except TimeoutError as error:
             raise RuntimeError(f"Ollama timeout on {endpoint}") from error
@@ -202,113 +242,405 @@ class OllamaClient:
 
 @dataclass
 class AgentConfig:
-    agent_id: str
-    system_prompt: str
-    model: str
-    command: Optional[str] = None
+  agent_id: str
+  system_prompt: str
+  model: str
+  command: Optional[str] = None
+
+
+@dataclass
+class CircuitBreakerState:
+  threshold: int
+  recovery_seconds: int
+  failure_count: int = 0
+  open_until: float = 0.0
+  last_opened_at: float = 0.0
+  last_error: str = ""
+  last_result: str = ""
+  trip_count: int = 0
+  success_count: int = 0
+
+  def is_open(self) -> bool:
+    return time.time() < self.open_until
+
+  def remaining_seconds(self) -> float:
+    remaining = self.open_until - time.time()
+    return max(0.0, remaining)
+
+  def record_success(self) -> bool:
+    was_open = self.is_open()
+    self.failure_count = 0
+    self.open_until = 0.0
+    self.last_error = ""
+    self.last_result = "success"
+    self.success_count += 1
+    return was_open
+
+  def record_failure(self, error_text: str) -> bool:
+    tripped = False
+    self.failure_count += 1
+    self.last_error = truncate(error_text, 240)
+    self.last_result = "failure"
+    if self.failure_count >= self.threshold:
+      self.trip_count += 1
+      self.failure_count = 0
+      opened_at = time.time()
+      self.last_opened_at = opened_at
+      self.open_until = opened_at + self.recovery_seconds
+      self.last_result = "trip-opened"
+      tripped = True
+    return tripped
+
+  def reset(self) -> None:
+    self.failure_count = 0
+    self.open_until = 0.0
+    self.last_error = ""
+    self.last_result = "reset"
+
+  def hydrate(
+    self,
+    *,
+    failure_count: int,
+    open_until_epoch: float,
+    last_opened_at_epoch: float,
+    last_error: Optional[str],
+    last_result: Optional[str],
+    trip_count: int,
+    success_count: int,
+  ) -> None:
+    self.failure_count = max(0, int(failure_count))
+    self.open_until = max(0.0, float(open_until_epoch))
+    self.last_opened_at = max(0.0, float(last_opened_at_epoch))
+    self.last_error = truncate(last_error or "", 240)
+    self.last_result = truncate(last_result or "", 120)
+    self.trip_count = max(0, int(trip_count))
+    self.success_count = max(0, int(success_count))
+
+  def snapshot(self) -> Dict[str, Any]:
+    return {
+      "open": self.is_open(),
+      "remaining_seconds": round(self.remaining_seconds(), 3),
+      "open_until_epoch": self.open_until if self.open_until > 0 else None,
+      "last_opened_at_epoch": self.last_opened_at if self.last_opened_at > 0 else None,
+      "failure_count": self.failure_count,
+      "last_error": self.last_error or None,
+      "last_result": self.last_result or None,
+      "trip_count": self.trip_count,
+      "success_count": self.success_count,
+      "threshold": self.threshold,
+      "recovery_seconds": self.recovery_seconds,
+    }
 
 
 class AgentAdapter:
-    def __init__(
-        self,
-        config: AgentConfig,
-        ollama: OllamaClient,
-        command_timeout_seconds: int = 45,
-    ) -> None:
-        self.config = config
-        self.ollama = ollama
-        self.command_timeout_seconds = command_timeout_seconds
+  def __init__(
+    self,
+    config: AgentConfig,
+    ollama: OllamaClient,
+    command_timeout_seconds: int = 45,
+    model_timeout_seconds: int = 20,
+    failover_timeout_seconds: int = 18,
+    circuit_failure_threshold: int = 2,
+    circuit_recovery_seconds: int = 45,
+  ) -> None:
+    self.config = config
+    self.ollama = ollama
+    self.command_timeout_seconds = max(1, command_timeout_seconds)
+    self.model_timeout_seconds = max(1, model_timeout_seconds)
+    self.failover_timeout_seconds = max(1, failover_timeout_seconds)
+    threshold = max(1, circuit_failure_threshold)
+    recovery = max(1, circuit_recovery_seconds)
+    self.command_breaker = CircuitBreakerState(threshold=threshold, recovery_seconds=recovery)
+    self.model_breaker = CircuitBreakerState(threshold=threshold, recovery_seconds=recovery)
+    self.turn_count = 0
+    self.degraded_turn_count = 0
 
-    def respond(
-        self,
-        prompt: str,
-        history: List[Dict[str, Any]],
-        bootstrap_text: str,
-        peer_context: Optional[str] = None,
-    ) -> Tuple[str, Dict[str, Any]]:
-        bridge_error: Optional[str] = None
-        if self.config.command:
-            try:
-                content = self._respond_via_command(prompt, history, bootstrap_text, peer_context)
-                return content, {"adapter": "command", "command": self.config.command}
-            except Exception as error:  # noqa: BLE001
-                bridge_error = f"{type(error).__name__}: {error}"
+  def respond(
+    self,
+    prompt: str,
+    history: List[Dict[str, Any]],
+    bootstrap_text: str,
+    peer_context: Optional[str] = None,
+  ) -> Tuple[str, Dict[str, Any]]:
+    self.turn_count += 1
+    started_at = time.monotonic()
+    deadline = started_at + self.failover_timeout_seconds
+    attempts: List[str] = []
+    telemetry_events: List[Dict[str, Any]] = []
 
-        message_stack = self._build_messages(prompt, history, bootstrap_text, peer_context)
-        content = self.ollama.chat(message_stack, temperature=0.2)
-        if bridge_error:
-            content = f"[bridge-fallback due to: {bridge_error}]\n\n{content}"
-        return content, {"adapter": "ollama", "model": self.config.model}
+    # Primary route is bridge command when configured; model fallback is always available.
+    channel_order: List[str] = ["command", "ollama"] if self.config.command else ["ollama"]
+    message_stack = self._build_messages(prompt, history, bootstrap_text, peer_context)
 
-    def _respond_via_command(
-        self,
-        prompt: str,
-        history: List[Dict[str, Any]],
-        bootstrap_text: str,
-        peer_context: Optional[str],
-    ) -> str:
-        payload = {
-            "agent_id": self.config.agent_id,
-            "prompt": prompt,
-            "history": history,
-            "bootstrap_text": bootstrap_text,
-            "peer_context": peer_context or "",
-            "timestamp": now_iso(),
-        }
-        proc = subprocess.run(
-            shlex.split(self.config.command),
-            input=json.dumps(payload, ensure_ascii=True),
-            capture_output=True,
-            text=True,
-            timeout=self.command_timeout_seconds,
-            check=False,
+    for channel in channel_order:
+      remaining = deadline - time.monotonic()
+      if remaining <= 0.05:
+        attempts.append("deadline-exceeded")
+        break
+
+      if channel == "command":
+        if self.command_breaker.is_open():
+          attempts.append(
+            f"command:circuit-open({self.command_breaker.remaining_seconds():.1f}s)"
+          )
+          continue
+        try:
+          timeout_seconds = min(self.command_timeout_seconds, max(1, int(remaining)))
+          content = self._respond_via_command(
+            prompt,
+            history,
+            bootstrap_text,
+            peer_context,
+            timeout_seconds,
+          )
+          recovered = self.command_breaker.record_success()
+          if recovered:
+            telemetry_events.append(
+              self._build_telemetry_event(
+                channel="command",
+                event_type="recovered",
+                details={"path": "command"},
+              )
+            )
+          meta: Dict[str, Any] = {
+            "adapter": "command",
+            "command": self.config.command,
+            "degraded": False,
+            "attempts": attempts,
+            "circuit": self.get_circuit_status(),
+            "telemetry_events": telemetry_events,
+          }
+          if attempts:
+            content = f"[failover recovered via command after: {'; '.join(attempts)}]\n\n{content}"
+          return content, meta
+        except Exception as error:  # noqa: BLE001
+          message = f"{type(error).__name__}: {error}"
+          tripped = self.command_breaker.record_failure(message)
+          if tripped:
+            telemetry_events.append(
+              self._build_telemetry_event(
+                channel="command",
+                event_type="trip_opened",
+                error_text=self.command_breaker.last_error,
+                open_until=epoch_to_iso(self.command_breaker.open_until),
+                details={"path": "command", "threshold": self.command_breaker.threshold},
+              )
+            )
+          attempts.append(f"command:failed({truncate(message, 120)})")
+          continue
+
+      if self.model_breaker.is_open():
+        attempts.append(
+          f"ollama:circuit-open({self.model_breaker.remaining_seconds():.1f}s)"
         )
-        if proc.returncode != 0:
-            stderr = truncate((proc.stderr or "").strip(), 800)
-            raise RuntimeError(f"bridge command failed: {stderr or proc.returncode}")
-        stdout = (proc.stdout or "").strip()
-        if not stdout:
-            raise RuntimeError("bridge command returned empty stdout")
-        parsed = safe_json_parse(stdout)
-        if isinstance(parsed, dict):
-            content = parsed.get("content")
-            if isinstance(content, str) and content.strip():
-                return content.strip()
-        if isinstance(parsed, str):
-            return parsed.strip()
-        raise RuntimeError("bridge command returned unsupported output")
+        continue
 
-    def _build_messages(
-        self,
-        prompt: str,
-        history: List[Dict[str, Any]],
-        bootstrap_text: str,
-        peer_context: Optional[str],
-    ) -> List[Dict[str, str]]:
-        history_lines = []
-        for item in history[-30:]:
-            agent_id = item.get("agent_id", "unknown")
-            role = item.get("role", "assistant")
-            content = compact_single_line(str(item.get("content", "")), 300)
-            history_lines.append(f"[{agent_id}/{role}] {content}")
-        history_block = "\n".join(history_lines) if history_lines else "(no prior messages)"
+      try:
+        timeout_seconds = min(self.model_timeout_seconds, max(1, int(remaining)))
+        content = self._respond_via_ollama(message_stack, timeout_seconds)
+        recovered = self.model_breaker.record_success()
+        if recovered:
+          telemetry_events.append(
+            self._build_telemetry_event(
+              channel="model",
+              event_type="recovered",
+              details={"path": "ollama"},
+            )
+          )
+        meta = {
+          "adapter": "ollama",
+          "model": self.config.model,
+          "degraded": False,
+          "attempts": attempts,
+          "circuit": self.get_circuit_status(),
+          "telemetry_events": telemetry_events,
+        }
+        if attempts:
+          content = f"[failover recovered via ollama after: {'; '.join(attempts)}]\n\n{content}"
+        return content, meta
+      except Exception as error:  # noqa: BLE001
+        message = f"{type(error).__name__}: {error}"
+        tripped = self.model_breaker.record_failure(message)
+        if tripped:
+          telemetry_events.append(
+            self._build_telemetry_event(
+              channel="model",
+              event_type="trip_opened",
+              error_text=self.model_breaker.last_error,
+              open_until=epoch_to_iso(self.model_breaker.open_until),
+              details={"path": "ollama", "threshold": self.model_breaker.threshold},
+            )
+          )
+        attempts.append(f"ollama:failed({truncate(message, 120)})")
 
-        user_parts = [
-            "TriChat user request:",
-            prompt.strip(),
-            "",
-            "Recent thread history:",
-            history_block,
-        ]
-        if peer_context:
-            user_parts.extend(["", "Peer context:", peer_context.strip()])
-        if bootstrap_text:
-            user_parts.extend(["", "Imprint bootstrap context:", truncate(bootstrap_text, 3000)])
+    self.degraded_turn_count += 1
+    reason = "; ".join(attempts[-3:]) if attempts else "no-channel-attempted"
+    telemetry_events.append(
+      self._build_telemetry_event(
+        channel="model",
+        event_type="degraded_turn",
+        details={"reason": reason},
+      )
+    )
+    content = (
+      f"[degraded-mode] {self.config.agent_id} unavailable for live inference this turn. "
+      f"Reason: {reason}. Continuing without blocking the tri-chat turn."
+    )
+    meta = {
+      "adapter": "degraded",
+      "model": self.config.model,
+      "degraded": True,
+      "reason": reason,
+      "attempts": attempts,
+      "circuit": self.get_circuit_status(),
+      "telemetry_events": telemetry_events,
+    }
+    return content, meta
 
-        return [
-            {"role": "system", "content": self.config.system_prompt},
-            {"role": "user", "content": "\n".join(user_parts).strip()},
-        ]
+  def _respond_via_command(
+    self,
+    prompt: str,
+    history: List[Dict[str, Any]],
+    bootstrap_text: str,
+    peer_context: Optional[str],
+    timeout_seconds: int,
+  ) -> str:
+    payload = {
+      "agent_id": self.config.agent_id,
+      "prompt": prompt,
+      "history": history,
+      "bootstrap_text": bootstrap_text,
+      "peer_context": peer_context or "",
+      "timestamp": now_iso(),
+    }
+    proc = subprocess.run(
+      shlex.split(self.config.command),
+      input=json.dumps(payload, ensure_ascii=True),
+      capture_output=True,
+      text=True,
+      timeout=max(1, timeout_seconds),
+      check=False,
+    )
+    if proc.returncode != 0:
+      stderr = truncate((proc.stderr or "").strip(), 800)
+      raise RuntimeError(f"bridge command failed: {stderr or proc.returncode}")
+    stdout = (proc.stdout or "").strip()
+    if not stdout:
+      raise RuntimeError("bridge command returned empty stdout")
+    parsed = safe_json_parse(stdout)
+    if isinstance(parsed, dict):
+      content = parsed.get("content")
+      if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(parsed, str):
+      return parsed.strip()
+    raise RuntimeError("bridge command returned unsupported output")
+
+  def _respond_via_ollama(self, message_stack: List[Dict[str, str]], timeout_seconds: int) -> str:
+    return self.ollama.chat(
+      message_stack,
+      temperature=0.2,
+      timeout_seconds=max(1, timeout_seconds),
+    )
+
+  def _build_messages(
+    self,
+    prompt: str,
+    history: List[Dict[str, Any]],
+    bootstrap_text: str,
+    peer_context: Optional[str],
+  ) -> List[Dict[str, str]]:
+    history_lines = []
+    for item in history[-30:]:
+      agent_id = item.get("agent_id", "unknown")
+      role = item.get("role", "assistant")
+      content = compact_single_line(str(item.get("content", "")), 300)
+      history_lines.append(f"[{agent_id}/{role}] {content}")
+    history_block = "\n".join(history_lines) if history_lines else "(no prior messages)"
+
+    user_parts = [
+      "TriChat user request:",
+      prompt.strip(),
+      "",
+      "Recent thread history:",
+      history_block,
+    ]
+    if peer_context:
+      user_parts.extend(["", "Peer context:", peer_context.strip()])
+    if bootstrap_text:
+      user_parts.extend(["", "Imprint bootstrap context:", truncate(bootstrap_text, 3000)])
+
+    return [
+      {"role": "system", "content": self.config.system_prompt},
+      {"role": "user", "content": "\n".join(user_parts).strip()},
+    ]
+
+  def get_circuit_status(self) -> Dict[str, Any]:
+    return {
+      "command": self.command_breaker.snapshot(),
+      "model": self.model_breaker.snapshot(),
+      "turn_count": self.turn_count,
+      "degraded_turn_count": self.degraded_turn_count,
+      "command_enabled": bool(self.config.command),
+    }
+
+  def reset_circuits(self) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    if self.command_breaker.is_open() or self.command_breaker.failure_count > 0 or self.command_breaker.last_error:
+      events.append(
+        self._build_telemetry_event(
+          channel="command",
+          event_type="manual_reset",
+          details={"reason": "operator-reset"},
+        )
+      )
+    if self.model_breaker.is_open() or self.model_breaker.failure_count > 0 or self.model_breaker.last_error:
+      events.append(
+        self._build_telemetry_event(
+          channel="model",
+          event_type="manual_reset",
+          details={"reason": "operator-reset"},
+        )
+      )
+    self.command_breaker.reset()
+    self.model_breaker.reset()
+    return events
+
+  def restore_from_telemetry_state(self, state: Dict[str, Any]) -> None:
+    channel = str(state.get("channel") or "").strip().lower()
+    breaker = self.command_breaker if channel == "command" else self.model_breaker
+    breaker.hydrate(
+      failure_count=int(state.get("failure_count") or 0),
+      open_until_epoch=iso_to_epoch(str(state.get("open_until") or "")),
+      last_opened_at_epoch=iso_to_epoch(str(state.get("last_opened_at") or "")),
+      last_error=str(state.get("last_error") or ""),
+      last_result=str(state.get("last_result") or ""),
+      trip_count=int(state.get("trip_count") or 0),
+      success_count=int(state.get("success_count") or 0),
+    )
+    self.turn_count = max(self.turn_count, int(state.get("turn_count") or 0))
+    self.degraded_turn_count = max(self.degraded_turn_count, int(state.get("degraded_turn_count") or 0))
+
+  def _build_telemetry_event(
+    self,
+    *,
+    channel: str,
+    event_type: str,
+    error_text: Optional[str] = None,
+    open_until: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+  ) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+      "agent_id": self.config.agent_id,
+      "channel": "command" if channel == "command" else "model",
+      "event_type": event_type,
+      "details": details or {},
+    }
+    if error_text:
+      payload["error_text"] = truncate(error_text, 240)
+    if open_until:
+      payload["open_until"] = open_until
+    return payload
 
 
 class TriChatApp:
@@ -327,7 +659,7 @@ class TriChatApp:
         )
         self.mutation = MutationFactory(seed=args.session_seed)
         self.thread_id = args.thread_id or ""
-        self.ollama = OllamaClient(model=args.model, timeout_seconds=args.turn_timeout)
+        self.ollama = OllamaClient(model=args.model, timeout_seconds=args.model_timeout)
         self.bootstrap_text = self._load_bootstrap()
         self.agents = self._build_agents()
         self.last_user_prompt = ""
@@ -337,6 +669,7 @@ class TriChatApp:
         if not self.execute_allow_agents:
             self.execute_allow_agents = {"codex", "cursor", "local-imprint"}
         self.execute_approval_phrase = str(args.execute_approval_phrase or "approve").strip() or "approve"
+        self.adapter_telemetry_enabled = True
 
     def _load_bootstrap(self) -> str:
         if self.args.no_bootstrap:
@@ -390,6 +723,10 @@ class TriChatApp:
                 config=config,
                 ollama=self.ollama,
                 command_timeout_seconds=self.args.bridge_timeout,
+                model_timeout_seconds=self.args.model_timeout,
+                failover_timeout_seconds=self.args.adapter_failover_timeout,
+                circuit_failure_threshold=self.args.adapter_circuit_threshold,
+                circuit_recovery_seconds=self.args.adapter_circuit_recovery_seconds,
             )
             for config in configs
         }
@@ -458,6 +795,7 @@ class TriChatApp:
 
     def run(self) -> None:
         self.validate_tooling()
+        self._restore_adapter_telemetry_state()
         self.initialize_thread()
         self._print_header()
         self.render_thread_timeline(limit=12, compact=True)
@@ -494,6 +832,9 @@ class TriChatApp:
             "trichat.message_post",
             "trichat.timeline",
             "trichat.retention",
+            "trichat.summary",
+            "trichat.auto_retention",
+            "trichat.adapter_telemetry",
             "task.create",
             "task.summary",
             "task.timeline",
@@ -531,6 +872,9 @@ class TriChatApp:
             return True
         if command == "/panel":
             self.render_reliability_panel()
+            return True
+        if command == "/adapters":
+            self.route_adapters(tail)
             return True
         if command == "/plan":
             text = " ".join(tail).strip()
@@ -590,6 +934,10 @@ class TriChatApp:
             action = tail[0] if tail else "status"
             self.route_retry(action)
             return True
+        if command == "/retentiond":
+            action = tail[0] if tail else "status"
+            self.route_retention_daemon(action)
+            return True
         if command == "/retention":
             self.route_retention(tail)
             return True
@@ -617,8 +965,12 @@ class TriChatApp:
         history = self.get_timeline(limit=60)
         response_order = ["codex", "cursor", "local-imprint"]
         futures: Dict[concurrent.futures.Future[Tuple[str, Dict[str, Any]]], str] = {}
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        results: Dict[str, Dict[str, Any]] = {}
+        telemetry_events: List[Dict[str, Any]] = []
+        pending: Dict[concurrent.futures.Future[Tuple[str, Dict[str, Any]]], str] = {}
+        max_workers = max(1, len(response_order))
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        try:
             for agent_id in response_order:
                 adapter = self.agents.get(agent_id)
                 if not adapter:
@@ -632,31 +984,82 @@ class TriChatApp:
                 )
                 futures[future] = agent_id
 
-            results: Dict[str, Dict[str, Any]] = {}
-            for future in concurrent.futures.as_completed(futures):
-                agent_id = futures[future]
-                try:
-                    content, adapter_meta = future.result(timeout=self.args.turn_timeout + 5)
-                except Exception as error:  # noqa: BLE001
-                    content = f"[agent-error] {type(error).__name__}: {error}"
-                    adapter_meta = {"adapter": "error"}
+            pending = dict(futures)
+            total_wait_seconds = max(2, int(self.args.adapter_failover_timeout) + 3)
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=total_wait_seconds):
+                    agent_id = futures[future]
+                    pending.pop(future, None)
+                    try:
+                        content, adapter_meta = future.result()
+                    except Exception as error:  # noqa: BLE001
+                        content = f"[agent-error] {type(error).__name__}: {error}"
+                        adapter_meta = {"adapter": "error", "degraded": True}
+                    telemetry_events.extend(self._extract_telemetry_events(adapter_meta))
 
-                posted = self.post_message(
-                    agent_id=agent_id,
-                    role="assistant",
-                    content=content,
-                    reply_to_message_id=user_message.get("message_id"),
-                    metadata={
-                        "kind": "fanout-response",
-                        "adapter": adapter_meta,
+                    posted = self.post_message(
+                        agent_id=agent_id,
+                        role="assistant",
+                        content=content,
+                        reply_to_message_id=user_message.get("message_id"),
+                        metadata={
+                            "kind": "fanout-response",
+                            "adapter": adapter_meta,
+                        },
+                    )
+                    results[agent_id] = {
+                        "content": content,
+                        "message_id": posted.get("message_id"),
+                    }
+                    self.print_agent_block(agent_id, content)
+            except concurrent.futures.TimeoutError:
+                pass
+        finally:
+            # Do not wait on hung adapters; unresolved agents are degraded below.
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        # Never block a tri-chat turn indefinitely: unresolved agents are forced into degraded responses.
+        for future, agent_id in list(pending.items()):
+            future.cancel()
+            adapter = self.agents.get(agent_id)
+            circuit_snapshot = adapter.get_circuit_status() if adapter else None
+            content = (
+                f"[degraded-mode] {agent_id} exceeded adapter failover timeout "
+                f"({self.args.adapter_failover_timeout}s)."
+            )
+            adapter_meta = {
+                "adapter": "degraded-timeout",
+                "degraded": True,
+                "timeout_seconds": self.args.adapter_failover_timeout,
+                "circuit": circuit_snapshot,
+            }
+            telemetry_events.append(
+                {
+                    "agent_id": agent_id,
+                    "channel": "model",
+                    "event_type": "degraded_timeout",
+                    "details": {
+                        "timeout_seconds": self.args.adapter_failover_timeout,
                     },
-                )
-                results[agent_id] = {
-                    "content": content,
-                    "message_id": posted.get("message_id"),
                 }
-                self.print_agent_block(agent_id, content)
+            )
+            posted = self.post_message(
+                agent_id=agent_id,
+                role="assistant",
+                content=content,
+                reply_to_message_id=user_message.get("message_id"),
+                metadata={
+                    "kind": "fanout-response",
+                    "adapter": adapter_meta,
+                },
+            )
+            results[agent_id] = {
+                "content": content,
+                "message_id": posted.get("message_id"),
+            }
+            self.print_agent_block(agent_id, content)
 
+        self._sync_adapter_telemetry(telemetry_events)
         if self.args.huddle_rounds > 0:
             self.run_huddle(prompt, rounds=self.args.huddle_rounds, latest_results=results)
 
@@ -685,6 +1088,7 @@ class TriChatApp:
             metadata={"kind": "targeted-response", "adapter": adapter_meta},
         )
         self.print_agent_block(agent_id, content)
+        self._sync_adapter_telemetry(self._extract_telemetry_events(adapter_meta))
 
     def run_huddle(
         self,
@@ -730,6 +1134,7 @@ class TriChatApp:
                     "message_id": posted.get("message_id"),
                 }
                 self.print_agent_block(f"{agent_id} (huddle {round_index})", content)
+                self._sync_adapter_telemetry(self._extract_telemetry_events(adapter_meta))
 
     def route_execute(self, agent_id: str, objective_override: Optional[str]) -> None:
         timeline = self.get_timeline(limit=120)
@@ -841,6 +1246,203 @@ class TriChatApp:
 
         return False, f"unsupported execute gate mode: {mode}"
 
+    def route_adapters(self, args: List[str]) -> None:
+        action = args[0].lower() if args else "status"
+        if action in {"status", "show"}:
+            self._print_adapter_status()
+            return
+
+        if action == "reset":
+            target = args[1].lower() if len(args) > 1 else "all"
+            reset_events: List[Dict[str, Any]] = []
+            if target == "all":
+                for adapter in self.agents.values():
+                    reset_events.extend(adapter.reset_circuits())
+                self._sync_adapter_telemetry(reset_events)
+                print("Reset adapter circuit breakers for all agents.")
+                return
+
+            adapter = self.agents.get(target)
+            if not adapter:
+                print(f"Unknown agent id for reset: {target}")
+                return
+            reset_events.extend(adapter.reset_circuits())
+            self._sync_adapter_telemetry(reset_events)
+            print(f"Reset adapter circuit breakers: {target}")
+            return
+
+        print("Usage: /adapters [status|reset [all|codex|cursor|local-imprint]]")
+
+    def _print_adapter_status(self) -> None:
+        statuses = self._adapter_status_rows()
+        persisted_summary: Dict[str, Any] = {}
+        persisted_open_events: List[Dict[str, Any]] = []
+        if self.adapter_telemetry_enabled:
+            try:
+                persisted = self.mcp.call_tool(
+                    "trichat.adapter_telemetry",
+                    {"action": "status", "include_events": True, "event_limit": 5},
+                )
+                if isinstance(persisted, dict):
+                    persisted_summary = persisted.get("summary", {}) if isinstance(persisted.get("summary"), dict) else {}
+                    events = persisted.get("last_open_events", [])
+                    if isinstance(events, list):
+                        persisted_open_events = [event for event in events if isinstance(event, dict)]
+            except Exception as error:  # noqa: BLE001
+                self.adapter_telemetry_enabled = False
+                print(f"adapter telemetry status unavailable: {error}", file=sys.stderr)
+
+        print("")
+        print("Adapter Health")
+        print("-" * 72)
+        for row in statuses:
+            command = row["command"]
+            model = row["model"]
+            print(
+                f"{row['agent_id']}: degraded_turns={row['degraded_turn_count']}/{row['turn_count']} "
+                f"command_open={command['open']} model_open={model['open']}"
+            )
+            print(
+                "  "
+                f"command trips={command['trip_count']} remaining={command['remaining_seconds']}s "
+                f"last_error={command['last_error'] or 'none'}"
+            )
+            print(
+                "  "
+                f"model trips={model['trip_count']} remaining={model['remaining_seconds']}s "
+                f"last_error={model['last_error'] or 'none'}"
+            )
+        if persisted_summary:
+            print("-" * 72)
+            print(
+                "Persisted summary: "
+                f"open={persisted_summary.get('open_channels', 0)}/{persisted_summary.get('total_channels', 0)} "
+                f"trips={persisted_summary.get('total_trips', 0)} "
+                f"degraded={persisted_summary.get('total_degraded_turns', 0)}/{persisted_summary.get('total_turns', 0)}"
+            )
+        if persisted_open_events:
+            print("Last open events:")
+            for event in persisted_open_events[:3]:
+                ts = str(event.get("created_at", ""))[11:19]
+                agent_id = str(event.get("agent_id", ""))
+                channel = str(event.get("channel", ""))
+                error_text = compact_single_line(str(event.get("error_text") or ""), 80)
+                print(f"  {ts} {agent_id}/{channel} trip_opened {error_text}")
+
+    def _adapter_status_rows(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for agent_id, adapter in self.agents.items():
+            state = adapter.get_circuit_status()
+            rows.append(
+                {
+                    "agent_id": agent_id,
+                    "command": state["command"],
+                    "model": state["model"],
+                    "turn_count": state["turn_count"],
+                    "degraded_turn_count": state["degraded_turn_count"],
+                    "command_enabled": state["command_enabled"],
+                }
+            )
+        rows.sort(key=lambda entry: entry["agent_id"])
+        return rows
+
+    def _extract_telemetry_events(self, adapter_meta: Any) -> List[Dict[str, Any]]:
+        if not isinstance(adapter_meta, dict):
+            return []
+        events = adapter_meta.get("telemetry_events")
+        if not isinstance(events, list):
+            return []
+        normalized: List[Dict[str, Any]] = []
+        for event in events:
+            if isinstance(event, dict):
+                normalized.append(event)
+        return normalized
+
+    def _collect_adapter_state_payloads(self) -> List[Dict[str, Any]]:
+        payloads: List[Dict[str, Any]] = []
+        now = now_iso()
+        for agent_id, adapter in self.agents.items():
+            state = adapter.get_circuit_status()
+            for channel in ["command", "model"]:
+                channel_state = state.get(channel, {})
+                if not isinstance(channel_state, dict):
+                    continue
+                open_until = epoch_to_iso(channel_state.get("open_until_epoch"))  # type: ignore[arg-type]
+                last_opened_at = epoch_to_iso(channel_state.get("last_opened_at_epoch"))  # type: ignore[arg-type]
+                payload: Dict[str, Any] = {
+                    "agent_id": agent_id,
+                    "channel": channel,
+                    "updated_at": now,
+                    "open": bool(channel_state.get("open")),
+                    "failure_count": int(channel_state.get("failure_count") or 0),
+                    "trip_count": int(channel_state.get("trip_count") or 0),
+                    "success_count": int(channel_state.get("success_count") or 0),
+                    "last_error": str(channel_state.get("last_error") or ""),
+                    "turn_count": int(state.get("turn_count") or 0),
+                    "degraded_turn_count": int(state.get("degraded_turn_count") or 0),
+                    "last_result": str(channel_state.get("last_result") or ""),
+                    "metadata": {
+                        "command_enabled": bool(state.get("command_enabled")),
+                    },
+                }
+                if open_until:
+                    payload["open_until"] = open_until
+                if last_opened_at:
+                    payload["last_opened_at"] = last_opened_at
+                payloads.append(payload)
+        return payloads
+
+    def _sync_adapter_telemetry(self, events: Optional[List[Dict[str, Any]]] = None) -> None:
+        if not self.adapter_telemetry_enabled:
+            return
+        states = self._collect_adapter_state_payloads()
+        normalized_events = [event for event in (events or []) if isinstance(event, dict)]
+        if not states and not normalized_events:
+            return
+        payload: Dict[str, Any] = {
+            "action": "record",
+            "mutation": self.mutation.next("trichat.adapter_telemetry.record"),
+            "states": states,
+            "event_limit": 0,
+            "include_events": False,
+        }
+        if normalized_events:
+            payload["events"] = normalized_events
+        try:
+            self.mcp.call_tool("trichat.adapter_telemetry", payload)
+        except Exception as error:  # noqa: BLE001
+            self.adapter_telemetry_enabled = False
+            print(f"adapter telemetry disabled: {error}", file=sys.stderr)
+
+    def _restore_adapter_telemetry_state(self) -> None:
+        if not self.adapter_telemetry_enabled:
+            return
+        try:
+            response = self.mcp.call_tool(
+                "trichat.adapter_telemetry",
+                {
+                    "action": "status",
+                    "include_events": False,
+                    "event_limit": 0,
+                },
+            )
+        except Exception as error:  # noqa: BLE001
+            self.adapter_telemetry_enabled = False
+            print(f"adapter telemetry restore unavailable: {error}", file=sys.stderr)
+            return
+
+        states = response.get("states", []) if isinstance(response, dict) else []
+        if not isinstance(states, list):
+            return
+        for state in states:
+            if not isinstance(state, dict):
+                continue
+            agent_id = str(state.get("agent_id") or "")
+            adapter = self.agents.get(agent_id)
+            if not adapter:
+                continue
+            adapter.restore_from_telemetry_state(state)
+
     def route_retry(self, action: str) -> None:
         valid_actions = {"status", "start", "stop", "run_once"}
         if action not in valid_actions:
@@ -861,6 +1463,28 @@ class TriChatApp:
             role="system",
             content=f"task.auto_retry action={action}",
             metadata={"kind": "command-route", "command": "/retry", "action": action},
+        )
+
+    def route_retention_daemon(self, action: str) -> None:
+        valid_actions = {"status", "start", "stop", "run_once"}
+        if action not in valid_actions:
+            print("Usage: /retentiond status|start|stop|run_once")
+            return
+        args: Dict[str, Any] = {"action": action}
+        if action != "status":
+            args["mutation"] = self.mutation.next(f"trichat.auto_retention.{action}")
+            if action == "start":
+                args["run_immediately"] = True
+                args["interval_seconds"] = 300
+                args["older_than_days"] = 30
+                args["limit"] = 1000
+        result = self.mcp.call_tool("trichat.auto_retention", args)
+        print(json.dumps(result, indent=2))
+        self.post_message(
+            agent_id="router",
+            role="system",
+            content=f"trichat.auto_retention action={action}",
+            metadata={"kind": "command-route", "command": "/retentiond", "action": action},
         )
 
     def route_switch(self, action: str) -> None:
@@ -1132,6 +1756,12 @@ class TriChatApp:
             summary = self.mcp.call_tool("task.summary", {"running_limit": 10})
             auto_retry = self.mcp.call_tool("task.auto_retry", {"action": "status"})
             auto_squish = self.mcp.call_tool("transcript.auto_squish", {"action": "status"})
+            trichat_summary = self.mcp.call_tool("trichat.summary", {"busiest_limit": 5})
+            trichat_retention = self.mcp.call_tool("trichat.auto_retention", {"action": "status"})
+            adapter_persistent = self.mcp.call_tool(
+                "trichat.adapter_telemetry",
+                {"action": "status", "include_events": True, "event_limit": 5},
+            )
         except Exception as error:  # noqa: BLE001
             print(f"\nReliability panel unavailable: {error}")
             return
@@ -1139,6 +1769,9 @@ class TriChatApp:
         counts = summary.get("counts", {}) if isinstance(summary, dict) else {}
         running = summary.get("running", []) if isinstance(summary, dict) else []
         last_failed = summary.get("last_failed") if isinstance(summary, dict) else None
+        thread_counts = trichat_summary.get("thread_counts", {}) if isinstance(trichat_summary, dict) else {}
+        message_count = trichat_summary.get("message_count", 0) if isinstance(trichat_summary, dict) else 0
+        persistent_summary = adapter_persistent.get("summary", {}) if isinstance(adapter_persistent, dict) else {}
 
         print("")
         print("Reliability Panel")
@@ -1153,8 +1786,35 @@ class TriChatApp:
         print(
             "Daemons  "
             f"task.auto_retry={'on' if auto_retry.get('running') else 'off'}  "
-            f"transcript.auto_squish={'on' if auto_squish.get('running') else 'off'}"
+            f"transcript.auto_squish={'on' if auto_squish.get('running') else 'off'}  "
+            f"trichat.auto_retention={'on' if trichat_retention.get('running') else 'off'}"
         )
+        print(
+            "TriChat  "
+            f"threads(active={thread_counts.get('active', 0)}, archived={thread_counts.get('archived', 0)}, "
+            f"total={thread_counts.get('total', 0)})  "
+            f"messages={message_count}"
+        )
+        adapter_rows = self._adapter_status_rows()
+        command_open_count = sum(1 for row in adapter_rows if row["command"]["open"])
+        model_open_count = sum(1 for row in adapter_rows if row["model"]["open"])
+        degraded_turns = sum(int(row["degraded_turn_count"]) for row in adapter_rows)
+        total_turns = sum(int(row["turn_count"]) for row in adapter_rows)
+        print(
+            "Adapters  "
+            f"command_open={command_open_count}  "
+            f"model_open={model_open_count}  "
+            f"degraded_turns={degraded_turns}/{total_turns}"
+        )
+        print(
+            "Adapters(persisted)  "
+            f"open={persistent_summary.get('open_channels', 0)}/{persistent_summary.get('total_channels', 0)}  "
+            f"trips={persistent_summary.get('total_trips', 0)}  "
+            f"degraded_turns={persistent_summary.get('total_degraded_turns', 0)}/{persistent_summary.get('total_turns', 0)}"
+        )
+        recent_trip = persistent_summary.get("newest_trip_opened_at")
+        if recent_trip:
+            print(f"Last circuit trip  {recent_trip}")
         if last_failed:
             print(
                 "Last failure  "
@@ -1296,6 +1956,7 @@ class TriChatApp:
         print("/help                              Show this help")
         print("/history [limit]                   Show thread timeline")
         print("/panel                             Show reliability panel")
+        print("/adapters [status|reset ...]       Show/reset adapter circuit state")
         print("/plan <request>                    Fanout with planning framing")
         print("/propose <request>                 Fanout with proposal framing")
         print("/agent <id> <message>              Target a single agent")
@@ -1304,6 +1965,7 @@ class TriChatApp:
         print("/tasks [status]                    List tasks")
         print("/timeline <task_id>                Show task.timeline")
         print("/retry status|start|stop|run_once  Control task.auto_retry")
+        print("/retentiond status|start|stop|run_once  Control trichat.auto_retention")
         print("/gate ...                          Control /execute policy gate")
         print("/retention [days] [apply] [all]     Tri-chat message retention")
         print("/switch on|off|status              Control launchd agent switch")
@@ -1384,8 +2046,37 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument("--max-transcript-lines", type=int, default=20)
     parser.add_argument("--max-snapshots", type=int, default=5)
     parser.add_argument("--no-bootstrap", action="store_true", help="Skip imprint.bootstrap preloading.")
-    parser.add_argument("--turn-timeout", type=int, default=60, help="Per-agent response timeout seconds.")
+    parser.add_argument(
+        "--model-timeout",
+        type=int,
+        default=int(os.environ.get("TRICHAT_MODEL_TIMEOUT", "20")),
+        help="Per-request Ollama timeout seconds.",
+    )
     parser.add_argument("--bridge-timeout", type=int, default=45, help="Bridge command timeout seconds.")
+    parser.add_argument(
+        "--adapter-failover-timeout",
+        type=int,
+        default=int(os.environ.get("TRICHAT_ADAPTER_FAILOVER_TIMEOUT", "18")),
+        help="Turn budget per agent before forced degraded routing.",
+    )
+    parser.add_argument(
+        "--adapter-circuit-threshold",
+        type=int,
+        default=int(os.environ.get("TRICHAT_ADAPTER_CIRCUIT_THRESHOLD", "2")),
+        help="Consecutive failures required to open a channel circuit.",
+    )
+    parser.add_argument(
+        "--adapter-circuit-recovery-seconds",
+        type=int,
+        default=int(os.environ.get("TRICHAT_ADAPTER_CIRCUIT_RECOVERY_SECONDS", "45")),
+        help="Recovery window before probing an open adapter channel again.",
+    )
+    parser.add_argument(
+        "--turn-timeout",
+        dest="adapter_failover_timeout",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--huddle-rounds", type=int, default=0, help="Automatic huddle rounds per prompt.")
     parser.add_argument(
         "--execute-gate-mode",

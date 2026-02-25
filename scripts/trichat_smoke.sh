@@ -89,7 +89,7 @@ try {
     throw new Error("trichat.thread_open did not return thread id");
   }
 
-  await callTool("trichat.message_post", {
+  const userMessage = await callTool("trichat.message_post", {
     mutation: mutation("trichat.message_post.user"),
     thread_id: threadId,
     agent_id: "user",
@@ -97,22 +97,71 @@ try {
     content: `TriChat smoke user prompt for ${threadId}`,
     metadata: { source: "trichat_smoke" },
   });
+  if (!userMessage?.message?.message_id) {
+    throw new Error("trichat.message_post user did not return message_id");
+  }
 
-  await callTool("trichat.message_post", {
-    mutation: mutation("trichat.message_post.assistant"),
+  const codexMessage = await callTool("trichat.message_post", {
+    mutation: mutation("trichat.message_post.codex"),
     thread_id: threadId,
     agent_id: "codex",
     role: "assistant",
-    content: `TriChat smoke assistant response for ${threadId}`,
+    content: `TriChat smoke codex response for ${threadId}`,
     metadata: { source: "trichat_smoke" },
+    reply_to_message_id: userMessage.message.message_id,
+  });
+  if (!codexMessage?.message?.message_id) {
+    throw new Error("trichat.message_post codex did not return message_id");
+  }
+
+  const cursorMessage = await callTool("trichat.message_post", {
+    mutation: mutation("trichat.message_post.cursor"),
+    thread_id: threadId,
+    agent_id: "cursor",
+    role: "assistant",
+    content: `TriChat smoke cursor response for ${threadId}`,
+    metadata: { source: "trichat_smoke" },
+    reply_to_message_id: codexMessage.message.message_id,
+  });
+  if (!cursorMessage?.message?.message_id) {
+    throw new Error("trichat.message_post cursor did not return message_id");
+  }
+
+  const imprintMessage = await callTool("trichat.message_post", {
+    mutation: mutation("trichat.message_post.imprint"),
+    thread_id: threadId,
+    agent_id: "local-imprint",
+    role: "assistant",
+    content: `TriChat smoke local-imprint response for ${threadId}`,
+    metadata: { source: "trichat_smoke" },
+    reply_to_message_id: cursorMessage.message.message_id,
+  });
+  if (!imprintMessage?.message?.message_id) {
+    throw new Error("trichat.message_post local-imprint did not return message_id");
+  }
+
+  const routerMessage = await callTool("trichat.message_post", {
+    mutation: mutation("trichat.message_post.router"),
+    thread_id: threadId,
+    agent_id: "router",
+    role: "system",
+    content: `TriChat smoke router ack for ${threadId}`,
+    metadata: { source: "trichat_smoke" },
+    reply_to_message_id: imprintMessage.message.message_id,
   });
 
   const timeline = await callTool("trichat.timeline", {
     thread_id: threadId,
-    limit: 20,
+    limit: 40,
   });
-  if (!Array.isArray(timeline?.messages) || timeline.messages.length < 2) {
+  if (!Array.isArray(timeline?.messages) || timeline.messages.length < 5) {
     throw new Error("trichat.timeline returned insufficient messages");
+  }
+  const agentsSeen = new Set(timeline.messages.map((entry) => entry.agent_id));
+  for (const agentId of ["user", "codex", "cursor", "local-imprint", "router"]) {
+    if (!agentsSeen.has(agentId)) {
+      throw new Error(`trichat.timeline missing expected agent message: ${agentId}`);
+    }
   }
 
   const thread = await callTool("trichat.thread_get", {
@@ -120,6 +169,29 @@ try {
   });
   if (!thread?.found) {
     throw new Error("trichat.thread_get returned not found for smoke thread");
+  }
+
+  const summary = await callTool("trichat.summary", {
+    busiest_limit: 5,
+  });
+  if (typeof summary?.message_count !== "number") {
+    throw new Error("trichat.summary did not return message_count");
+  }
+
+  const autoRetentionStatus = await callTool("trichat.auto_retention", {
+    action: "status",
+  });
+  if (typeof autoRetentionStatus?.running !== "boolean") {
+    throw new Error("trichat.auto_retention status missing running flag");
+  }
+
+  const adapterTelemetry = await callTool("trichat.adapter_telemetry", {
+    action: "status",
+    include_events: true,
+    event_limit: 5,
+  });
+  if (typeof adapterTelemetry?.summary?.total_channels !== "number") {
+    throw new Error("trichat.adapter_telemetry status missing summary totals");
   }
 
   const retention = await callTool("trichat.retention", {
@@ -142,6 +214,11 @@ try {
         timeline_count: timeline.count ?? timeline.messages.length,
         retention_candidates: retention.candidate_count,
         thread_status: thread.thread?.status ?? null,
+        total_messages: summary.message_count,
+        auto_retention_running: autoRetentionStatus.running,
+        adapter_channels: adapterTelemetry.summary.total_channels,
+        adapter_open_channels: adapterTelemetry.summary.open_channels,
+        router_message_id: routerMessage?.message?.message_id ?? null,
       },
       null,
       2

@@ -53,8 +53,11 @@ const EXPECTED_TOOLS = [
   "task.timeline",
   "task.retry",
   "task.auto_retry",
+  "trichat.adapter_telemetry",
   "trichat.message_post",
+  "trichat.auto_retention",
   "trichat.retention",
+  "trichat.summary",
   "trichat.thread_get",
   "trichat.thread_list",
   "trichat.thread_open",
@@ -447,25 +450,60 @@ test("MCP v0.2 integration and safety invariants", async () => {
       triChatUserMessage.message.message_id
     );
 
-    const triChatAssistantMessage = await callTool(client, "trichat.message_post", {
-      mutation: nextMutation(testId, "trichat.message_post-assistant", () => mutationCounter++),
+    const triChatCodexMessage = await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-codex", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      agent_id: "codex",
+      role: "assistant",
+      content: `integration tri-chat codex reply ${testId}`,
+      reply_to_message_id: triChatUserMessage.message.message_id,
+    });
+    assert.equal(triChatCodexMessage.ok, true);
+
+    const triChatCursorMessage = await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-cursor", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      agent_id: "cursor",
+      role: "assistant",
+      content: `integration tri-chat cursor follow-up ${testId}`,
+      reply_to_message_id: triChatCodexMessage.message.message_id,
+    });
+    assert.equal(triChatCursorMessage.ok, true);
+
+    const triChatImprintMessage = await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-imprint", () => mutationCounter++),
       thread_id: triChatThreadId,
       agent_id: "local-imprint",
       role: "assistant",
-      content: `integration tri-chat assistant message ${testId}`,
-      reply_to_message_id: triChatUserMessage.message.message_id,
+      content: `integration tri-chat local-imprint synthesis ${testId}`,
+      reply_to_message_id: triChatCursorMessage.message.message_id,
     });
-    assert.equal(triChatAssistantMessage.ok, true);
+    assert.equal(triChatImprintMessage.ok, true);
 
     const triChatTimeline = await callTool(client, "trichat.timeline", {
       thread_id: triChatThreadId,
       limit: 20,
     });
-    assert.ok(triChatTimeline.count >= 2);
+    assert.ok(triChatTimeline.count >= 4);
     assert.equal(triChatTimeline.messages[0].role, "user");
-    assert.equal(
-      triChatTimeline.messages[triChatTimeline.messages.length - 1].role,
-      "assistant"
+    const timelineAgents = new Set(triChatTimeline.messages.map((message) => message.agent_id));
+    assert.ok(timelineAgents.has("codex"));
+    assert.ok(timelineAgents.has("cursor"));
+    assert.ok(timelineAgents.has("local-imprint"));
+    assert.ok(
+      triChatTimeline.messages.some(
+        (message) => message.reply_to_message_id === triChatUserMessage.message.message_id
+      )
+    );
+    assert.ok(
+      triChatTimeline.messages.some(
+        (message) => message.reply_to_message_id === triChatCodexMessage.message.message_id
+      )
+    );
+    assert.ok(
+      triChatTimeline.messages.some(
+        (message) => message.reply_to_message_id === triChatCursorMessage.message.message_id
+      )
     );
 
     const triChatRetentionDryRun = await callTool(client, "trichat.retention", {
@@ -478,6 +516,129 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.equal(triChatRetentionDryRun.thread_id, triChatThreadId);
     assert.ok(triChatRetentionDryRun.candidate_count >= 2);
     assert.equal(triChatRetentionDryRun.deleted_count, 0);
+
+    const triChatSummary = await callTool(client, "trichat.summary", {
+      busiest_limit: 10,
+    });
+    assert.ok(triChatSummary.thread_counts.total >= 1);
+    assert.ok(triChatSummary.message_count >= 4);
+    assert.ok(Array.isArray(triChatSummary.busiest_threads));
+
+    const adapterTelemetryInitial = await callTool(client, "trichat.adapter_telemetry", {
+      action: "status",
+      event_limit: 10,
+    });
+    assert.equal(typeof adapterTelemetryInitial.summary.total_channels, "number");
+    assert.ok(Array.isArray(adapterTelemetryInitial.states));
+
+    const telemetryOpenUntil = new Date(Date.now() + 60_000).toISOString();
+    const telemetryOpenedAt = new Date(Date.now() - 1_000).toISOString();
+    const adapterTelemetryRecorded = await callTool(client, "trichat.adapter_telemetry", {
+      action: "record",
+      mutation: nextMutation(testId, "trichat.adapter_telemetry-record", () => mutationCounter++),
+      states: [
+        {
+          agent_id: "codex",
+          channel: "command",
+          open: true,
+          open_until: telemetryOpenUntil,
+          failure_count: 0,
+          trip_count: 1,
+          success_count: 0,
+          last_error: "bridge timeout",
+          last_opened_at: telemetryOpenedAt,
+          turn_count: 2,
+          degraded_turn_count: 1,
+          last_result: "trip-opened",
+          metadata: {
+            source: "integration-test",
+          },
+        },
+        {
+          agent_id: "codex",
+          channel: "model",
+          open: false,
+          failure_count: 0,
+          trip_count: 0,
+          success_count: 2,
+          turn_count: 2,
+          degraded_turn_count: 1,
+          last_result: "success",
+          metadata: {
+            source: "integration-test",
+          },
+        },
+      ],
+      events: [
+        {
+          agent_id: "codex",
+          channel: "command",
+          event_type: "trip_opened",
+          open_until: telemetryOpenUntil,
+          error_text: "bridge timeout",
+          details: {
+            threshold: 2,
+          },
+        },
+      ],
+    });
+    assert.equal(adapterTelemetryRecorded.action, "record");
+    assert.equal(adapterTelemetryRecorded.recorded_state_count, 2);
+    assert.equal(adapterTelemetryRecorded.recorded_event_count, 1);
+    assert.ok(adapterTelemetryRecorded.status.summary.total_channels >= 2);
+
+    const adapterTelemetryStatus = await callTool(client, "trichat.adapter_telemetry", {
+      action: "status",
+      agent_id: "codex",
+      event_limit: 20,
+    });
+    assert.ok(adapterTelemetryStatus.state_count >= 2);
+    assert.ok(
+      adapterTelemetryStatus.states.some(
+        (state) => state.agent_id === "codex" && state.channel === "command" && state.open === true
+      )
+    );
+    assert.ok(adapterTelemetryStatus.summary.total_trips >= 1);
+    assert.ok(
+      adapterTelemetryStatus.last_open_events.some((event) => event.event_type === "trip_opened")
+    );
+
+    const triChatAutoRetentionRunOnce = await callTool(client, "trichat.auto_retention", {
+      action: "run_once",
+      mutation: nextMutation(testId, "trichat.auto_retention-run_once", () => mutationCounter++),
+      older_than_days: 3650,
+      limit: 100,
+    });
+    assert.equal(typeof triChatAutoRetentionRunOnce.tick.candidate_count, "number");
+
+    const triChatAutoRetentionStart = await callTool(client, "trichat.auto_retention", {
+      action: "start",
+      mutation: nextMutation(testId, "trichat.auto_retention-start", () => mutationCounter++),
+      interval_seconds: 15,
+      older_than_days: 45,
+      limit: 1500,
+      run_immediately: false,
+    });
+    assert.equal(triChatAutoRetentionStart.running, true);
+    assert.equal(triChatAutoRetentionStart.persisted.enabled, true);
+    assert.equal(triChatAutoRetentionStart.persisted.interval_seconds, 15);
+    assert.equal(triChatAutoRetentionStart.persisted.older_than_days, 45);
+    assert.equal(triChatAutoRetentionStart.persisted.limit, 1500);
+
+    const triChatAutoRetentionStatus = await callTool(client, "trichat.auto_retention", {
+      action: "status",
+    });
+    assert.equal(triChatAutoRetentionStatus.running, true);
+    assert.equal(triChatAutoRetentionStatus.config.interval_seconds, 15);
+    assert.equal(triChatAutoRetentionStatus.config.older_than_days, 45);
+    assert.equal(triChatAutoRetentionStatus.config.limit, 1500);
+
+    const triChatAutoRetentionStop = await callTool(client, "trichat.auto_retention", {
+      action: "stop",
+      mutation: nextMutation(testId, "trichat.auto_retention-stop", () => mutationCounter++),
+    });
+    assert.equal(triChatAutoRetentionStop.running, false);
+    assert.equal(triChatAutoRetentionStop.persisted.enabled, false);
 
     const durableTaskIdC = `task-${testId}-c`;
     await callTool(client, "task.create", {
@@ -1008,7 +1169,7 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.equal(healthStorage.ok, true);
     assert.equal(path.resolve(healthStorage.db_path), path.resolve(dbPath));
     assert.equal(healthStorage.db_exists, true);
-    assert.ok(healthStorage.schema_version >= 5);
+    assert.ok(healthStorage.schema_version >= 6);
     assert.equal(typeof healthStorage.table_counts.schema_migrations, "number");
     assert.equal(typeof healthStorage.table_counts.daemon_configs, "number");
     assert.equal(typeof healthStorage.table_counts.imprint_profiles, "number");
@@ -1019,7 +1180,7 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(healthPolicy.enforced_rules.length >= 3);
 
     const migrationStatus = await callTool(client, "migration.status", {});
-    assert.ok(migrationStatus.schema_version >= 5);
+    assert.ok(migrationStatus.schema_version >= 6);
     assert.ok(Array.isArray(migrationStatus.applied_versions));
     assert.ok(
       migrationStatus.applied_versions.some((entry) => entry.version === 1),
@@ -1032,6 +1193,10 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(
       migrationStatus.applied_versions.some((entry) => entry.version === 3),
       "Expected migration version 3 to be present"
+    );
+    assert.ok(
+      migrationStatus.applied_versions.some((entry) => entry.version === 6),
+      "Expected migration version 6 to be present"
     );
     assert.equal(typeof migrationStatus.recorded_count, "number");
     assert.equal(typeof migrationStatus.inferred_count, "number");

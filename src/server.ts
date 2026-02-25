@@ -66,10 +66,17 @@ import {
   initializeTaskAutoRetryDaemon,
 } from "./tools/task.js";
 import {
+  trichatAdapterTelemetry,
+  trichatAdapterTelemetrySchema,
+  initializeTriChatAutoRetentionDaemon,
+  trichatAutoRetentionControl,
+  trichatAutoRetentionSchema,
   trichatMessagePost,
   trichatMessagePostSchema,
   trichatRetention,
   trichatRetentionSchema,
+  trichatSummary,
+  trichatSummarySchema,
   trichatThreadGet,
   trichatThreadGetSchema,
   trichatThreadList,
@@ -110,6 +117,7 @@ const storage = new Storage(storagePath);
 storage.init();
 initializeAutoSquishDaemon(storage);
 initializeTaskAutoRetryDaemon(storage);
+initializeTriChatAutoRetentionDaemon(storage);
 
 const SERVER_NAME = "anamnesis";
 const SERVER_VERSION = "0.2.0";
@@ -440,6 +448,17 @@ registerTool("trichat.timeline", "Read ordered messages for a tri-chat thread.",
   trichatTimeline(storage, input)
 );
 
+registerTool("trichat.summary", "Summarize tri-chat thread/message bus state.", trichatSummarySchema, (input) =>
+  trichatSummary(storage, input)
+);
+
+registerTool(
+  "trichat.adapter_telemetry",
+  "Record and read persistent tri-chat adapter circuit-breaker telemetry.",
+  trichatAdapterTelemetrySchema,
+  (input) => trichatAdapterTelemetry(storage, input)
+);
+
 registerTool("trichat.retention", "Apply retention policy to old tri-chat messages.", trichatRetentionSchema, (input) =>
   runIdempotentMutation({
     storage,
@@ -448,6 +467,13 @@ registerTool("trichat.retention", "Apply retention policy to old tri-chat messag
     payload: input,
     execute: () => trichatRetention(storage, input),
   })
+);
+
+registerTool(
+  "trichat.auto_retention",
+  "Manage interval-based tri-chat retention daemon (status/start/stop/run_once).",
+  trichatAutoRetentionSchema,
+  (input) => trichatAutoRetentionControl(storage, input)
 );
 
 registerTool(

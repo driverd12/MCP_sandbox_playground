@@ -24,6 +24,8 @@ Anamnesis is designed as a "Shared Apartment" for agents. Different clients and 
 - Failed-task retry daemon with deterministic backoff (`task.auto_retry`)
 - Durable tri-chat message bus (`trichat.thread_*`, `trichat.message_post`, `trichat.timeline`)
 - Tri-chat retention controls to keep message history bounded (`trichat.retention`)
+- Tri-chat observability and housekeeping daemon (`trichat.summary`, `trichat.auto_retention`)
+- Persistent adapter breaker telemetry (`trichat.adapter_telemetry`) with trip history and last-open events
 - Launchd auto-start support for MCP HTTP server + Imprint auto-snapshot
 - Agent on/off switch (`scripts/agents_switch.sh`) for start/stop/status control
 - ADR creation helper (`adr.create`) writing to `./docs/adrs/`
@@ -171,7 +173,10 @@ Switch mapping:
 - Use `task.auto_retry` (`status`, `run_once`, `start`, `stop`) to requeue failed tasks with backoff.
 - Use `trichat.thread_open` / `trichat.thread_list` / `trichat.thread_get` to manage persistent tri-chat threads.
 - Use `trichat.message_post` and `trichat.timeline` to keep user/agent conversation state durable across restarts.
+- Use `trichat.summary` for tri-chat bus health telemetry.
+- Use `trichat.adapter_telemetry` for durable adapter circuit state, trip history, and recovery diagnostics.
 - Use `trichat.retention` (`dry_run` first) to prune old message-bus history when threads grow large.
+- Use `trichat.auto_retention` (`status`, `run_once`, `start`, `stop`) for interval-based tri-chat pruning.
 - Run `./scripts/mvp_smoke.sh` before handoff to verify end-to-end health (default `stdio`, optional `http`).
 
 ## TriChat
@@ -188,15 +193,19 @@ Bridge mode (optional):
 
 - Set `TRICHAT_CODEX_CMD` and/or `TRICHAT_CURSOR_CMD` to command adapters that read JSON from stdin and print response text or `{"content":"..."}` JSON.
 - If bridge commands are not configured (or fail), TriChat falls back to local Ollama adapters so all three channels continue responding.
+- Per-agent command/model channels use circuit breakers with recovery windows so transient adapter failures degrade the turn instead of stalling it.
+- Tune failover behavior with `--adapter-failover-timeout`, `--adapter-circuit-threshold`, `--adapter-circuit-recovery-seconds`, and `--model-timeout`.
 
 Useful commands in TriChat:
 
 - `/plan`, `/propose`, `/agent <id> <msg>`, `/huddle <topic>`
+- `/adapters status|reset [all|codex|cursor|local-imprint]`
 - `/execute <agent> [objective]` (routes into `task.create`)
 - `/gate status|open|allowlist|approval`
 - `/gate allowlist <agent1,agent2,...>`
 - `/gate phrase <text>` (approval mode phrase)
 - `/panel`, `/tasks`, `/timeline <task_id>`, `/retry ...`
+- `/retentiond status|start|stop|run_once`
 - `/thread list|new|use|archive`
 - `/retention [days] [apply] [all]`
 

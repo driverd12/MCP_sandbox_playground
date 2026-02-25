@@ -8,22 +8,21 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const REPO_ROOT = process.cwd();
 
-test("transcript.auto_squish persists daemon state across server restarts", async () => {
+test("trichat.auto_retention persists daemon state across server restarts", async () => {
   const testId = `${Date.now()}`;
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-auto-squish-test-"));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-trichat-retention-test-"));
   const dbPath = path.join(tempDir, "hub.sqlite");
   let mutationCounter = 0;
 
   try {
     const sessionOne = await openClient(dbPath);
     try {
-      const started = await callTool(sessionOne.client, "transcript.auto_squish", {
+      const started = await callTool(sessionOne.client, "trichat.auto_retention", {
         action: "start",
-        mutation: nextMutation(testId, "transcript.auto_squish-start", () => mutationCounter++),
-        interval_seconds: 17,
-        batch_runs: 9,
-        per_run_limit: 123,
-        max_points: 7,
+        mutation: nextMutation(testId, "trichat.auto_retention-start", () => mutationCounter++),
+        interval_seconds: 19,
+        older_than_days: 61,
+        limit: 789,
         run_immediately: false,
       });
       assert.equal(started.running, true);
@@ -32,7 +31,6 @@ test("transcript.auto_squish persists daemon state across server restarts", asyn
       const storageHealth = await callTool(sessionOne.client, "health.storage", {});
       assert.equal(typeof storageHealth.schema_version, "number");
       assert.ok(storageHealth.schema_version >= 6);
-      assert.equal(typeof storageHealth.table_counts.schema_migrations, "number");
       assert.equal(typeof storageHealth.table_counts.daemon_configs, "number");
     } finally {
       await sessionOne.client.close().catch(() => {});
@@ -40,18 +38,17 @@ test("transcript.auto_squish persists daemon state across server restarts", asyn
 
     const sessionTwo = await openClient(dbPath);
     try {
-      const status = await callTool(sessionTwo.client, "transcript.auto_squish", {
+      const status = await callTool(sessionTwo.client, "trichat.auto_retention", {
         action: "status",
       });
       assert.equal(status.running, true);
-      assert.equal(status.config.interval_seconds, 17);
-      assert.equal(status.config.batch_runs, 9);
-      assert.equal(status.config.per_run_limit, 123);
-      assert.equal(status.config.max_points, 7);
+      assert.equal(status.config.interval_seconds, 19);
+      assert.equal(status.config.older_than_days, 61);
+      assert.equal(status.config.limit, 789);
 
-      const stopped = await callTool(sessionTwo.client, "transcript.auto_squish", {
+      const stopped = await callTool(sessionTwo.client, "trichat.auto_retention", {
         action: "stop",
-        mutation: nextMutation(testId, "transcript.auto_squish-stop", () => mutationCounter++),
+        mutation: nextMutation(testId, "trichat.auto_retention-stop", () => mutationCounter++),
       });
       assert.equal(stopped.running, false);
       assert.equal(stopped.persisted.enabled, false);
@@ -61,14 +58,13 @@ test("transcript.auto_squish persists daemon state across server restarts", asyn
 
     const sessionThree = await openClient(dbPath);
     try {
-      const status = await callTool(sessionThree.client, "transcript.auto_squish", {
+      const status = await callTool(sessionThree.client, "trichat.auto_retention", {
         action: "status",
       });
       assert.equal(status.running, false);
-      assert.equal(status.config.interval_seconds, 17);
-      assert.equal(status.config.batch_runs, 9);
-      assert.equal(status.config.per_run_limit, 123);
-      assert.equal(status.config.max_points, 7);
+      assert.equal(status.config.interval_seconds, 19);
+      assert.equal(status.config.older_than_days, 61);
+      assert.equal(status.config.limit, 789);
     } finally {
       await sessionThree.client.close().catch(() => {});
     }
@@ -88,7 +84,7 @@ async function openClient(dbPath) {
     stderr: "pipe",
   });
   const client = new Client(
-    { name: "mcp-auto-squish-persistence-test", version: "0.1.0" },
+    { name: "mcp-trichat-retention-persistence-test", version: "0.1.0" },
     { capabilities: {} }
   );
   await client.connect(transport);

@@ -124,6 +124,57 @@ export type TriChatMessageRecord = {
   metadata: Record<string, unknown>;
 };
 
+export type TriChatAdapterChannel = "command" | "model";
+
+export type TriChatAdapterStateRecord = {
+  agent_id: string;
+  channel: TriChatAdapterChannel;
+  updated_at: string;
+  open: boolean;
+  open_until: string | null;
+  failure_count: number;
+  trip_count: number;
+  success_count: number;
+  last_error: string | null;
+  last_opened_at: string | null;
+  turn_count: number;
+  degraded_turn_count: number;
+  last_result: string | null;
+  metadata: Record<string, unknown>;
+};
+
+export type TriChatAdapterEventRecord = {
+  event_id: string;
+  created_at: string;
+  agent_id: string;
+  channel: TriChatAdapterChannel;
+  event_type: string;
+  open_until: string | null;
+  error_text: string | null;
+  details: Record<string, unknown>;
+};
+
+export type TriChatAdapterTelemetrySummaryRecord = {
+  total_channels: number;
+  open_channels: number;
+  total_trips: number;
+  total_successes: number;
+  total_turns: number;
+  total_degraded_turns: number;
+  newest_state_at: string | null;
+  newest_event_at: string | null;
+  newest_trip_opened_at: string | null;
+  per_agent: Array<{
+    agent_id: string;
+    channel_count: number;
+    open_channels: number;
+    total_trips: number;
+    total_turns: number;
+    degraded_turns: number;
+    updated_at: string | null;
+  }>;
+};
+
 export type TaskSummaryRecord = {
   counts: Record<TaskStatus, number>;
   running: Array<{
@@ -142,6 +193,23 @@ export type TaskSummaryRecord = {
     max_attempts: number;
     updated_at: string;
   } | null;
+};
+
+export type TriChatSummaryRecord = {
+  thread_counts: {
+    active: number;
+    archived: number;
+    total: number;
+  };
+  message_count: number;
+  oldest_message_at: string | null;
+  newest_message_at: string | null;
+  busiest_threads: Array<{
+    thread_id: string;
+    status: TriChatThreadStatus;
+    updated_at: string;
+    message_count: number;
+  }>;
 };
 
 export type MutationMeta = {
@@ -231,6 +299,14 @@ export type TaskAutoRetryStateRecord = {
   updated_at: string;
 };
 
+export type TriChatAutoRetentionStateRecord = {
+  enabled: boolean;
+  interval_seconds: number;
+  older_than_days: number;
+  limit: number;
+  updated_at: string;
+};
+
 export type ImprintProfileRecord = {
   profile_id: string;
   created_at: string;
@@ -287,7 +363,9 @@ export class Storage {
   }
 
   init(): void {
+    this.db.pragma("foreign_keys = ON");
     this.db.pragma("journal_mode = WAL");
+    this.db.pragma("busy_timeout = 5000");
     this.ensureMigrationTable();
     this.applyPendingMigrations([
       {
@@ -314,6 +392,11 @@ export class Storage {
         version: 5,
         name: "add-trichat-message-bus-schema",
         run: () => this.applyTriChatSchemaMigration(),
+      },
+      {
+        version: 6,
+        name: "add-trichat-adapter-telemetry-schema",
+        run: () => this.applyTriChatAdapterTelemetryMigration(),
       },
     ]);
     this.ensureRuntimeSchemaCompleteness();
@@ -1019,6 +1102,65 @@ export class Storage {
            updated_at = excluded.updated_at`
       )
       .run("task.auto_retry", normalized.enabled ? 1 : 0, configJson, now);
+
+    return {
+      ...normalized,
+      updated_at: now,
+    };
+  }
+
+  getTriChatAutoRetentionState(): TriChatAutoRetentionStateRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT enabled, config_json, updated_at
+         FROM daemon_configs
+         WHERE daemon_key = ?`
+      )
+      .get("trichat.auto_retention") as Record<string, unknown> | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    const config = parseJsonObject(row.config_json);
+    return {
+      enabled: Number(row.enabled ?? 0) === 1,
+      interval_seconds: parseBoundedInt(config.interval_seconds, 600, 10, 86400),
+      older_than_days: parseBoundedInt(config.older_than_days, 30, 0, 3650),
+      limit: parseBoundedInt(config.limit, 1000, 1, 5000),
+      updated_at: String(row.updated_at ?? ""),
+    };
+  }
+
+  setTriChatAutoRetentionState(params: {
+    enabled: boolean;
+    interval_seconds: number;
+    older_than_days: number;
+    limit: number;
+  }): TriChatAutoRetentionStateRecord {
+    const now = new Date().toISOString();
+    const normalized = {
+      enabled: Boolean(params.enabled),
+      interval_seconds: parseBoundedInt(params.interval_seconds, 600, 10, 86400),
+      older_than_days: parseBoundedInt(params.older_than_days, 30, 0, 3650),
+      limit: parseBoundedInt(params.limit, 1000, 1, 5000),
+    };
+    const configJson = stableStringify({
+      interval_seconds: normalized.interval_seconds,
+      older_than_days: normalized.older_than_days,
+      limit: normalized.limit,
+    });
+
+    this.db
+      .prepare(
+        `INSERT INTO daemon_configs (daemon_key, enabled, config_json, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(daemon_key) DO UPDATE SET
+           enabled = excluded.enabled,
+           config_json = excluded.config_json,
+           updated_at = excluded.updated_at`
+      )
+      .run("trichat.auto_retention", normalized.enabled ? 1 : 0, configJson, now);
 
     return {
       ...normalized,
@@ -2045,6 +2187,69 @@ export class Storage {
     };
   }
 
+  getTriChatSummary(params?: {
+    busiest_limit?: number;
+  }): TriChatSummaryRecord {
+    const busiestLimit = parseBoundedInt(params?.busiest_limit, 10, 1, 200);
+
+    const threadCountRows = this.db
+      .prepare(
+        `SELECT status, COUNT(*) AS count
+         FROM trichat_threads
+         GROUP BY status`
+      )
+      .all() as Array<Record<string, unknown>>;
+
+    const threadCounts = {
+      active: 0,
+      archived: 0,
+      total: 0,
+    };
+    for (const row of threadCountRows) {
+      const status = normalizeTriChatThreadStatus(row.status);
+      const count = Number(row.count ?? 0);
+      if (status === "archived") {
+        threadCounts.archived = count;
+      } else {
+        threadCounts.active = count;
+      }
+    }
+    threadCounts.total = threadCounts.active + threadCounts.archived;
+
+    const messageAgg = this.db
+      .prepare(
+        `SELECT COUNT(*) AS message_count,
+                MIN(created_at) AS oldest_message_at,
+                MAX(created_at) AS newest_message_at
+         FROM trichat_messages`
+      )
+      .get() as Record<string, unknown>;
+
+    const busiestRows = this.db
+      .prepare(
+        `SELECT t.thread_id, t.status, t.updated_at, COUNT(m.message_id) AS message_count
+         FROM trichat_threads t
+         LEFT JOIN trichat_messages m ON m.thread_id = t.thread_id
+         GROUP BY t.thread_id, t.status, t.updated_at
+         ORDER BY message_count DESC, t.updated_at DESC
+         LIMIT ?`
+      )
+      .all(busiestLimit) as Array<Record<string, unknown>>;
+
+    return {
+      thread_counts: threadCounts,
+      message_count: Number(messageAgg.message_count ?? 0),
+      oldest_message_at: asNullableString(messageAgg.oldest_message_at),
+      newest_message_at: asNullableString(messageAgg.newest_message_at),
+      busiest_threads: busiestRows.map((row) => ({
+        thread_id: String(row.thread_id ?? ""),
+        status: normalizeTriChatThreadStatus(row.status),
+        updated_at: String(row.updated_at ?? ""),
+        message_count: Number(row.message_count ?? 0),
+      })),
+    };
+  }
+
   upsertTriChatThread(params: {
     thread_id?: string;
     title?: string;
@@ -2290,6 +2495,333 @@ export class Storage {
       candidate_count: messageIds.length,
       deleted_count: deletedCount,
       deleted_message_ids: messageIds,
+    };
+  }
+
+  upsertTriChatAdapterStates(params: {
+    states: Array<{
+      agent_id: string;
+      channel: TriChatAdapterChannel;
+      updated_at?: string;
+      open: boolean;
+      open_until?: string | null;
+      failure_count: number;
+      trip_count: number;
+      success_count: number;
+      last_error?: string | null;
+      last_opened_at?: string | null;
+      turn_count: number;
+      degraded_turn_count: number;
+      last_result?: string | null;
+      metadata?: Record<string, unknown>;
+    }>;
+  }): TriChatAdapterStateRecord[] {
+    if (!params.states.length) {
+      return [];
+    }
+
+    const now = new Date().toISOString();
+    const upsertStmt = this.db.prepare(
+      `INSERT INTO trichat_adapter_states (
+         agent_id, channel, updated_at, open, open_until, failure_count, trip_count, success_count,
+         last_error, last_opened_at, turn_count, degraded_turn_count, last_result, metadata_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(agent_id, channel) DO UPDATE SET
+         updated_at = excluded.updated_at,
+         open = excluded.open,
+         open_until = excluded.open_until,
+         failure_count = excluded.failure_count,
+         trip_count = excluded.trip_count,
+         success_count = excluded.success_count,
+         last_error = excluded.last_error,
+         last_opened_at = excluded.last_opened_at,
+         turn_count = excluded.turn_count,
+         degraded_turn_count = excluded.degraded_turn_count,
+         last_result = excluded.last_result,
+         metadata_json = excluded.metadata_json`
+    );
+
+    const apply = this.db.transaction((states: typeof params.states) => {
+      const records: TriChatAdapterStateRecord[] = [];
+      for (const state of states) {
+        const agentId = state.agent_id.trim();
+        if (!agentId) {
+          continue;
+        }
+        const channel = normalizeTriChatAdapterChannel(state.channel);
+        const updatedAt = normalizeIsoTimestamp(state.updated_at, now);
+        const openUntil = normalizeOptionalIsoTimestamp(state.open_until);
+        const failureCount = parseBoundedInt(state.failure_count, 0, 0, 1_000_000);
+        const tripCount = parseBoundedInt(state.trip_count, 0, 0, 1_000_000);
+        const successCount = parseBoundedInt(state.success_count, 0, 0, 1_000_000);
+        const turnCount = parseBoundedInt(state.turn_count, 0, 0, 1_000_000);
+        const degradedTurnCount = parseBoundedInt(state.degraded_turn_count, 0, 0, 1_000_000);
+        const lastError = asNullableString(state.last_error);
+        const lastOpenedAt = normalizeOptionalIsoTimestamp(state.last_opened_at);
+        const lastResult = asNullableString(state.last_result);
+        const metadata = state.metadata ?? {};
+
+        upsertStmt.run(
+          agentId,
+          channel,
+          updatedAt,
+          state.open ? 1 : 0,
+          openUntil,
+          failureCount,
+          tripCount,
+          successCount,
+          lastError,
+          lastOpenedAt,
+          turnCount,
+          degradedTurnCount,
+          lastResult,
+          stableStringify(metadata)
+        );
+
+        records.push({
+          agent_id: agentId,
+          channel,
+          updated_at: updatedAt,
+          open: Boolean(state.open),
+          open_until: openUntil,
+          failure_count: failureCount,
+          trip_count: tripCount,
+          success_count: successCount,
+          last_error: lastError,
+          last_opened_at: lastOpenedAt,
+          turn_count: turnCount,
+          degraded_turn_count: degradedTurnCount,
+          last_result: lastResult,
+          metadata,
+        });
+      }
+      return records;
+    });
+
+    return apply(params.states);
+  }
+
+  listTriChatAdapterStates(params?: {
+    agent_id?: string;
+    channel?: TriChatAdapterChannel;
+    limit?: number;
+  }): TriChatAdapterStateRecord[] {
+    const whereClauses: string[] = [];
+    const values: Array<string | number> = [];
+    const agentId = params?.agent_id?.trim();
+    if (agentId) {
+      whereClauses.push("agent_id = ?");
+      values.push(agentId);
+    }
+    if (params?.channel) {
+      whereClauses.push("channel = ?");
+      values.push(normalizeTriChatAdapterChannel(params.channel));
+    }
+    const limit = parseBoundedInt(params?.limit, 500, 1, 5000);
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT agent_id, channel, updated_at, open, open_until, failure_count, trip_count, success_count,
+                last_error, last_opened_at, turn_count, degraded_turn_count, last_result, metadata_json
+         FROM trichat_adapter_states
+         ${whereSql}
+         ORDER BY agent_id ASC, channel ASC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapTriChatAdapterStateRow(row));
+  }
+
+  appendTriChatAdapterEvents(params: {
+    events: Array<{
+      agent_id: string;
+      channel: TriChatAdapterChannel;
+      event_type: string;
+      created_at?: string;
+      open_until?: string | null;
+      error_text?: string | null;
+      details?: Record<string, unknown>;
+    }>;
+  }): TriChatAdapterEventRecord[] {
+    if (!params.events.length) {
+      return [];
+    }
+    const now = new Date().toISOString();
+    const insertStmt = this.db.prepare(
+      `INSERT INTO trichat_adapter_events (
+         event_id, created_at, agent_id, channel, event_type, open_until, error_text, details_json
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    const apply = this.db.transaction((events: typeof params.events) => {
+      const records: TriChatAdapterEventRecord[] = [];
+      for (const event of events) {
+        const agentId = event.agent_id.trim();
+        const eventType = event.event_type.trim();
+        if (!agentId || !eventType) {
+          continue;
+        }
+        const channel = normalizeTriChatAdapterChannel(event.channel);
+        const createdAt = normalizeIsoTimestamp(event.created_at, now);
+        const eventId = crypto.randomUUID();
+        const openUntil = normalizeOptionalIsoTimestamp(event.open_until);
+        const errorText = asNullableString(event.error_text);
+        const details = event.details ?? {};
+        insertStmt.run(
+          eventId,
+          createdAt,
+          agentId,
+          channel,
+          eventType,
+          openUntil,
+          errorText,
+          stableStringify(details)
+        );
+        records.push({
+          event_id: eventId,
+          created_at: createdAt,
+          agent_id: agentId,
+          channel,
+          event_type: eventType,
+          open_until: openUntil,
+          error_text: errorText,
+          details,
+        });
+      }
+      return records;
+    });
+
+    return apply(params.events);
+  }
+
+  listTriChatAdapterEvents(params?: {
+    agent_id?: string;
+    channel?: TriChatAdapterChannel;
+    event_types?: string[];
+    limit?: number;
+  }): TriChatAdapterEventRecord[] {
+    const whereClauses: string[] = [];
+    const values: Array<string | number> = [];
+    const agentId = params?.agent_id?.trim();
+    if (agentId) {
+      whereClauses.push("agent_id = ?");
+      values.push(agentId);
+    }
+    if (params?.channel) {
+      whereClauses.push("channel = ?");
+      values.push(normalizeTriChatAdapterChannel(params.channel));
+    }
+    const eventTypes = (params?.event_types ?? [])
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
+    if (eventTypes.length > 0) {
+      const placeholders = eventTypes.map(() => "?").join(", ");
+      whereClauses.push(`event_type IN (${placeholders})`);
+      values.push(...eventTypes);
+    }
+
+    const limit = parseBoundedInt(params?.limit, 100, 0, 5000);
+    if (limit === 0) {
+      return [];
+    }
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT event_id, created_at, agent_id, channel, event_type, open_until, error_text, details_json
+         FROM trichat_adapter_events
+         ${whereSql}
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapTriChatAdapterEventRow(row));
+  }
+
+  getTriChatAdapterTelemetrySummary(params?: {
+    agent_id?: string;
+    channel?: TriChatAdapterChannel;
+  }): TriChatAdapterTelemetrySummaryRecord {
+    const stateWhereClauses: string[] = [];
+    const stateValues: Array<string | number> = [];
+    const eventWhereClauses: string[] = [];
+    const eventValues: Array<string | number> = [];
+
+    const agentId = params?.agent_id?.trim();
+    if (agentId) {
+      stateWhereClauses.push("agent_id = ?");
+      stateValues.push(agentId);
+      eventWhereClauses.push("agent_id = ?");
+      eventValues.push(agentId);
+    }
+    if (params?.channel) {
+      const channel = normalizeTriChatAdapterChannel(params.channel);
+      stateWhereClauses.push("channel = ?");
+      stateValues.push(channel);
+      eventWhereClauses.push("channel = ?");
+      eventValues.push(channel);
+    }
+
+    const stateWhereSql = stateWhereClauses.length > 0 ? `WHERE ${stateWhereClauses.join(" AND ")}` : "";
+    const eventWhereSql = eventWhereClauses.length > 0 ? `WHERE ${eventWhereClauses.join(" AND ")}` : "";
+
+    const stateAgg = this.db
+      .prepare(
+        `SELECT COUNT(*) AS total_channels,
+                SUM(CASE WHEN open = 1 THEN 1 ELSE 0 END) AS open_channels,
+                SUM(trip_count) AS total_trips,
+                SUM(success_count) AS total_successes,
+                SUM(turn_count) AS total_turns,
+                SUM(degraded_turn_count) AS total_degraded_turns,
+                MAX(updated_at) AS newest_state_at
+         FROM trichat_adapter_states
+         ${stateWhereSql}`
+      )
+      .get(...stateValues) as Record<string, unknown>;
+
+    const eventAgg = this.db
+      .prepare(
+        `SELECT MAX(created_at) AS newest_event_at,
+                MAX(CASE WHEN event_type = 'trip_opened' THEN created_at END) AS newest_trip_opened_at
+         FROM trichat_adapter_events
+         ${eventWhereSql}`
+      )
+      .get(...eventValues) as Record<string, unknown>;
+
+    const perAgentRows = this.db
+      .prepare(
+        `SELECT agent_id,
+                COUNT(*) AS channel_count,
+                SUM(CASE WHEN open = 1 THEN 1 ELSE 0 END) AS open_channels,
+                SUM(trip_count) AS total_trips,
+                SUM(turn_count) AS total_turns,
+                SUM(degraded_turn_count) AS degraded_turns,
+                MAX(updated_at) AS updated_at
+         FROM trichat_adapter_states
+         ${stateWhereSql}
+         GROUP BY agent_id
+         ORDER BY agent_id ASC`
+      )
+      .all(...stateValues) as Array<Record<string, unknown>>;
+
+    return {
+      total_channels: Number(stateAgg.total_channels ?? 0),
+      open_channels: Number(stateAgg.open_channels ?? 0),
+      total_trips: Number(stateAgg.total_trips ?? 0),
+      total_successes: Number(stateAgg.total_successes ?? 0),
+      total_turns: Number(stateAgg.total_turns ?? 0),
+      total_degraded_turns: Number(stateAgg.total_degraded_turns ?? 0),
+      newest_state_at: asNullableString(stateAgg.newest_state_at),
+      newest_event_at: asNullableString(eventAgg.newest_event_at),
+      newest_trip_opened_at: asNullableString(eventAgg.newest_trip_opened_at),
+      per_agent: perAgentRows.map((row) => ({
+        agent_id: String(row.agent_id ?? ""),
+        channel_count: Number(row.channel_count ?? 0),
+        open_channels: Number(row.open_channels ?? 0),
+        total_trips: Number(row.total_trips ?? 0),
+        total_turns: Number(row.total_turns ?? 0),
+        degraded_turns: Number(row.degraded_turns ?? 0),
+        updated_at: asNullableString(row.updated_at),
+      })),
     };
   }
 
@@ -2925,6 +3457,8 @@ export class Storage {
       "task_artifacts",
       "trichat_threads",
       "trichat_messages",
+      "trichat_adapter_states",
+      "trichat_adapter_events",
     ] as const;
     const counts: Record<string, number> = {};
     for (const table of tables) {
@@ -2999,6 +3533,7 @@ export class Storage {
     this.applyImprintSchemaMigration();
     this.applyTaskSchemaMigration();
     this.applyTriChatSchemaMigration();
+    this.applyTriChatAdapterTelemetryMigration();
   }
 
   private applyCoreSchemaMigration(): void {
@@ -3300,6 +3835,44 @@ export class Storage {
     this.ensureIndex("idx_trichat_messages_agent_created", "trichat_messages", "agent_id, created_at DESC");
   }
 
+  private applyTriChatAdapterTelemetryMigration(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS trichat_adapter_states (
+        agent_id TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        open INTEGER NOT NULL DEFAULT 0,
+        open_until TEXT,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        trip_count INTEGER NOT NULL DEFAULT 0,
+        success_count INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        last_opened_at TEXT,
+        turn_count INTEGER NOT NULL DEFAULT 0,
+        degraded_turn_count INTEGER NOT NULL DEFAULT 0,
+        last_result TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (agent_id, channel)
+      );
+      CREATE TABLE IF NOT EXISTS trichat_adapter_events (
+        event_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        open_until TEXT,
+        error_text TEXT,
+        details_json TEXT NOT NULL
+      );
+    `);
+
+    this.ensureIndex("idx_trichat_adapter_states_updated", "trichat_adapter_states", "updated_at DESC");
+    this.ensureIndex("idx_trichat_adapter_states_open", "trichat_adapter_states", "open, updated_at DESC");
+    this.ensureIndex("idx_trichat_adapter_events_created", "trichat_adapter_events", "created_at DESC");
+    this.ensureIndex("idx_trichat_adapter_events_agent_created", "trichat_adapter_events", "agent_id, created_at DESC");
+    this.ensureIndex("idx_trichat_adapter_events_type_created", "trichat_adapter_events", "event_type, created_at DESC");
+  }
+
   private appendTaskEvent(params: {
     task_id: string;
     event_type: string;
@@ -3517,6 +4090,38 @@ function mapTriChatMessageRow(row: Record<string, unknown>): TriChatMessageRecor
   };
 }
 
+function mapTriChatAdapterStateRow(row: Record<string, unknown>): TriChatAdapterStateRecord {
+  return {
+    agent_id: String(row.agent_id ?? ""),
+    channel: normalizeTriChatAdapterChannel(row.channel),
+    updated_at: String(row.updated_at ?? ""),
+    open: Number(row.open ?? 0) === 1,
+    open_until: asNullableString(row.open_until),
+    failure_count: Number(row.failure_count ?? 0),
+    trip_count: Number(row.trip_count ?? 0),
+    success_count: Number(row.success_count ?? 0),
+    last_error: asNullableString(row.last_error),
+    last_opened_at: asNullableString(row.last_opened_at),
+    turn_count: Number(row.turn_count ?? 0),
+    degraded_turn_count: Number(row.degraded_turn_count ?? 0),
+    last_result: asNullableString(row.last_result),
+    metadata: parseJsonObject(row.metadata_json),
+  };
+}
+
+function mapTriChatAdapterEventRow(row: Record<string, unknown>): TriChatAdapterEventRecord {
+  return {
+    event_id: String(row.event_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    agent_id: String(row.agent_id ?? ""),
+    channel: normalizeTriChatAdapterChannel(row.channel),
+    event_type: String(row.event_type ?? ""),
+    open_until: asNullableString(row.open_until),
+    error_text: asNullableString(row.error_text),
+    details: parseJsonObject(row.details_json),
+  };
+}
+
 function normalizeTrustTier(value: unknown): TrustTier {
   const normalized = String(value ?? "raw");
   if (normalized === "verified" || normalized === "policy-backed" || normalized === "deprecated") {
@@ -3535,6 +4140,10 @@ function normalizeTaskStatus(value: unknown): TaskStatus {
 
 function normalizeTriChatThreadStatus(value: unknown): TriChatThreadStatus {
   return String(value ?? "active") === "archived" ? "archived" : "active";
+}
+
+function normalizeTriChatAdapterChannel(value: unknown): TriChatAdapterChannel {
+  return String(value ?? "model") === "command" ? "command" : "model";
 }
 
 function asNullableString(value: unknown): string | null {
@@ -3733,6 +4342,18 @@ function normalizeIsoTimestamp(value: string | undefined, fallback: string): str
   const parsed = new Date(trimmed);
   if (Number.isNaN(parsed.getTime())) {
     return fallback;
+  }
+  return parsed.toISOString();
+}
+
+function normalizeOptionalIsoTimestamp(value: string | null | undefined): string | null {
+  const normalized = asNullableString(value);
+  if (!normalized) {
+    return null;
+  }
+  const parsed = new Date(normalized);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
   }
   return parsed.toISOString();
 }

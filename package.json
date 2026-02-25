@@ -23,6 +23,8 @@
     "agents:status": "./scripts/agents_switch.sh status",
     "trichat": "python3 ./scripts/trichat.py",
     "trichat:http": "TRICHAT_MCP_TRANSPORT=http python3 ./scripts/trichat.py --transport http --url http://127.0.0.1:8787/ --origin http://127.0.0.1 --resume-latest --panel-on-start",
+    "trichat:tui": "go run ./cmd/trichat-tui --resume-latest",
+    "trichat:tui:http": "TRICHAT_MCP_TRANSPORT=http go run ./cmd/trichat-tui --transport http --url http://127.0.0.1:8787/ --origin http://127.0.0.1 --resume-latest",
     "trichat:smoke": "./scripts/trichat_smoke.sh"
   },
   "dependencies": {

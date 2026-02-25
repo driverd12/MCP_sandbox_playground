@@ -179,11 +179,24 @@ Run TriChat with STDIO MCP calls:
 npm run trichat
 ```
 
+Run TriChat Bubble Tea TUI with STDIO MCP calls:
+
+```bash
+npm run trichat:tui
+```
+
 Run TriChat against local HTTP MCP:
 
 ```bash
 npm run start:http
 npm run trichat:http
+```
+
+Run TriChat Bubble Tea TUI against local HTTP MCP:
+
+```bash
+npm run start:http
+npm run trichat:tui:http
 ```
 
 Bridge adapters (optional):
@@ -200,6 +213,7 @@ Adapter contract:
 TriChat verifies required `trichat.*` + `task.*` tooling at startup and retries MCP tool calls on transient failures.
 Each adapter channel (bridge command + Ollama fallback) uses per-agent circuit breakers with recovery windows, so transient bridge/model failures degrade gracefully without stalling fanout turns.
 Circuit state and breaker events can be persisted via `trichat.adapter_telemetry` for restart-safe reliability diagnostics.
+The TUI exposes the same runtime path with an interactive split-pane UX (timeline, slash input, reliability sidebar, and settings menu).
 
 TriChat runtime commands for housekeeping:
 

@@ -34,8 +34,8 @@ const (
 )
 
 const (
-	codePrompt = "You are Codex in tri-chat mode. Respond with concrete, high-signal engineering advice focused on implementation and reliability tradeoffs."
-	cursorPrompt = "You are Cursor in tri-chat mode. Respond with practical implementation guidance, developer UX suggestions, and concise reasoning."
+	codePrompt    = "You are Codex in tri-chat mode. Respond with concrete, high-signal engineering advice focused on implementation and reliability tradeoffs."
+	cursorPrompt  = "You are Cursor in tri-chat mode. Respond with practical implementation guidance, developer UX suggestions, and concise reasoning."
 	imprintPrompt = "You are the local Imprint agent for Anamnesis. Favor deterministic local-first execution, idempotent operations, and explicit next actions."
 )
 
@@ -169,9 +169,9 @@ func (m *mutationFactory) next(tool string) map[string]string {
 }
 
 type triChatThread struct {
-	ThreadID string `json:"thread_id"`
-	Title    string `json:"title"`
-	Status   string `json:"status"`
+	ThreadID string         `json:"thread_id"`
+	Title    string         `json:"title"`
+	Status   string         `json:"status"`
 	Metadata map[string]any `json:"metadata"`
 }
 
@@ -231,69 +231,69 @@ type triChatSummaryResp struct {
 
 type adapterTelemetryStatusResp struct {
 	Summary struct {
-		TotalChannels       int    `json:"total_channels"`
-		OpenChannels        int    `json:"open_channels"`
-		TotalTrips          int    `json:"total_trips"`
-		TotalSuccesses      int    `json:"total_successes"`
-		TotalTurns          int    `json:"total_turns"`
-		TotalDegradedTurns  int    `json:"total_degraded_turns"`
-		NewestTripOpenedAt  string `json:"newest_trip_opened_at"`
-		NewestStateAt       string `json:"newest_state_at"`
-		NewestEventAt       string `json:"newest_event_at"`
+		TotalChannels      int    `json:"total_channels"`
+		OpenChannels       int    `json:"open_channels"`
+		TotalTrips         int    `json:"total_trips"`
+		TotalSuccesses     int    `json:"total_successes"`
+		TotalTurns         int    `json:"total_turns"`
+		TotalDegradedTurns int    `json:"total_degraded_turns"`
+		NewestTripOpenedAt string `json:"newest_trip_opened_at"`
+		NewestStateAt      string `json:"newest_state_at"`
+		NewestEventAt      string `json:"newest_event_at"`
 	} `json:"summary"`
-	States        []adapterState `json:"states"`
-	RecentEvents  []adapterEvent `json:"recent_events"`
+	States         []adapterState `json:"states"`
+	RecentEvents   []adapterEvent `json:"recent_events"`
 	LastOpenEvents []adapterEvent `json:"last_open_events"`
 }
 
 type adapterState struct {
-	AgentID           string `json:"agent_id"`
-	Channel           string `json:"channel"`
-	UpdatedAt         string `json:"updated_at"`
-	Open              bool   `json:"open"`
-	OpenUntil         string `json:"open_until"`
-	FailureCount      int    `json:"failure_count"`
-	TripCount         int    `json:"trip_count"`
-	SuccessCount      int    `json:"success_count"`
-	LastError         string `json:"last_error"`
-	LastOpenedAt      string `json:"last_opened_at"`
-	TurnCount         int    `json:"turn_count"`
-	DegradedTurnCount int    `json:"degraded_turn_count"`
-	LastResult        string `json:"last_result"`
+	AgentID           string         `json:"agent_id"`
+	Channel           string         `json:"channel"`
+	UpdatedAt         string         `json:"updated_at"`
+	Open              bool           `json:"open"`
+	OpenUntil         string         `json:"open_until"`
+	FailureCount      int            `json:"failure_count"`
+	TripCount         int            `json:"trip_count"`
+	SuccessCount      int            `json:"success_count"`
+	LastError         string         `json:"last_error"`
+	LastOpenedAt      string         `json:"last_opened_at"`
+	TurnCount         int            `json:"turn_count"`
+	DegradedTurnCount int            `json:"degraded_turn_count"`
+	LastResult        string         `json:"last_result"`
 	Metadata          map[string]any `json:"metadata"`
 }
 
 type adapterEvent struct {
-	EventID    string         `json:"event_id"`
-	CreatedAt  string         `json:"created_at"`
-	AgentID    string         `json:"agent_id"`
-	Channel    string         `json:"channel"`
-	EventType  string         `json:"event_type"`
-	OpenUntil  string         `json:"open_until"`
-	ErrorText  string         `json:"error_text"`
-	Details    map[string]any `json:"details"`
+	EventID   string         `json:"event_id"`
+	CreatedAt string         `json:"created_at"`
+	AgentID   string         `json:"agent_id"`
+	Channel   string         `json:"channel"`
+	EventType string         `json:"event_type"`
+	OpenUntil string         `json:"open_until"`
+	ErrorText string         `json:"error_text"`
+	Details   map[string]any `json:"details"`
 }
 
 type reliabilitySnapshot struct {
-	taskSummary       taskSummaryResp
-	taskAutoRetry     daemonStatusResp
-	transcriptSquish  daemonStatusResp
-	triRetention      daemonStatusResp
-	triSummary        triChatSummaryResp
-	adapterTelemetry  adapterTelemetryStatusResp
-	updatedAt         time.Time
+	taskSummary      taskSummaryResp
+	taskAutoRetry    daemonStatusResp
+	transcriptSquish daemonStatusResp
+	triRetention     daemonStatusResp
+	triSummary       triChatSummaryResp
+	adapterTelemetry adapterTelemetryStatusResp
+	updatedAt        time.Time
 }
 
 type breakerState struct {
-	threshold      int
-	recovery       time.Duration
-	failureCount   int
-	openUntil      time.Time
-	lastOpenedAt   time.Time
-	lastError      string
-	lastResult     string
-	tripCount      int
-	successCount   int
+	threshold    int
+	recovery     time.Duration
+	failureCount int
+	openUntil    time.Time
+	lastOpenedAt time.Time
+	lastError    string
+	lastResult   string
+	tripCount    int
+	successCount int
 }
 
 func (b *breakerState) isOpen(now time.Time) bool {
@@ -355,18 +355,18 @@ type agentRuntime struct {
 }
 
 type agentResponse struct {
-	agentID        string
-	content        string
-	adapterMeta    map[string]any
+	agentID         string
+	content         string
+	adapterMeta     map[string]any
 	telemetryEvents []map[string]any
 }
 
 type orchestrator struct {
 	mu sync.Mutex
 
-	agents       map[string]*agentRuntime
-	bootstrap    string
-	ollamaAPI    string
+	agents    map[string]*agentRuntime
+	bootstrap string
+	ollamaAPI string
 }
 
 func newOrchestrator(cfg appConfig) *orchestrator {
@@ -451,8 +451,8 @@ func (o *orchestrator) collectStates(cfg appConfig, settings runtimeSettings) []
 	now := time.Now().UTC().Format(time.RFC3339)
 	states := make([]map[string]any, 0, 6)
 	commands := map[string]string{
-		"codex": cfg.codexCommand,
-		"cursor": cfg.cursorCommand,
+		"codex":         cfg.codexCommand,
+		"cursor":        cfg.cursorCommand,
 		"local-imprint": cfg.imprintCommand,
 	}
 	for _, agentID := range []string{"codex", "cursor", "local-imprint"} {
@@ -479,17 +479,17 @@ func (o *orchestrator) collectStates(cfg appConfig, settings runtimeSettings) []
 
 func breakerToStatePayload(agentID, channel, now string, turnCount, degraded int, snapshot breakerState, commandEnabled bool) map[string]any {
 	payload := map[string]any{
-		"agent_id":             agentID,
-		"channel":              channel,
-		"updated_at":           now,
-		"open":                 snapshot.isOpen(time.Now()),
-		"failure_count":        snapshot.failureCount,
-		"trip_count":           snapshot.tripCount,
-		"success_count":        snapshot.successCount,
-		"last_error":           snapshot.lastError,
-		"turn_count":           turnCount,
-		"degraded_turn_count":  degraded,
-		"last_result":          snapshot.lastResult,
+		"agent_id":            agentID,
+		"channel":             channel,
+		"updated_at":          now,
+		"open":                snapshot.isOpen(time.Now()),
+		"failure_count":       snapshot.failureCount,
+		"trip_count":          snapshot.tripCount,
+		"success_count":       snapshot.successCount,
+		"last_error":          snapshot.lastError,
+		"turn_count":          turnCount,
+		"degraded_turn_count": degraded,
+		"last_result":         snapshot.lastResult,
 		"metadata": map[string]any{
 			"command_enabled": commandEnabled,
 		},
@@ -729,34 +729,34 @@ func (a *agentRuntime) respond(
 func (a *agentRuntime) snapshotStateLocked(commandEnabled bool, turnCount, degraded int) map[string]any {
 	return map[string]any{
 		"command": map[string]any{
-			"open":                a.commandBreaker.isOpen(time.Now()),
-			"remaining_seconds":   maxFloat(0, a.commandBreaker.remaining(time.Now()).Seconds()),
-			"open_until_epoch":    epochOrNil(a.commandBreaker.openUntil),
+			"open":                 a.commandBreaker.isOpen(time.Now()),
+			"remaining_seconds":    maxFloat(0, a.commandBreaker.remaining(time.Now()).Seconds()),
+			"open_until_epoch":     epochOrNil(a.commandBreaker.openUntil),
 			"last_opened_at_epoch": epochOrNil(a.commandBreaker.lastOpenedAt),
-			"failure_count":       a.commandBreaker.failureCount,
-			"last_error":          nullIfEmpty(a.commandBreaker.lastError),
-			"last_result":         nullIfEmpty(a.commandBreaker.lastResult),
-			"trip_count":          a.commandBreaker.tripCount,
-			"success_count":       a.commandBreaker.successCount,
-			"threshold":           a.commandBreaker.threshold,
-			"recovery_seconds":    int(a.commandBreaker.recovery.Seconds()),
+			"failure_count":        a.commandBreaker.failureCount,
+			"last_error":           nullIfEmpty(a.commandBreaker.lastError),
+			"last_result":          nullIfEmpty(a.commandBreaker.lastResult),
+			"trip_count":           a.commandBreaker.tripCount,
+			"success_count":        a.commandBreaker.successCount,
+			"threshold":            a.commandBreaker.threshold,
+			"recovery_seconds":     int(a.commandBreaker.recovery.Seconds()),
 		},
 		"model": map[string]any{
-			"open":                a.modelBreaker.isOpen(time.Now()),
-			"remaining_seconds":   maxFloat(0, a.modelBreaker.remaining(time.Now()).Seconds()),
-			"open_until_epoch":    epochOrNil(a.modelBreaker.openUntil),
+			"open":                 a.modelBreaker.isOpen(time.Now()),
+			"remaining_seconds":    maxFloat(0, a.modelBreaker.remaining(time.Now()).Seconds()),
+			"open_until_epoch":     epochOrNil(a.modelBreaker.openUntil),
 			"last_opened_at_epoch": epochOrNil(a.modelBreaker.lastOpenedAt),
-			"failure_count":       a.modelBreaker.failureCount,
-			"last_error":          nullIfEmpty(a.modelBreaker.lastError),
-			"last_result":         nullIfEmpty(a.modelBreaker.lastResult),
-			"trip_count":          a.modelBreaker.tripCount,
-			"success_count":       a.modelBreaker.successCount,
-			"threshold":           a.modelBreaker.threshold,
-			"recovery_seconds":    int(a.modelBreaker.recovery.Seconds()),
+			"failure_count":        a.modelBreaker.failureCount,
+			"last_error":           nullIfEmpty(a.modelBreaker.lastError),
+			"last_result":          nullIfEmpty(a.modelBreaker.lastResult),
+			"trip_count":           a.modelBreaker.tripCount,
+			"success_count":        a.modelBreaker.successCount,
+			"threshold":            a.modelBreaker.threshold,
+			"recovery_seconds":     int(a.modelBreaker.recovery.Seconds()),
 		},
-		"turn_count":         turnCount,
+		"turn_count":          turnCount,
 		"degraded_turn_count": degraded,
-		"command_enabled":    commandEnabled,
+		"command_enabled":     commandEnabled,
 	}
 }
 
@@ -853,10 +853,10 @@ func callCommandAdapter(command string, payload map[string]any, timeout time.Dur
 func callOllama(apiBase, model string, messages []map[string]string, timeout time.Duration) (string, error) {
 	endpoint := strings.TrimRight(strings.TrimSpace(apiBase), "/") + "/api/chat"
 	body := map[string]any{
-		"model":   model,
-		"stream":  false,
+		"model":    model,
+		"stream":   false,
 		"messages": messages,
-		"options": map[string]any{"temperature": 0.2},
+		"options":  map[string]any{"temperature": 0.2},
 	}
 	buf, _ := json.Marshal(body)
 	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(buf))
@@ -902,11 +902,11 @@ const (
 )
 
 type model struct {
-	cfg       appConfig
-	settings  runtimeSettings
-	caller    mcpCaller
-	mutation  *mutationFactory
-	orch      *orchestrator
+	cfg      appConfig
+	settings runtimeSettings
+	caller   mcpCaller
+	mutation *mutationFactory
+	orch     *orchestrator
 
 	threadID    string
 	threadTitle string
@@ -1019,17 +1019,17 @@ func newTheme() uiTheme {
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(pink).
 			Padding(0, 1),
-		status: lipgloss.NewStyle().Foreground(blue).Bold(true),
+		status:      lipgloss.NewStyle().Foreground(blue).Bold(true),
 		errorStatus: lipgloss.NewStyle().Foreground(pink).Bold(true),
 		inputPanel: lipgloss.NewStyle().
 			Background(panelBg).
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(mint).
 			Padding(0, 1),
-		helpText: lipgloss.NewStyle().Foreground(muted),
-		settingKey: lipgloss.NewStyle().Foreground(blue),
+		helpText:     lipgloss.NewStyle().Foreground(muted),
+		settingKey:   lipgloss.NewStyle().Foreground(blue),
 		settingValue: lipgloss.NewStyle().Foreground(text),
-		settingPick: lipgloss.NewStyle().Foreground(pink).Bold(true),
+		settingPick:  lipgloss.NewStyle().Foreground(pink).Bold(true),
 		chatAgent: map[string]lipgloss.Style{
 			"user":          lipgloss.NewStyle().Foreground(mint).Bold(true),
 			"codex":         lipgloss.NewStyle().Foreground(pink).Bold(true),
@@ -1111,7 +1111,9 @@ func (m model) initCmd() tea.Cmd {
 		var health struct {
 			Tools []string `json:"tools"`
 		}
-		health, _ = decodeAny[struct{ Tools []string `json:"tools"` }](toolPayload)
+		health, _ = decodeAny[struct {
+			Tools []string `json:"tools"`
+		}](toolPayload)
 		required := []string{
 			"trichat.thread_open",
 			"trichat.thread_list",
@@ -1142,7 +1144,9 @@ func (m model) initCmd() tea.Cmd {
 				var listing struct {
 					Threads []triChatThread `json:"threads"`
 				}
-				listing, _ = decodeAny[struct{ Threads []triChatThread `json:"threads"` }](payload)
+				listing, _ = decodeAny[struct {
+					Threads []triChatThread `json:"threads"`
+				}](payload)
 				if len(listing.Threads) > 0 {
 					threadID = listing.Threads[0].ThreadID
 					if listing.Threads[0].Title != "" {
@@ -1157,9 +1161,9 @@ func (m model) initCmd() tea.Cmd {
 		}
 
 		openArgs := map[string]any{
-			"mutation": mutation.next("trichat.thread_open"),
+			"mutation":  mutation.next("trichat.thread_open"),
 			"thread_id": threadID,
-			"title":    threadTitle,
+			"title":     threadTitle,
 			"metadata": map[string]any{
 				"source":    "cmd/trichat-tui",
 				"resume":    cfg.resumeLatest,
@@ -1172,16 +1176,18 @@ func (m model) initCmd() tea.Cmd {
 
 		bootstrap := ""
 		bootstrapPayload, err := caller.callTool("imprint.bootstrap", map[string]any{
-			"profile_id":            "default",
-			"max_memories":          20,
-			"max_transcript_lines":  20,
-			"max_snapshots":         5,
+			"profile_id":           "default",
+			"max_memories":         20,
+			"max_transcript_lines": 20,
+			"max_snapshots":        5,
 		})
 		if err == nil {
 			var parsed struct {
 				BootstrapText string `json:"bootstrap_text"`
 			}
-			parsed, _ = decodeAny[struct{ BootstrapText string `json:"bootstrap_text"` }](bootstrapPayload)
+			parsed, _ = decodeAny[struct {
+				BootstrapText string `json:"bootstrap_text"`
+			}](bootstrapPayload)
 			bootstrap = parsed.BootstrapText
 		}
 
@@ -1280,7 +1286,7 @@ func (m model) postMessageCmd(agentID, role, content string, replyTo string, met
 	mutation := m.mutation.next("trichat.message_post")
 	return func() tea.Msg {
 		args := map[string]any{
-			"mutation": mutation,
+			"mutation":  mutation,
 			"thread_id": threadID,
 			"agent_id":  agentID,
 			"role":      role,
@@ -1309,7 +1315,7 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 	return func() tea.Msg {
 		userMutation := mutation.next("trichat.message_post")
 		userPostPayload := map[string]any{
-			"mutation": userMutation,
+			"mutation":  userMutation,
 			"thread_id": threadID,
 			"agent_id":  "user",
 			"role":      "user",
@@ -1325,7 +1331,11 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 				MessageID string `json:"message_id"`
 			} `json:"message"`
 		}
-		posted, _ = decodeAny[struct{ Message struct{ MessageID string `json:"message_id"` } `json:"message"` }](postResult)
+		posted, _ = decodeAny[struct {
+			Message struct {
+				MessageID string `json:"message_id"`
+			} `json:"message"`
+		}](postResult)
 		userMessageID := posted.Message.MessageID
 
 		historyPayload, err := caller.callTool("trichat.timeline", map[string]any{"thread_id": threadID, "limit": 90})
@@ -1340,11 +1350,11 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 		responses, events := orch.fanout(prompt, history.Messages, cfg, settings, target)
 		for _, response := range responses {
 			postArgs := map[string]any{
-				"mutation": mutation.next("trichat.message_post"),
-				"thread_id": threadID,
-				"agent_id":  response.agentID,
-				"role":      "assistant",
-				"content":   response.content,
+				"mutation":            mutation.next("trichat.message_post"),
+				"thread_id":           threadID,
+				"agent_id":            response.agentID,
+				"role":                "assistant",
+				"content":             response.content,
 				"reply_to_message_id": userMessageID,
 				"metadata": map[string]any{
 					"kind":    "fanout-response",
@@ -1381,10 +1391,10 @@ func (m model) trichatRetentionCmd(days int, applyAll bool, doApply bool) tea.Cm
 	mutation := m.mutation.next("trichat.retention")
 	return func() tea.Msg {
 		args := map[string]any{
-			"mutation":       mutation,
+			"mutation":        mutation,
 			"older_than_days": days,
-			"limit":          2000,
-			"dry_run":        !doApply,
+			"limit":           2000,
+			"dry_run":         !doApply,
 		}
 		if !applyAll {
 			args["thread_id"] = threadID
@@ -1394,13 +1404,13 @@ func (m model) trichatRetentionCmd(days int, applyAll bool, doApply bool) tea.Cm
 			return actionDoneMsg{err: err}
 		}
 		var result struct {
-			CandidateCount int `json:"candidate_count"`
-			DeletedCount   int `json:"deleted_count"`
+			CandidateCount int  `json:"candidate_count"`
+			DeletedCount   int  `json:"deleted_count"`
 			DryRun         bool `json:"dry_run"`
 		}
 		result, _ = decodeAny[struct {
-			CandidateCount int `json:"candidate_count"`
-			DeletedCount   int `json:"deleted_count"`
+			CandidateCount int  `json:"candidate_count"`
+			DeletedCount   int  `json:"deleted_count"`
 			DryRun         bool `json:"dry_run"`
 		}](payload)
 		status := fmt.Sprintf("retention %s candidates=%d deleted=%d", ternary(result.DryRun, "dry-run", "apply"), result.CandidateCount, result.DeletedCount)
@@ -1455,7 +1465,9 @@ func (m model) threadCommandCmd(parts []string) tea.Cmd {
 			var listing struct {
 				Threads []triChatThread `json:"threads"`
 			}
-			listing, _ = decodeAny[struct{ Threads []triChatThread `json:"threads"` }](payload)
+			listing, _ = decodeAny[struct {
+				Threads []triChatThread `json:"threads"`
+			}](payload)
 			if len(listing.Threads) == 0 {
 				return actionDoneMsg{status: "no active threads"}
 			}
@@ -1473,10 +1485,10 @@ func (m model) threadCommandCmd(parts []string) tea.Cmd {
 		threadID := fmt.Sprintf("trichat-%d", time.Now().Unix())
 		return func() tea.Msg {
 			_, err := caller.callTool("trichat.thread_open", map[string]any{
-				"mutation": mutation.next("trichat.thread_open"),
+				"mutation":  mutation.next("trichat.thread_open"),
 				"thread_id": threadID,
-				"title":    title,
-				"metadata": map[string]any{"source": "trichat-tui", "created_by": "thread-new"},
+				"title":     title,
+				"metadata":  map[string]any{"source": "trichat-tui", "created_by": "thread-new"},
 			})
 			if err != nil {
 				return actionDoneMsg{err: err}
@@ -1494,21 +1506,21 @@ func (m model) threadCommandCmd(parts []string) tea.Cmd {
 				return actionDoneMsg{err: err}
 			}
 			var threadGet struct {
-				Found  bool         `json:"found"`
+				Found  bool          `json:"found"`
 				Thread triChatThread `json:"thread"`
 			}
 			threadGet, _ = decodeAny[struct {
-				Found  bool         `json:"found"`
+				Found  bool          `json:"found"`
 				Thread triChatThread `json:"thread"`
 			}](payload)
 			if !threadGet.Found {
 				return actionDoneMsg{status: "thread not found: " + threadID}
 			}
 			_, err = caller.callTool("trichat.thread_open", map[string]any{
-				"mutation": mutation.next("trichat.thread_open"),
+				"mutation":  mutation.next("trichat.thread_open"),
 				"thread_id": threadID,
-				"status":   "active",
-				"metadata": map[string]any{"source": "trichat-tui", "resumed": true},
+				"status":    "active",
+				"metadata":  map[string]any{"source": "trichat-tui", "resumed": true},
 			})
 			if err != nil {
 				return actionDoneMsg{err: err}
@@ -1522,10 +1534,10 @@ func (m model) threadCommandCmd(parts []string) tea.Cmd {
 		}
 		return func() tea.Msg {
 			_, err := caller.callTool("trichat.thread_open", map[string]any{
-				"mutation": mutation.next("trichat.thread_open"),
+				"mutation":  mutation.next("trichat.thread_open"),
 				"thread_id": threadID,
-				"status":   "archived",
-				"metadata": map[string]any{"source": "trichat-tui", "archived": true},
+				"status":    "archived",
+				"metadata":  map[string]any{"source": "trichat-tui", "archived": true},
 			})
 			if err != nil {
 				return actionDoneMsg{err: err}
@@ -1582,11 +1594,11 @@ func (m model) executeCmd(agentID, objective string) tea.Cmd {
 		}
 
 		taskPayload := map[string]any{
-			"mutation":   mutation.next("task.create"),
-			"objective":  objective,
-			"project_dir": m.cfg.repoRoot,
-			"priority":   50,
-			"source":     "trichat.execute",
+			"mutation":      mutation.next("task.create"),
+			"objective":     objective,
+			"project_dir":   m.cfg.repoRoot,
+			"priority":      50,
+			"source":        "trichat.execute",
 			"source_client": "trichat-tui",
 			"metadata": map[string]any{
 				"thread_id": threadID,
@@ -1602,12 +1614,12 @@ func (m model) executeCmd(agentID, objective string) tea.Cmd {
 		status := "task created: " + compactSingleLine(string(createdJSON), 160)
 
 		_, _ = caller.callTool("trichat.message_post", map[string]any{
-			"mutation": mutation.next("trichat.message_post"),
+			"mutation":  mutation.next("trichat.message_post"),
 			"thread_id": threadID,
 			"agent_id":  "router",
 			"role":      "system",
 			"content":   status,
-			"metadata": map[string]any{"kind": "command-route", "command": "/execute"},
+			"metadata":  map[string]any{"kind": "command-route", "command": "/execute"},
 		})
 		return actionDoneMsg{status: status, refresh: true}
 	}
@@ -1897,8 +1909,8 @@ func (m model) View() string {
 			Width(maxInt(20, m.width-4)).
 			Render(
 				m.theme.panelTitle.Render("TriChat TUI Startup Failed") + "\n\n" +
-				m.theme.errorStatus.Render(m.startupErr.Error()) + "\n\n" +
-				m.theme.helpText.Render("Press q or Ctrl+C to exit."),
+					m.theme.errorStatus.Render(m.startupErr.Error()) + "\n\n" +
+					m.theme.helpText.Render("Press q or Ctrl+C to exit."),
 			)
 		return m.theme.root.Render(errorPanel)
 	}
@@ -2028,8 +2040,8 @@ func (m *model) renderTimeline() string {
 		if strings.TrimSpace(agentLabel) == "" {
 			agentLabel = msg.Role
 		}
-		style := m.theme.chatAgent[agentLabel]
-		if style.GetForeground() == "" {
+		style, ok := m.theme.chatAgent[agentLabel]
+		if !ok {
 			style = m.theme.chatAgent["system"]
 		}
 		header := fmt.Sprintf("%s [%s/%s]", timestamp, agentLabel, msg.Role)

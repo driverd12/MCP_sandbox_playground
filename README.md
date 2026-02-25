@@ -189,6 +189,27 @@ Run:
 python3 ./scripts/trichat.py --resume-latest --panel-on-start
 ```
 
+Bubble Tea TUI (full-screen framed UI with timeline, slash bar, reliability sidebar, and settings menu):
+
+```bash
+npm run trichat:tui
+```
+
+TUI over HTTP transport:
+
+```bash
+npm run start:http
+npm run trichat:tui:http
+```
+
+TUI notes:
+
+- Requires Go (`go` in PATH). Install with Homebrew: `brew install go`.
+- Tabs: `Chat`, `Reliability`, `Settings`, `Help`.
+- `Chat` tab supports one-prompt fanout and slash commands.
+- `Settings` tab exposes live controls for fanout target, execute gate mode, polling interval, failover timeouts, and circuit breaker thresholds/recovery.
+- `Reliability` tab surfaces task counts, active lease owners, daemon statuses, and adapter telemetry/trip events.
+
 Bridge mode (optional):
 
 - Set `TRICHAT_CODEX_CMD` and/or `TRICHAT_CURSOR_CMD` to command adapters that read JSON from stdin and print response text or `{"content":"..."}` JSON.

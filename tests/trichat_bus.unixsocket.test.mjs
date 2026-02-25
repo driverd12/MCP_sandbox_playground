@@ -13,6 +13,7 @@ test("trichat.bus streams message_post events over Unix socket while persisting 
   const testId = `${Date.now()}`;
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-trichat-bus-test-"));
   const dbPath = path.join(tempDir, "hub.sqlite");
+  const busSocketPath = path.join(tempDir, "trichat.bus.sock");
   let mutationCounter = 0;
 
   const transport = new StdioClientTransport({
@@ -21,6 +22,7 @@ test("trichat.bus streams message_post events over Unix socket while persisting 
     cwd: REPO_ROOT,
     env: inheritedEnv({
       ANAMNESIS_HUB_DB_PATH: dbPath,
+      TRICHAT_BUS_SOCKET_PATH: busSocketPath,
     }),
     stderr: "pipe",
   });

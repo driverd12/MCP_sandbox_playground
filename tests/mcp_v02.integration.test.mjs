@@ -117,6 +117,7 @@ test("MCP v0.2 integration and safety invariants", async () => {
 
   const env = inheritedEnv({
     ANAMNESIS_HUB_DB_PATH: dbPath,
+    TRICHAT_BUS_SOCKET_PATH: path.join(tempDir, "trichat.bus.sock"),
   });
   const transport = new StdioClientTransport({
     command: "node",

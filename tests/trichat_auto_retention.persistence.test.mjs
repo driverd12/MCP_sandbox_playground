@@ -80,6 +80,7 @@ async function openClient(dbPath) {
     cwd: REPO_ROOT,
     env: inheritedEnv({
       ANAMNESIS_HUB_DB_PATH: dbPath,
+      TRICHAT_BUS_SOCKET_PATH: path.join(path.dirname(dbPath), "trichat.bus.sock"),
     }),
     stderr: "pipe",
   });

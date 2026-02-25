@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -37,6 +39,8 @@ const (
 	bootstrapMaxChars  = 1200
 	timelineMaxLines   = 8
 	timelineMaxChars   = 900
+	busStripMaxEvents  = 240
+	busStripMaxRows    = 5
 )
 
 const (
@@ -197,6 +201,24 @@ type triChatTimelineResp struct {
 	ThreadID string           `json:"thread_id"`
 	Count    int              `json:"count"`
 	Messages []triChatMessage `json:"messages"`
+}
+
+type triChatBusEvent struct {
+	EventSeq     int            `json:"event_seq"`
+	EventID      string         `json:"event_id"`
+	ThreadID     string         `json:"thread_id"`
+	CreatedAt    string         `json:"created_at"`
+	SourceAgent  string         `json:"source_agent"`
+	SourceClient string         `json:"source_client"`
+	EventType    string         `json:"event_type"`
+	Role         string         `json:"role"`
+	Content      string         `json:"content"`
+	Metadata     map[string]any `json:"metadata"`
+}
+
+type triChatBusTailResp struct {
+	Count  int               `json:"count"`
+	Events []triChatBusEvent `json:"events"`
 }
 
 type taskSummaryResp struct {
@@ -949,6 +971,7 @@ type model struct {
 	threadID    string
 	threadTitle string
 	messages    []triChatMessage
+	busEvents   []triChatBusEvent
 	reliability reliabilitySnapshot
 
 	ready          bool
@@ -965,6 +988,13 @@ type model struct {
 	refreshing     bool
 	lastRefresh    time.Time
 	quitConfirm    bool
+	busSocketPath  string
+	busLiveConn    bool
+	busLiveError   string
+	busLastSeq     int
+	busListening   bool
+	busInbound     chan tea.Msg
+	busSeenEventID map[string]struct{}
 
 	width  int
 	height int
@@ -1000,6 +1030,28 @@ type actionDoneMsg struct {
 }
 
 type tickMsg time.Time
+
+type busInitMsg struct {
+	status triChatBusStatusResp
+	events []triChatBusEvent
+	err    error
+}
+
+type busTailMsg struct {
+	threadID string
+	events   []triChatBusEvent
+	err      error
+}
+
+type busLiveStatusMsg struct {
+	connected bool
+	socket    string
+	info      string
+}
+
+type busLiveEventMsg struct {
+	event triChatBusEvent
+}
 
 type uiTheme struct {
 	root               lipgloss.Style
@@ -1190,11 +1242,13 @@ func newModel(cfg appConfig) model {
 			"Open Help",
 			"Quit",
 		},
-		input:    input,
-		timeline: timeline,
-		sidebar:  sidebar,
-		spinner:  sp,
-		theme:    newTheme(),
+		input:          input,
+		timeline:       timeline,
+		sidebar:        sidebar,
+		spinner:        sp,
+		theme:          newTheme(),
+		busEvents:      []triChatBusEvent{},
+		busSeenEventID: map[string]struct{}{},
 	}
 }
 
@@ -1412,6 +1466,195 @@ func (m model) refreshCmd() tea.Cmd {
 		}
 		reliability.updatedAt = time.Now()
 		return refreshDoneMsg{messages: timeline.Messages, reliability: reliability}
+	}
+}
+
+func (m model) busInitCmd(threadID string) tea.Cmd {
+	caller := m.caller
+	return func() tea.Msg {
+		statusPayload, err := caller.callTool("trichat.bus", map[string]any{"action": "status"})
+		if err != nil {
+			return busInitMsg{err: err}
+		}
+		status, err := decodeAny[triChatBusStatusResp](statusPayload)
+		if err != nil {
+			return busInitMsg{err: err}
+		}
+
+		events := []triChatBusEvent{}
+		if strings.TrimSpace(threadID) != "" {
+			tailPayload, err := caller.callTool("trichat.bus", map[string]any{
+				"action":    "tail",
+				"thread_id": threadID,
+				"limit":     80,
+			})
+			if err == nil {
+				tail, decodeErr := decodeAny[triChatBusTailResp](tailPayload)
+				if decodeErr == nil {
+					events = tail.Events
+				}
+			}
+		}
+		return busInitMsg{
+			status: status,
+			events: events,
+		}
+	}
+}
+
+func (m model) busTailCmd(threadID string, limit int) tea.Cmd {
+	caller := m.caller
+	bounded := clampInt(limit, 1, 5000)
+	return func() tea.Msg {
+		if strings.TrimSpace(threadID) == "" {
+			return busTailMsg{threadID: threadID, events: []triChatBusEvent{}}
+		}
+		payload, err := caller.callTool("trichat.bus", map[string]any{
+			"action":    "tail",
+			"thread_id": threadID,
+			"limit":     bounded,
+		})
+		if err != nil {
+			return busTailMsg{threadID: threadID, err: err}
+		}
+		tail, err := decodeAny[triChatBusTailResp](payload)
+		if err != nil {
+			return busTailMsg{threadID: threadID, err: err}
+		}
+		return busTailMsg{
+			threadID: threadID,
+			events:   tail.Events,
+		}
+	}
+}
+
+func waitBusMsg(ch <-chan tea.Msg) tea.Cmd {
+	if ch == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
+func (m *model) startBusListener(socketPath string) tea.Cmd {
+	normalized := strings.TrimSpace(socketPath)
+	if normalized == "" || m.busListening {
+		return nil
+	}
+	m.busSocketPath = normalized
+	m.busInbound = make(chan tea.Msg, 256)
+	m.busListening = true
+	go runBusStream(normalized, m.busLastSeq, m.busInbound)
+	m.appendLog("bus listener started: " + normalized)
+	return waitBusMsg(m.busInbound)
+}
+
+func runBusStream(socketPath string, initialSinceSeq int, out chan<- tea.Msg) {
+	sinceSeq := maxInt(0, initialSinceSeq)
+	backoff := time.Second
+	lastStatus := ""
+	emitStatus := func(connected bool, info string) {
+		label := "down"
+		if connected {
+			label = "up"
+		}
+		key := fmt.Sprintf("%s|%s", label, info)
+		if key == lastStatus {
+			return
+		}
+		lastStatus = key
+		select {
+		case out <- busLiveStatusMsg{connected: connected, socket: socketPath, info: info}:
+		default:
+		}
+	}
+	emitEvent := func(event triChatBusEvent) {
+		select {
+		case out <- busLiveEventMsg{event: event}:
+		default:
+		}
+	}
+
+	for {
+		conn, err := net.DialTimeout("unix", socketPath, 1500*time.Millisecond)
+		if err != nil {
+			emitStatus(false, compactSingleLine(err.Error(), 160))
+			time.Sleep(backoff)
+			if backoff < 3*time.Second {
+				backoff += 500 * time.Millisecond
+			}
+			continue
+		}
+
+		backoff = time.Second
+		emitStatus(true, "connected")
+		subscribe := map[string]any{
+			"op":           "subscribe",
+			"since_seq":    sinceSeq,
+			"replay_limit": 120,
+		}
+		subscribeBuf, _ := json.Marshal(subscribe)
+		if _, err := conn.Write(append(subscribeBuf, '\n')); err != nil {
+			emitStatus(false, compactSingleLine(err.Error(), 160))
+			_ = conn.Close()
+			time.Sleep(backoff)
+			continue
+		}
+
+		reader := bufio.NewReader(conn)
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					continue
+				}
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					continue
+				}
+				emitStatus(false, compactSingleLine(err.Error(), 160))
+				_ = conn.Close()
+				break
+			}
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(trimmed), &payload); err != nil {
+				emitStatus(false, "invalid bus frame")
+				continue
+			}
+			kind := strings.ToLower(strings.TrimSpace(fmt.Sprint(payload["kind"])))
+			switch kind {
+			case "event":
+				eventRaw, ok := payload["event"]
+				if !ok {
+					continue
+				}
+				event, err := decodeAny[triChatBusEvent](eventRaw)
+				if err != nil {
+					continue
+				}
+				if event.EventSeq > sinceSeq {
+					sinceSeq = event.EventSeq
+				}
+				emitEvent(event)
+			case "subscribed":
+				if parsed, ok := parseAnyInt(payload["since_seq"]); ok && parsed > sinceSeq {
+					sinceSeq = parsed
+				}
+				emitStatus(true, "subscribed")
+			case "error":
+				emitStatus(false, compactSingleLine(fmt.Sprint(payload["error"]), 160))
+			}
+		}
 	}
 }
 
@@ -1776,7 +2019,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.orch.restoreStates(msg.states, m.settings)
 		m.ready = true
 		m.statusLine = fmt.Sprintf("ready · thread=%s", m.threadID)
-		cmds = append(cmds, m.refreshCmd())
+		cmds = append(cmds, m.refreshCmd(), m.busInitCmd(m.threadID))
 	case refreshDoneMsg:
 		m.refreshing = false
 		if msg.err != nil {
@@ -1787,7 +2030,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.messages = msg.messages
 		m.reliability = msg.reliability
 		m.lastRefresh = time.Now()
+		if !m.busListening && msg.reliability.busStatus.Running && strings.TrimSpace(msg.reliability.busStatus.SocketPath) != "" {
+			cmd := m.startBusListener(msg.reliability.busStatus.SocketPath)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
 		m.renderPanes()
+	case busInitMsg:
+		if msg.err != nil {
+			m.appendLog("bus init failed: " + compactSingleLine(msg.err.Error(), 160))
+			break
+		}
+		m.reliability.busStatus = msg.status
+		m.mergeBusEvents(msg.events)
+		if !m.busListening && msg.status.Running && strings.TrimSpace(msg.status.SocketPath) != "" {
+			cmd := m.startBusListener(msg.status.SocketPath)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+		m.renderPanes()
+	case busTailMsg:
+		if msg.err != nil {
+			m.appendLog("bus tail failed: " + compactSingleLine(msg.err.Error(), 160))
+			break
+		}
+		m.mergeBusEvents(msg.events)
+		m.renderPanes()
+	case busLiveStatusMsg:
+		m.busLiveConn = msg.connected
+		m.busSocketPath = nullCoalesce(msg.socket, m.busSocketPath)
+		if strings.TrimSpace(msg.info) != "" {
+			if msg.connected {
+				m.busLiveError = ""
+			} else {
+				m.busLiveError = msg.info
+			}
+		}
+		m.renderPanes()
+		cmds = append(cmds, waitBusMsg(m.busInbound))
+	case busLiveEventMsg:
+		if m.mergeBusEvents([]triChatBusEvent{msg.event}) {
+			m.renderPanes()
+		}
+		cmds = append(cmds, waitBusMsg(m.busInbound))
 	case actionDoneMsg:
 		m.inflight = false
 		if msg.err != nil {
@@ -1797,7 +2084,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusLine = msg.status
 			m.appendLog(msg.status)
 		}
+		threadChanged := false
 		if strings.TrimSpace(msg.threadID) != "" {
+			if msg.threadID != m.threadID {
+				threadChanged = true
+			}
 			m.threadID = msg.threadID
 		}
 		if strings.TrimSpace(msg.threadTitle) != "" {
@@ -1805,6 +2096,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.refresh {
 			cmds = append(cmds, m.refreshCmd())
+		}
+		if threadChanged {
+			cmds = append(cmds, m.busTailCmd(m.threadID, 80))
 		}
 	case tickMsg:
 		if m.settings.autoRefresh && m.ready && !m.refreshing && !m.inflight {
@@ -2341,19 +2635,24 @@ func (m *model) renderContent() string {
 
 	switch m.activeTab {
 	case tabChat:
+		mainPanelHeight, busStripHeight := chatPanelHeights(contentHeight)
 		leftWidth := int(float64(contentWidth) * 0.66)
 		rightWidth := contentWidth - leftWidth - 1
 		if rightWidth < 28 {
 			rightWidth = 28
 			leftWidth = contentWidth - rightWidth - 1
 		}
-		left := m.theme.panel.Width(leftWidth).Height(contentHeight).Render(
+		left := m.theme.panel.Width(leftWidth).Height(mainPanelHeight).Render(
 			m.theme.panelTitle.Render("Live Timeline") + "\n" + m.timeline.View(),
 		)
-		right := m.theme.panel.Width(rightWidth).Height(contentHeight).Render(
+		right := m.theme.panel.Width(rightWidth).Height(mainPanelHeight).Render(
 			m.theme.panelTitle.Render("Reliability Sidebar") + "\n" + m.sidebar.View(),
 		)
-		return lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+		top := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+		bus := m.theme.panel.Width(contentWidth).Height(busStripHeight).Render(
+			m.theme.panelTitle.Render("Live Bus Strip") + "\n" + m.renderBusStrip(),
+		)
+		return lipgloss.JoinVertical(lipgloss.Left, top, bus)
 	case tabReliability:
 		panel := m.theme.panel.Width(contentWidth).Height(contentHeight)
 		return panel.Render(m.theme.panelTitle.Render("Reliability Detail") + "\n" + m.renderReliabilityDetail())
@@ -2366,6 +2665,79 @@ func (m *model) renderContent() string {
 	default:
 		return ""
 	}
+}
+
+func (m *model) renderBusStrip() string {
+	threadID := strings.TrimSpace(m.threadID)
+	socketName := "(unset)"
+	if strings.TrimSpace(m.busSocketPath) != "" {
+		socketName = filepath.Base(m.busSocketPath)
+	} else if strings.TrimSpace(m.reliability.busStatus.SocketPath) != "" {
+		socketName = filepath.Base(m.reliability.busStatus.SocketPath)
+	}
+	connection := "reconnecting"
+	if m.busLiveConn {
+		connection = "connected"
+	} else if !m.busListening {
+		connection = "idle"
+	}
+
+	var b strings.Builder
+	b.WriteString(
+		m.theme.helpText.Render(
+			fmt.Sprintf(
+				"Feed %s · socket=%s · clients=%d subs=%d · published=%d",
+				connection,
+				socketName,
+				m.reliability.busStatus.ClientCount,
+				m.reliability.busStatus.SubscriptionCount,
+				m.reliability.busStatus.Metrics.TotalPublished,
+			),
+		),
+	)
+
+	rendered := 0
+	selected := make([]triChatBusEvent, 0, busStripMaxRows)
+	for i := len(m.busEvents) - 1; i >= 0 && len(selected) < busStripMaxRows; i-- {
+		event := m.busEvents[i]
+		if threadID != "" && strings.TrimSpace(event.ThreadID) != threadID {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(event.EventType), "trichat.message_post") {
+			continue
+		}
+		selected = append(selected, event)
+	}
+	for i := len(selected) - 1; i >= 0; i-- {
+		event := selected[i]
+		agent := strings.TrimSpace(event.SourceAgent)
+		if agent == "" {
+			agent = "system"
+		}
+		style, ok := m.theme.chatAgent[agent]
+		if !ok {
+			style = m.theme.chatAgent["system"]
+		}
+		prefix := style.Render(fmt.Sprintf("%s %s", shortTime(event.CreatedAt), agent))
+		content := compactSingleLine(strings.TrimSpace(event.Content), 100)
+		detail := event.EventType
+		if content != "" {
+			detail += " :: " + content
+		}
+		b.WriteString("\n")
+		b.WriteString(prefix + " " + detail)
+		rendered++
+	}
+
+	if rendered == 0 {
+		b.WriteString("\n")
+		if strings.TrimSpace(m.busLiveError) != "" {
+			b.WriteString(m.theme.helpText.Render("No adapter events yet. " + compactSingleLine(m.busLiveError, 110)))
+		} else {
+			b.WriteString(m.theme.helpText.Render("No adapter events yet for this thread. Live bridge signals will appear here."))
+		}
+	}
+	return strings.TrimSpace(b.String())
 }
 
 func (m *model) renderInput() string {
@@ -2435,6 +2807,7 @@ func (m *model) renderPanes() {
 
 	contentHeight := maxInt(8, m.height-12)
 	contentWidth := maxInt(40, m.width-4)
+	mainPanelHeight, _ := chatPanelHeights(contentHeight)
 	leftWidth := int(float64(contentWidth) * 0.66)
 	rightWidth := contentWidth - leftWidth - 1
 	if rightWidth < 28 {
@@ -2443,9 +2816,9 @@ func (m *model) renderPanes() {
 	}
 
 	m.timeline.Width = maxInt(20, leftWidth-4)
-	m.timeline.Height = maxInt(5, contentHeight-3)
+	m.timeline.Height = maxInt(5, mainPanelHeight-3)
 	m.sidebar.Width = maxInt(20, rightWidth-4)
-	m.sidebar.Height = maxInt(5, contentHeight-3)
+	m.sidebar.Height = maxInt(5, mainPanelHeight-3)
 
 	m.timeline.SetContent(m.renderTimeline())
 	if prevTimelineAtBottom {
@@ -2459,6 +2832,47 @@ func (m *model) renderPanes() {
 	} else {
 		m.sidebar.SetYOffset(prevSidebarYOffset)
 	}
+}
+
+func (m *model) mergeBusEvents(events []triChatBusEvent) bool {
+	if len(events) == 0 {
+		return false
+	}
+	changed := false
+	for _, event := range events {
+		eventID := strings.TrimSpace(event.EventID)
+		if eventID != "" {
+			if _, exists := m.busSeenEventID[eventID]; exists {
+				continue
+			}
+			m.busSeenEventID[eventID] = struct{}{}
+		}
+		m.busEvents = append(m.busEvents, event)
+		if event.EventSeq > m.busLastSeq {
+			m.busLastSeq = event.EventSeq
+		}
+		changed = true
+	}
+	if len(m.busEvents) > busStripMaxEvents {
+		m.busEvents = m.busEvents[len(m.busEvents)-busStripMaxEvents:]
+		seen := make(map[string]struct{}, len(m.busEvents))
+		for _, event := range m.busEvents {
+			if id := strings.TrimSpace(event.EventID); id != "" {
+				seen[id] = struct{}{}
+			}
+		}
+		m.busSeenEventID = seen
+	}
+	return changed
+}
+
+func chatPanelHeights(contentHeight int) (mainPanelHeight int, busStripHeight int) {
+	mainPanelHeight = maxInt(6, contentHeight-7)
+	busStripHeight = maxInt(5, contentHeight-mainPanelHeight)
+	if mainPanelHeight+busStripHeight > contentHeight {
+		mainPanelHeight = maxInt(5, contentHeight-busStripHeight)
+	}
+	return mainPanelHeight, busStripHeight
 }
 
 func (m *model) resize() {
@@ -2667,6 +3081,7 @@ func (m *model) renderHelp() string {
 		"- Timeline scroll: PgUp/PgDn, Up/Down (input empty), +/- (or Ctrl+U/Ctrl+D)",
 		"- Ctrl+C: quit",
 		"- Chat timeline auto-hides system chatter and compacts long responses",
+		"- Live Bus Strip shows real-time adapter events (socket stream) before timeline persistence",
 		"",
 		"Slash Commands",
 		"- /fanout all|codex|cursor|local-imprint",
@@ -2940,6 +3355,35 @@ func parseISO(value string) (time.Time, error) {
 		return parsed, nil
 	}
 	return time.Time{}, err
+}
+
+func parseAnyInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(parsed), true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return 0, false
+		}
+		parsed, err := strconv.Atoi(trimmed)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
 }
 
 func wrapText(text string, width int) string {

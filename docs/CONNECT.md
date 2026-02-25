@@ -81,6 +81,8 @@ npm test
 - `policy.evaluate`
 - `run.begin`, `run.step`, `run.end`, `run.timeline`
 - `task.create`, `task.list`, `task.timeline`, `task.claim`, `task.heartbeat`, `task.complete`, `task.fail`, `task.retry`, `task.auto_retry`
+- `task.summary`
+- `trichat.thread_open`, `trichat.thread_list`, `trichat.thread_get`, `trichat.message_post`, `trichat.timeline`, `trichat.retention`
 - `mutation.check`
 - `preflight.check`, `postflight.verify`
 - `lock.acquire`, `lock.release`
@@ -168,6 +170,62 @@ Safety defaults:
 - `transcript.retention` only deletes squished lines unless `include_unsquished: true`.
 - `transcript.auto_squish` requires mutation metadata for `start`, `stop`, and `run_once`.
 - `transcript.auto_squish` persists daemon state/config, so restart restores previous mode.
+
+## TriChat Terminal
+
+Run TriChat with STDIO MCP calls:
+
+```bash
+npm run trichat
+```
+
+Run TriChat against local HTTP MCP:
+
+```bash
+npm run start:http
+npm run trichat:http
+```
+
+Bridge adapters (optional):
+
+- `TRICHAT_CODEX_CMD`
+- `TRICHAT_CURSOR_CMD`
+- `TRICHAT_IMPRINT_CMD`
+
+Adapter contract:
+
+- reads one JSON payload from stdin
+- writes response text or JSON with `content` field to stdout
+
+TriChat verifies required `trichat.*` + `task.*` tooling at startup and retries MCP tool calls on transient failures.
+
+`/execute` gate modes:
+
+- `open` (default): no extra constraints before `task.create`.
+- `allowlist`: only allow selected agent IDs for `/execute`.
+- `approval`: require operator confirmation phrase before `task.create`.
+
+Configure at startup:
+
+```bash
+python3 ./scripts/trichat.py --execute-gate-mode open
+python3 ./scripts/trichat.py --execute-gate-mode allowlist --execute-allow-agents codex,local-imprint
+python3 ./scripts/trichat.py --execute-gate-mode approval --execute-approval-phrase approve
+```
+
+Run TriChat message-bus smoke check:
+
+```bash
+npm run trichat:smoke
+```
+
+Against a live HTTP MCP server:
+
+```bash
+TRICHAT_SMOKE_TRANSPORT=http \
+MCP_HTTP_BEARER_TOKEN="change-me" \
+npm run trichat:smoke
+```
 
 ## Task Auto Retry
 

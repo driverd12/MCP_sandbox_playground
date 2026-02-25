@@ -102,6 +102,48 @@ export type TaskEventRecord = {
   details: Record<string, unknown>;
 };
 
+export type TriChatThreadStatus = "active" | "archived";
+
+export type TriChatThreadRecord = {
+  thread_id: string;
+  created_at: string;
+  updated_at: string;
+  title: string | null;
+  status: TriChatThreadStatus;
+  metadata: Record<string, unknown>;
+};
+
+export type TriChatMessageRecord = {
+  message_id: string;
+  thread_id: string;
+  created_at: string;
+  agent_id: string;
+  role: string;
+  content: string;
+  reply_to_message_id: string | null;
+  metadata: Record<string, unknown>;
+};
+
+export type TaskSummaryRecord = {
+  counts: Record<TaskStatus, number>;
+  running: Array<{
+    task_id: string;
+    objective: string;
+    owner_id: string | null;
+    lease_expires_at: string | null;
+    updated_at: string;
+    attempt_count: number;
+    max_attempts: number;
+  }>;
+  last_failed: {
+    task_id: string;
+    last_error: string | null;
+    attempt_count: number;
+    max_attempts: number;
+    updated_at: string;
+  } | null;
+};
+
 export type MutationMeta = {
   idempotency_key: string;
   side_effect_fingerprint: string;
@@ -268,7 +310,13 @@ export class Storage {
         name: "add-task-orchestrator-schema",
         run: () => this.applyTaskSchemaMigration(),
       },
+      {
+        version: 5,
+        name: "add-trichat-message-bus-schema",
+        run: () => this.applyTriChatSchemaMigration(),
+      },
     ]);
+    this.ensureRuntimeSchemaCompleteness();
   }
 
   getSchemaVersion(): number {
@@ -1928,6 +1976,323 @@ export class Storage {
     return rows.reverse().map((row) => mapTaskEventRow(row));
   }
 
+  getTaskSummary(params?: {
+    running_limit?: number;
+  }): TaskSummaryRecord {
+    const runningLimit = parseBoundedInt(params?.running_limit, 10, 1, 200);
+    const countRows = this.db
+      .prepare(
+        `SELECT status, COUNT(*) AS count
+         FROM tasks
+         GROUP BY status`
+      )
+      .all() as Array<Record<string, unknown>>;
+
+    const counts: Record<TaskStatus, number> = {
+      pending: 0,
+      running: 0,
+      failed: 0,
+      completed: 0,
+      cancelled: 0,
+    };
+    for (const row of countRows) {
+      const status = normalizeTaskStatus(row.status);
+      counts[status] = Number(row.count ?? 0);
+    }
+
+    const runningRows = this.db
+      .prepare(
+        `SELECT t.task_id, t.objective, t.updated_at, t.attempt_count, t.max_attempts,
+                l.owner_id, l.lease_expires_at
+         FROM tasks t
+         LEFT JOIN task_leases l ON l.task_id = t.task_id
+         WHERE t.status = 'running'
+         ORDER BY t.priority DESC, t.updated_at DESC
+         LIMIT ?`
+      )
+      .all(runningLimit) as Array<Record<string, unknown>>;
+
+    const failedRow = this.db
+      .prepare(
+        `SELECT task_id, last_error, attempt_count, max_attempts, updated_at
+         FROM tasks
+         WHERE status = 'failed'
+         ORDER BY updated_at DESC
+         LIMIT 1`
+      )
+      .get() as Record<string, unknown> | undefined;
+
+    return {
+      counts,
+      running: runningRows.map((row) => ({
+        task_id: String(row.task_id ?? ""),
+        objective: String(row.objective ?? ""),
+        owner_id: asNullableString(row.owner_id),
+        lease_expires_at: asNullableString(row.lease_expires_at),
+        updated_at: String(row.updated_at ?? ""),
+        attempt_count: Number(row.attempt_count ?? 0),
+        max_attempts: Number(row.max_attempts ?? 0),
+      })),
+      last_failed: failedRow
+        ? {
+            task_id: String(failedRow.task_id ?? ""),
+            last_error: asNullableString(failedRow.last_error),
+            attempt_count: Number(failedRow.attempt_count ?? 0),
+            max_attempts: Number(failedRow.max_attempts ?? 0),
+            updated_at: String(failedRow.updated_at ?? ""),
+          }
+        : null,
+    };
+  }
+
+  upsertTriChatThread(params: {
+    thread_id?: string;
+    title?: string;
+    status?: TriChatThreadStatus;
+    metadata?: Record<string, unknown>;
+  }): { created: boolean; thread: TriChatThreadRecord } {
+    const now = new Date().toISOString();
+    const threadId = params.thread_id?.trim() || crypto.randomUUID();
+    const existing = this.getTriChatThreadById(threadId);
+    const status = normalizeTriChatThreadStatus(params.status);
+    const metadata = params.metadata ?? {};
+    const title = params.title?.trim() || null;
+    this.db
+      .prepare(
+        `INSERT INTO trichat_threads (thread_id, created_at, updated_at, title, status, metadata_json)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET
+           updated_at = excluded.updated_at,
+           title = COALESCE(excluded.title, trichat_threads.title),
+           status = excluded.status,
+           metadata_json = excluded.metadata_json`
+      )
+      .run(threadId, now, now, title, status, stableStringify(metadata));
+    const thread = this.getTriChatThreadById(threadId);
+    if (!thread) {
+      throw new Error(`Failed to read trichat thread after upsert: ${threadId}`);
+    }
+    return {
+      created: !existing,
+      thread,
+    };
+  }
+
+  getTriChatThreadById(threadId: string): TriChatThreadRecord | null {
+    const normalized = threadId.trim();
+    if (!normalized) {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT thread_id, created_at, updated_at, title, status, metadata_json
+         FROM trichat_threads
+         WHERE thread_id = ?`
+      )
+      .get(normalized) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return mapTriChatThreadRow(row);
+  }
+
+  listTriChatThreads(params: {
+    status?: TriChatThreadStatus;
+    limit: number;
+  }): TriChatThreadRecord[] {
+    const limit = Math.max(1, Math.min(500, params.limit));
+    const rows = params.status
+      ? (this.db
+          .prepare(
+            `SELECT thread_id, created_at, updated_at, title, status, metadata_json
+             FROM trichat_threads
+             WHERE status = ?
+             ORDER BY updated_at DESC
+             LIMIT ?`
+          )
+          .all(params.status, limit) as Array<Record<string, unknown>>)
+      : (this.db
+          .prepare(
+            `SELECT thread_id, created_at, updated_at, title, status, metadata_json
+             FROM trichat_threads
+             ORDER BY updated_at DESC
+             LIMIT ?`
+          )
+          .all(limit) as Array<Record<string, unknown>>);
+    return rows.map((row) => mapTriChatThreadRow(row));
+  }
+
+  appendTriChatMessage(params: {
+    thread_id: string;
+    agent_id: string;
+    role: string;
+    content: string;
+    reply_to_message_id?: string;
+    metadata?: Record<string, unknown>;
+  }): TriChatMessageRecord {
+    const now = new Date().toISOString();
+    const threadId = params.thread_id.trim();
+    const agentId = params.agent_id.trim();
+    const role = params.role.trim();
+    const content = params.content.trim();
+    const replyToMessageId = params.reply_to_message_id?.trim() || null;
+    if (!threadId || !agentId || !role || !content) {
+      throw new Error("thread_id, agent_id, role, and content are required");
+    }
+    const messageId = crypto.randomUUID();
+    const metadata = params.metadata ?? {};
+
+    const write = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO trichat_threads (thread_id, created_at, updated_at, title, status, metadata_json)
+           VALUES (?, ?, ?, NULL, 'active', '{}')
+           ON CONFLICT(thread_id) DO UPDATE SET
+             updated_at = excluded.updated_at`
+        )
+        .run(threadId, now, now);
+      this.db
+        .prepare(
+          `INSERT INTO trichat_messages (
+             message_id, thread_id, created_at, agent_id, role, content, reply_to_message_id, metadata_json
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(messageId, threadId, now, agentId, role, content, replyToMessageId, stableStringify(metadata));
+      this.db.prepare(`UPDATE trichat_threads SET updated_at = ? WHERE thread_id = ?`).run(now, threadId);
+    });
+    write();
+
+    return {
+      message_id: messageId,
+      thread_id: threadId,
+      created_at: now,
+      agent_id: agentId,
+      role,
+      content,
+      reply_to_message_id: replyToMessageId,
+      metadata,
+    };
+  }
+
+  getTriChatTimeline(params: {
+    thread_id: string;
+    limit: number;
+    since?: string;
+    agent_id?: string;
+    role?: string;
+  }): TriChatMessageRecord[] {
+    const threadId = params.thread_id.trim();
+    if (!threadId) {
+      return [];
+    }
+    const limit = Math.max(1, Math.min(2000, params.limit));
+    const whereClauses = ["thread_id = ?"];
+    const values: Array<string | number> = [threadId];
+
+    if (params.since?.trim()) {
+      whereClauses.push("created_at > ?");
+      values.push(normalizeIsoTimestamp(params.since, params.since));
+    }
+    if (params.agent_id?.trim()) {
+      whereClauses.push("agent_id = ?");
+      values.push(params.agent_id.trim());
+    }
+    if (params.role?.trim()) {
+      whereClauses.push("role = ?");
+      values.push(params.role.trim());
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, thread_id, created_at, agent_id, role, content, reply_to_message_id, metadata_json
+         FROM trichat_messages
+         WHERE ${whereClauses.join(" AND ")}
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    return rows.reverse().map((row) => mapTriChatMessageRow(row));
+  }
+
+  pruneTriChatMessages(params: {
+    older_than_iso: string;
+    thread_id?: string;
+    limit: number;
+    dry_run?: boolean;
+  }): { candidate_count: number; deleted_count: number; deleted_message_ids: string[] } {
+    const limit = Math.max(1, Math.min(5000, params.limit));
+    const whereClauses = ["created_at <= ?"];
+    const values: Array<string | number> = [params.older_than_iso];
+    if (params.thread_id?.trim()) {
+      whereClauses.push("thread_id = ?");
+      values.push(params.thread_id.trim());
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT message_id, thread_id
+         FROM trichat_messages
+         WHERE ${whereClauses.join(" AND ")}
+         ORDER BY created_at ASC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    const messageIds = rows
+      .map((row) => String(row.message_id ?? ""))
+      .filter((id) => id.length > 0);
+    const threadIds = Array.from(
+      new Set(rows.map((row) => String(row.thread_id ?? "")).filter((id) => id.length > 0))
+    );
+
+    if (params.dry_run || messageIds.length === 0) {
+      return {
+        candidate_count: messageIds.length,
+        deleted_count: 0,
+        deleted_message_ids: [],
+      };
+    }
+
+    const deleteStmt = this.db.prepare(`DELETE FROM trichat_messages WHERE message_id = ?`);
+    const latestMessageStmt = this.db.prepare(
+      `SELECT MAX(created_at) AS latest_created_at
+       FROM trichat_messages
+       WHERE thread_id = ?`
+    );
+    const threadCreatedStmt = this.db.prepare(
+      `SELECT created_at
+       FROM trichat_threads
+       WHERE thread_id = ?`
+    );
+    const touchThreadStmt = this.db.prepare(`UPDATE trichat_threads SET updated_at = ? WHERE thread_id = ?`);
+
+    const apply = this.db.transaction((ids: string[], affectedThreadIds: string[]) => {
+      let deleted = 0;
+      for (const messageId of ids) {
+        const result = deleteStmt.run(messageId);
+        deleted += Number(result.changes ?? 0);
+      }
+      for (const threadId of affectedThreadIds) {
+        const latestRow = latestMessageStmt.get(threadId) as Record<string, unknown> | undefined;
+        const latestCreatedAt = asNullableString(latestRow?.latest_created_at);
+        if (latestCreatedAt) {
+          touchThreadStmt.run(latestCreatedAt, threadId);
+          continue;
+        }
+        const createdRow = threadCreatedStmt.get(threadId) as Record<string, unknown> | undefined;
+        const fallback = asNullableString(createdRow?.created_at) ?? new Date().toISOString();
+        touchThreadStmt.run(fallback, threadId);
+      }
+      return deleted;
+    });
+
+    const deletedCount = apply(messageIds, threadIds);
+    return {
+      candidate_count: messageIds.length,
+      deleted_count: deletedCount,
+      deleted_message_ids: messageIds,
+    };
+  }
+
   getTranscriptById(transcriptId: string): TranscriptRecord | null {
     const row = this.db
       .prepare(
@@ -2558,6 +2923,8 @@ export class Storage {
       "task_events",
       "task_leases",
       "task_artifacts",
+      "trichat_threads",
+      "trichat_messages",
     ] as const;
     const counts: Record<string, number> = {};
     for (const table of tables) {
@@ -2622,6 +2989,16 @@ export class Storage {
       this.db.exec(`PRAGMA user_version = ${version}`);
     });
     apply();
+  }
+
+  private ensureRuntimeSchemaCompleteness(): void {
+    // Defensive schema replay keeps table/index guarantees intact even if
+    // migration metadata was partially imported from legacy environments.
+    this.applyCoreSchemaMigration();
+    this.applyDaemonConfigMigration();
+    this.applyImprintSchemaMigration();
+    this.applyTaskSchemaMigration();
+    this.applyTriChatSchemaMigration();
   }
 
   private applyCoreSchemaMigration(): void {
@@ -2896,6 +3273,33 @@ export class Storage {
     this.ensureIndex("idx_task_artifacts_task", "task_artifacts", "task_id, created_at ASC");
   }
 
+  private applyTriChatSchemaMigration(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS trichat_threads (
+        thread_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        title TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        metadata_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS trichat_messages (
+        message_id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        reply_to_message_id TEXT,
+        metadata_json TEXT NOT NULL
+      );
+    `);
+
+    this.ensureIndex("idx_trichat_threads_status_updated", "trichat_threads", "status, updated_at DESC");
+    this.ensureIndex("idx_trichat_messages_thread_created", "trichat_messages", "thread_id, created_at ASC");
+    this.ensureIndex("idx_trichat_messages_agent_created", "trichat_messages", "agent_id, created_at DESC");
+  }
+
   private appendTaskEvent(params: {
     task_id: string;
     event_type: string;
@@ -3089,6 +3493,30 @@ function mapTaskEventRow(row: Record<string, unknown>): TaskEventRecord {
   };
 }
 
+function mapTriChatThreadRow(row: Record<string, unknown>): TriChatThreadRecord {
+  return {
+    thread_id: String(row.thread_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    updated_at: String(row.updated_at ?? ""),
+    title: asNullableString(row.title),
+    status: normalizeTriChatThreadStatus(row.status),
+    metadata: parseJsonObject(row.metadata_json),
+  };
+}
+
+function mapTriChatMessageRow(row: Record<string, unknown>): TriChatMessageRecord {
+  return {
+    message_id: String(row.message_id ?? ""),
+    thread_id: String(row.thread_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    agent_id: String(row.agent_id ?? ""),
+    role: String(row.role ?? ""),
+    content: String(row.content ?? ""),
+    reply_to_message_id: asNullableString(row.reply_to_message_id),
+    metadata: parseJsonObject(row.metadata_json),
+  };
+}
+
 function normalizeTrustTier(value: unknown): TrustTier {
   const normalized = String(value ?? "raw");
   if (normalized === "verified" || normalized === "policy-backed" || normalized === "deprecated") {
@@ -3103,6 +3531,10 @@ function normalizeTaskStatus(value: unknown): TaskStatus {
     return normalized;
   }
   return "pending";
+}
+
+function normalizeTriChatThreadStatus(value: unknown): TriChatThreadStatus {
+  return String(value ?? "active") === "archived" ? "archived" : "active";
 }
 
 function asNullableString(value: unknown): string | null {

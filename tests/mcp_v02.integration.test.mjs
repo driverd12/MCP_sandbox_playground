@@ -49,9 +49,16 @@ const EXPECTED_TOOLS = [
   "task.fail",
   "task.heartbeat",
   "task.list",
+  "task.summary",
   "task.timeline",
   "task.retry",
   "task.auto_retry",
+  "trichat.message_post",
+  "trichat.retention",
+  "trichat.thread_get",
+  "trichat.thread_list",
+  "trichat.thread_open",
+  "trichat.timeline",
   "simulate.workflow",
   "transcript.log",
   "transcript.auto_squish",
@@ -86,6 +93,9 @@ const MUTATION_REQUIRED_TOOLS = [
   "task.fail",
   "task.heartbeat",
   "task.retry",
+  "trichat.message_post",
+  "trichat.retention",
+  "trichat.thread_open",
   "transcript.log",
   "transcript.retention",
   "transcript.squish",
@@ -374,6 +384,100 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(taskTimelineTypes.includes("claimed"));
     assert.ok(taskTimelineTypes.includes("failed"));
     assert.ok(taskTimelineTypes.includes("retried"));
+
+    const taskSummaryBeforeAutoRetry = await callTool(client, "task.summary", {
+      running_limit: 10,
+    });
+    assert.equal(typeof taskSummaryBeforeAutoRetry.counts.pending, "number");
+    assert.equal(typeof taskSummaryBeforeAutoRetry.counts.failed, "number");
+    assert.ok(Array.isArray(taskSummaryBeforeAutoRetry.running));
+    if (taskSummaryBeforeAutoRetry.last_failed) {
+      assert.equal(typeof taskSummaryBeforeAutoRetry.last_failed.task_id, "string");
+    }
+
+    const triChatThreadId = `trichat-${testId}`;
+    const triChatThread = await callTool(client, "trichat.thread_open", {
+      mutation: nextMutation(testId, "trichat.thread_open", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      title: `Integration thread ${testId}`,
+      metadata: {
+        source: "integration-test",
+      },
+    });
+    assert.equal(triChatThread.created, true);
+    assert.equal(triChatThread.thread.thread_id, triChatThreadId);
+    assert.equal(triChatThread.thread.status, "active");
+
+    const triChatThreadList = await callTool(client, "trichat.thread_list", {
+      status: "active",
+      limit: 50,
+    });
+    assert.ok(
+      triChatThreadList.threads.some((thread) => thread.thread_id === triChatThreadId),
+      "Expected tri-chat thread in active list"
+    );
+
+    const triChatThreadGet = await callTool(client, "trichat.thread_get", {
+      thread_id: triChatThreadId,
+    });
+    assert.equal(triChatThreadGet.found, true);
+    assert.equal(triChatThreadGet.thread.thread_id, triChatThreadId);
+
+    const triChatMessageMutation = nextMutation(testId, "trichat.message_post-user", () => mutationCounter++);
+    const triChatUserMessage = await callTool(client, "trichat.message_post", {
+      mutation: triChatMessageMutation,
+      thread_id: triChatThreadId,
+      agent_id: "user",
+      role: "user",
+      content: `integration tri-chat user message ${testId}`,
+    });
+    assert.equal(triChatUserMessage.ok, true);
+    assert.ok(triChatUserMessage.message.message_id);
+
+    const triChatUserMessageReplay = await callTool(client, "trichat.message_post", {
+      mutation: triChatMessageMutation,
+      thread_id: triChatThreadId,
+      agent_id: "user",
+      role: "user",
+      content: `integration tri-chat user message ${testId}`,
+    });
+    assert.equal(triChatUserMessageReplay.replayed, true);
+    assert.equal(
+      triChatUserMessageReplay.message.message_id,
+      triChatUserMessage.message.message_id
+    );
+
+    const triChatAssistantMessage = await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-assistant", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      agent_id: "local-imprint",
+      role: "assistant",
+      content: `integration tri-chat assistant message ${testId}`,
+      reply_to_message_id: triChatUserMessage.message.message_id,
+    });
+    assert.equal(triChatAssistantMessage.ok, true);
+
+    const triChatTimeline = await callTool(client, "trichat.timeline", {
+      thread_id: triChatThreadId,
+      limit: 20,
+    });
+    assert.ok(triChatTimeline.count >= 2);
+    assert.equal(triChatTimeline.messages[0].role, "user");
+    assert.equal(
+      triChatTimeline.messages[triChatTimeline.messages.length - 1].role,
+      "assistant"
+    );
+
+    const triChatRetentionDryRun = await callTool(client, "trichat.retention", {
+      mutation: nextMutation(testId, "trichat.retention", () => mutationCounter++),
+      older_than_days: 0,
+      thread_id: triChatThreadId,
+      limit: 100,
+      dry_run: true,
+    });
+    assert.equal(triChatRetentionDryRun.thread_id, triChatThreadId);
+    assert.ok(triChatRetentionDryRun.candidate_count >= 2);
+    assert.equal(triChatRetentionDryRun.deleted_count, 0);
 
     const durableTaskIdC = `task-${testId}-c`;
     await callTool(client, "task.create", {
@@ -904,7 +1008,7 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.equal(healthStorage.ok, true);
     assert.equal(path.resolve(healthStorage.db_path), path.resolve(dbPath));
     assert.equal(healthStorage.db_exists, true);
-    assert.ok(healthStorage.schema_version >= 3);
+    assert.ok(healthStorage.schema_version >= 5);
     assert.equal(typeof healthStorage.table_counts.schema_migrations, "number");
     assert.equal(typeof healthStorage.table_counts.daemon_configs, "number");
     assert.equal(typeof healthStorage.table_counts.imprint_profiles, "number");
@@ -915,7 +1019,7 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(healthPolicy.enforced_rules.length >= 3);
 
     const migrationStatus = await callTool(client, "migration.status", {});
-    assert.ok(migrationStatus.schema_version >= 3);
+    assert.ok(migrationStatus.schema_version >= 5);
     assert.ok(Array.isArray(migrationStatus.applied_versions));
     assert.ok(
       migrationStatus.applied_versions.some((entry) => entry.version === 1),

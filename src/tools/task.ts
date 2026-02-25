@@ -34,6 +34,10 @@ export const taskTimelineSchema = z.object({
   limit: z.number().int().min(1).max(500).optional(),
 });
 
+export const taskSummarySchema = z.object({
+  running_limit: z.number().int().min(1).max(200).optional(),
+});
+
 export const taskClaimSchema = z.object({
   mutation: mutationSchema,
   worker_id: z.string().min(1),
@@ -224,6 +228,16 @@ export function taskTimeline(storage: Storage, input: z.infer<typeof taskTimelin
     task_id: input.task_id,
     count: events.length,
     events,
+  };
+}
+
+export function taskSummary(storage: Storage, input: z.infer<typeof taskSummarySchema>) {
+  const summary = storage.getTaskSummary({
+    running_limit: input.running_limit ?? 10,
+  });
+  return {
+    ...summary,
+    running_count: summary.running.length,
   };
 }
 

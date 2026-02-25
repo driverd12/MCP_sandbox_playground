@@ -55,6 +55,8 @@ import {
   taskHeartbeatSchema,
   taskList,
   taskListSchema,
+  taskSummary,
+  taskSummarySchema,
   taskTimeline,
   taskTimelineSchema,
   taskRetry,
@@ -63,6 +65,20 @@ import {
   taskAutoRetrySchema,
   initializeTaskAutoRetryDaemon,
 } from "./tools/task.js";
+import {
+  trichatMessagePost,
+  trichatMessagePostSchema,
+  trichatRetention,
+  trichatRetentionSchema,
+  trichatThreadGet,
+  trichatThreadGetSchema,
+  trichatThreadList,
+  trichatThreadListSchema,
+  trichatThreadOpen,
+  trichatThreadOpenSchema,
+  trichatTimeline,
+  trichatTimelineSchema,
+} from "./tools/trichat.js";
 import {
   imprintAutoSnapshotControl,
   imprintAutoSnapshotSchema,
@@ -364,6 +380,10 @@ registerTool("task.timeline", "Read ordered task lifecycle events from task_even
   taskTimeline(storage, input)
 );
 
+registerTool("task.summary", "Summarize task queue reliability state (counts, running leases, last failure).", taskSummarySchema, (input) =>
+  taskSummary(storage, input)
+);
+
 registerTool("task.claim", "Claim the next available task using a renewable lease.", taskClaimSchema, (input) =>
   taskClaim(storage, input)
 );
@@ -386,6 +406,48 @@ registerTool("task.retry", "Requeue a failed task for retry with optional delay.
 
 registerTool("task.auto_retry", "Manage failed-task auto-retry daemon with deterministic backoff.", taskAutoRetrySchema, (input) =>
   taskAutoRetryControl(storage, input)
+);
+
+registerTool("trichat.thread_open", "Create or update a durable tri-chat thread.", trichatThreadOpenSchema, (input) =>
+  runIdempotentMutation({
+    storage,
+    tool_name: "trichat.thread_open",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => trichatThreadOpen(storage, input),
+  })
+);
+
+registerTool("trichat.thread_list", "List durable tri-chat threads by status.", trichatThreadListSchema, (input) =>
+  trichatThreadList(storage, input)
+);
+
+registerTool("trichat.thread_get", "Read tri-chat thread metadata by thread id.", trichatThreadGetSchema, (input) =>
+  trichatThreadGet(storage, input)
+);
+
+registerTool("trichat.message_post", "Append a message into a tri-chat thread timeline.", trichatMessagePostSchema, (input) =>
+  runIdempotentMutation({
+    storage,
+    tool_name: "trichat.message_post",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => trichatMessagePost(storage, input),
+  })
+);
+
+registerTool("trichat.timeline", "Read ordered messages for a tri-chat thread.", trichatTimelineSchema, (input) =>
+  trichatTimeline(storage, input)
+);
+
+registerTool("trichat.retention", "Apply retention policy to old tri-chat messages.", trichatRetentionSchema, (input) =>
+  runIdempotentMutation({
+    storage,
+    tool_name: "trichat.retention",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => trichatRetention(storage, input),
+  })
 );
 
 registerTool(

@@ -20,7 +20,10 @@ Anamnesis is designed as a "Shared Apartment" for agents. Different clients and 
 - Interval-based Imprint snapshot daemon (`imprint.auto_snapshot`)
 - Local inbox queue + worker daemon for unprompted workload execution (`data/imprint/inbox`, `imprint.inbox.enqueue`)
 - Durable task orchestration with leases (`tasks`, `task_events`, `task_leases`, `task.*`)
+- Task reliability summary surface (`task.summary`) for live queue/lease visibility
 - Failed-task retry daemon with deterministic backoff (`task.auto_retry`)
+- Durable tri-chat message bus (`trichat.thread_*`, `trichat.message_post`, `trichat.timeline`)
+- Tri-chat retention controls to keep message history bounded (`trichat.retention`)
 - Launchd auto-start support for MCP HTTP server + Imprint auto-snapshot
 - Agent on/off switch (`scripts/agents_switch.sh`) for start/stop/status control
 - ADR creation helper (`adr.create`) writing to `./docs/adrs/`
@@ -35,6 +38,19 @@ Anamnesis is designed as a "Shared Apartment" for agents. Different clients and 
 npm ci
 npm run build
 npm run start:stdio
+```
+
+Start TriChat (STDIO-backed MCP calls):
+
+```bash
+npm run trichat
+```
+
+Start TriChat against a live local HTTP MCP server:
+
+```bash
+npm run start:http
+npm run trichat:http
 ```
 
 ## Configuration
@@ -149,10 +165,68 @@ Switch mapping:
 - Use `imprint.inbox.enqueue` (or `npm run inbox:enqueue`) to submit background workloads.
 - Use `imprint.inbox.list` to inspect backlog and task outcomes.
 - Use `task.create`, `task.list`, and `task.claim` for durable queue orchestration.
+- Use `task.summary` for live reliability counts, running lease owners, and latest failure context.
 - Use `task.timeline` to inspect the exact event trail in `task_events`.
 - Use `task.heartbeat`, `task.complete`, `task.fail`, and `task.retry` for lease-aware lifecycle control.
 - Use `task.auto_retry` (`status`, `run_once`, `start`, `stop`) to requeue failed tasks with backoff.
+- Use `trichat.thread_open` / `trichat.thread_list` / `trichat.thread_get` to manage persistent tri-chat threads.
+- Use `trichat.message_post` and `trichat.timeline` to keep user/agent conversation state durable across restarts.
+- Use `trichat.retention` (`dry_run` first) to prune old message-bus history when threads grow large.
 - Run `./scripts/mvp_smoke.sh` before handoff to verify end-to-end health (default `stdio`, optional `http`).
+
+## TriChat
+
+TriChat provides one terminal orchestrator that fans one prompt out to `codex`, `cursor`, and `local-imprint`, writes every turn into the durable message bus, and routes execution into durable tasks.
+
+Run:
+
+```bash
+python3 ./scripts/trichat.py --resume-latest --panel-on-start
+```
+
+Bridge mode (optional):
+
+- Set `TRICHAT_CODEX_CMD` and/or `TRICHAT_CURSOR_CMD` to command adapters that read JSON from stdin and print response text or `{"content":"..."}` JSON.
+- If bridge commands are not configured (or fail), TriChat falls back to local Ollama adapters so all three channels continue responding.
+
+Useful commands in TriChat:
+
+- `/plan`, `/propose`, `/agent <id> <msg>`, `/huddle <topic>`
+- `/execute <agent> [objective]` (routes into `task.create`)
+- `/gate status|open|allowlist|approval`
+- `/gate allowlist <agent1,agent2,...>`
+- `/gate phrase <text>` (approval mode phrase)
+- `/panel`, `/tasks`, `/timeline <task_id>`, `/retry ...`
+- `/thread list|new|use|archive`
+- `/retention [days] [apply] [all]`
+
+`/execute` policy modes:
+
+- `open` (default): fully unconstrained routing to `task.create`.
+- `allowlist`: only allow `/execute` from configured agent IDs.
+- `approval`: require interactive operator confirmation before `task.create`.
+
+Configure gate mode at startup:
+
+```bash
+python3 ./scripts/trichat.py --execute-gate-mode open
+python3 ./scripts/trichat.py --execute-gate-mode allowlist --execute-allow-agents codex,local-imprint
+python3 ./scripts/trichat.py --execute-gate-mode approval --execute-approval-phrase approve
+```
+
+TriChat operational smoke check:
+
+```bash
+npm run trichat:smoke
+```
+
+Run smoke against a live local HTTP server:
+
+```bash
+TRICHAT_SMOKE_TRANSPORT=http \
+MCP_HTTP_BEARER_TOKEN="change-me" \
+npm run trichat:smoke
+```
 
 Suggested loop for multi-agent collaboration:
 

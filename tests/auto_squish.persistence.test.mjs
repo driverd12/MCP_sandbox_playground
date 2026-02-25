@@ -31,7 +31,7 @@ test("transcript.auto_squish persists daemon state across server restarts", asyn
 
       const storageHealth = await callTool(sessionOne.client, "health.storage", {});
       assert.equal(typeof storageHealth.schema_version, "number");
-      assert.ok(storageHealth.schema_version >= 3);
+      assert.ok(storageHealth.schema_version >= 5);
       assert.equal(typeof storageHealth.table_counts.schema_migrations, "number");
       assert.equal(typeof storageHealth.table_counts.daemon_configs, "number");
     } finally {

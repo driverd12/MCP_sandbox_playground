@@ -20,7 +20,10 @@
     "launchd:uninstall": "./scripts/launchd_uninstall.sh",
     "agents:on": "./scripts/agents_switch.sh on",
     "agents:off": "./scripts/agents_switch.sh off",
-    "agents:status": "./scripts/agents_switch.sh status"
+    "agents:status": "./scripts/agents_switch.sh status",
+    "trichat": "python3 ./scripts/trichat.py",
+    "trichat:http": "TRICHAT_MCP_TRANSPORT=http python3 ./scripts/trichat.py --transport http --url http://127.0.0.1:8787/ --origin http://127.0.0.1 --resume-latest --panel-on-start",
+    "trichat:smoke": "./scripts/trichat_smoke.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",

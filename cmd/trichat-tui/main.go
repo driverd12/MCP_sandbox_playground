@@ -258,6 +258,47 @@ type triChatSummaryResp struct {
 	MessageCount int `json:"message_count"`
 }
 
+type triChatConsensusAnswer struct {
+	AgentID       string   `json:"agent_id"`
+	MessageID     string   `json:"message_id"`
+	CreatedAt     string   `json:"created_at"`
+	AnswerExcerpt string   `json:"answer_excerpt"`
+	Mode          string   `json:"mode"`
+	Normalized    string   `json:"normalized"`
+	NumericValue  *float64 `json:"numeric_value"`
+}
+
+type triChatConsensusTurn struct {
+	UserMessageID      string                   `json:"user_message_id"`
+	UserCreatedAt      string                   `json:"user_created_at"`
+	UserExcerpt        string                   `json:"user_excerpt"`
+	Status             string                   `json:"status"`
+	ResponseCount      int                      `json:"response_count"`
+	RequiredCount      int                      `json:"required_count"`
+	AgentsResponded    []string                 `json:"agents_responded"`
+	MajorityAnswer     *string                  `json:"majority_answer"`
+	DisagreementAgents []string                 `json:"disagreement_agents"`
+	Answers            []triChatConsensusAnswer `json:"answers"`
+}
+
+type triChatConsensusResp struct {
+	Mode               string                 `json:"mode"`
+	ThreadID           string                 `json:"thread_id"`
+	AgentIDs           []string               `json:"agent_ids"`
+	MinAgents          int                    `json:"min_agents"`
+	TurnsTotal         int                    `json:"turns_total"`
+	TurnsWithAny       int                    `json:"turns_with_any_response"`
+	AnalyzedTurns      int                    `json:"analyzed_turns"`
+	ConsensusTurns     int                    `json:"consensus_turns"`
+	DisagreementTurns  int                    `json:"disagreement_turns"`
+	IncompleteTurns    int                    `json:"incomplete_turns"`
+	DisagreementRate   *float64               `json:"disagreement_rate"`
+	Flagged            bool                   `json:"flagged"`
+	LatestTurn         *triChatConsensusTurn  `json:"latest_turn"`
+	LatestDisagreement *triChatConsensusTurn  `json:"latest_disagreement"`
+	RecentTurns        []triChatConsensusTurn `json:"recent_turns"`
+}
+
 type adapterTelemetryStatusResp struct {
 	Summary struct {
 		TotalChannels      int    `json:"total_channels"`
@@ -324,6 +365,7 @@ type reliabilitySnapshot struct {
 	transcriptSquish daemonStatusResp
 	triRetention     daemonStatusResp
 	triSummary       triChatSummaryResp
+	consensus        triChatConsensusResp
 	adapterTelemetry adapterTelemetryStatusResp
 	busStatus        triChatBusStatusResp
 	updatedAt        time.Time
@@ -1283,6 +1325,7 @@ func (m model) initCmd() tea.Cmd {
 			"trichat.timeline",
 			"trichat.bus",
 			"trichat.summary",
+			"trichat.consensus",
 			"trichat.adapter_telemetry",
 			"task.summary",
 			"task.auto_retry",
@@ -1451,6 +1494,14 @@ func (m model) refreshCmd() tea.Cmd {
 		triSummaryPayload, err := caller.callTool("trichat.summary", map[string]any{"busiest_limit": 5})
 		if err == nil {
 			reliability.triSummary, _ = decodeAny[triChatSummaryResp](triSummaryPayload)
+		}
+		consensusPayload, err := caller.callTool("trichat.consensus", map[string]any{
+			"thread_id":         threadID,
+			"limit":             240,
+			"recent_turn_limit": 6,
+		})
+		if err == nil {
+			reliability.consensus, _ = decodeAny[triChatConsensusResp](consensusPayload)
 		}
 		busStatusPayload, err := caller.callTool("trichat.bus", map[string]any{"action": "status"})
 		if err == nil {
@@ -2926,6 +2977,21 @@ func (m *model) renderSidebar() string {
 		onOff(r.taskAutoRetry.Running), onOff(r.transcriptSquish.Running), onOff(r.triRetention.Running)))
 	b.WriteString(fmt.Sprintf("TriChat  threads=%d messages=%d\n",
 		r.triSummary.ThreadCounts.Total, r.triSummary.MessageCount))
+	latestConsensusStatus := "n/a"
+	if r.consensus.LatestTurn != nil && strings.TrimSpace(r.consensus.LatestTurn.Status) != "" {
+		latestConsensusStatus = r.consensus.LatestTurn.Status
+	}
+	consensusMode := strings.TrimSpace(r.consensus.Mode)
+	if consensusMode == "" {
+		consensusMode = "basic"
+	}
+	b.WriteString(fmt.Sprintf("Consensus  mode=%s latest=%s agree=%d disagree=%d incomplete=%d\n",
+		consensusMode,
+		latestConsensusStatus,
+		r.consensus.ConsensusTurns,
+		r.consensus.DisagreementTurns,
+		r.consensus.IncompleteTurns,
+	))
 	b.WriteString(fmt.Sprintf("Bus  running=%s clients=%d subs=%d events=%d\n",
 		onOff(r.busStatus.Running),
 		r.busStatus.ClientCount,
@@ -2944,6 +3010,10 @@ func (m *model) renderSidebar() string {
 	}
 	if strings.TrimSpace(r.adapterTelemetry.Summary.NewestTripOpenedAt) != "" {
 		b.WriteString("Last trip  " + r.adapterTelemetry.Summary.NewestTripOpenedAt + "\n")
+	}
+	if r.consensus.Flagged && r.consensus.LatestTurn != nil {
+		userText := compactSingleLine(r.consensus.LatestTurn.UserExcerpt, 70)
+		b.WriteString("Consensus alert  " + userText + "\n")
 	}
 
 	if len(r.taskSummary.Running) > 0 {
@@ -2972,6 +3042,30 @@ func (m *model) renderSidebar() string {
 func (m *model) renderReliabilityDetail() string {
 	var b strings.Builder
 	b.WriteString(m.renderSidebar())
+	b.WriteString("\n\nConsensus detail:\n")
+	if m.reliability.consensus.LatestTurn == nil {
+		b.WriteString("(no consensus turns yet)")
+	} else {
+		latest := m.reliability.consensus.LatestTurn
+		b.WriteString(fmt.Sprintf("- latest status: %s (%d/%d responses)\n",
+			nullCoalesce(latest.Status, "n/a"),
+			latest.ResponseCount,
+			latest.RequiredCount,
+		))
+		if m.reliability.consensus.Flagged {
+			b.WriteString(fmt.Sprintf("- disagreement agents: %s\n",
+				nullCoalesce(strings.Join(latest.DisagreementAgents, ","), "n/a"),
+			))
+		}
+		for _, answer := range latest.Answers {
+			line := fmt.Sprintf("- %s [%s] %s",
+				answer.AgentID,
+				answer.Mode,
+				compactSingleLine(answer.AnswerExcerpt, 90),
+			)
+			b.WriteString(line + "\n")
+		}
+	}
 	b.WriteString("\n\nBus detail:\n")
 	b.WriteString(fmt.Sprintf("- socket: %s\n", nullCoalesce(m.reliability.busStatus.SocketPath, "(unset)")))
 	b.WriteString(fmt.Sprintf("- io: in=%d out=%d delivered=%d\n",
@@ -3081,6 +3175,7 @@ func (m *model) renderHelp() string {
 		"- Timeline scroll: PgUp/PgDn, Up/Down (input empty), +/- (or Ctrl+U/Ctrl+D)",
 		"- Ctrl+C: quit",
 		"- Chat timeline auto-hides system chatter and compacts long responses",
+		"- Reliability sidebar includes consensus status and disagreement alerts",
 		"- Live Bus Strip shows real-time adapter events (socket stream) before timeline persistence",
 		"",
 		"Slash Commands",
@@ -3101,7 +3196,7 @@ func (m *model) renderHelp() string {
 		"Visual Theme",
 		"- Neon cotton-candy palette (pink/blue/mint)",
 		"- Framed split panes with live timeline and reliability telemetry",
-		"- Bridge wrappers auto-load from ./bridges for codex/cursor (override with --codex-command / --cursor-command)",
+		"- Bridge wrappers auto-load from ./bridges for codex/cursor/local-imprint (override with --codex-command / --cursor-command / --imprint-command)",
 	}
 	return m.theme.helpText.Render(strings.Join(lines, "\n"))
 }

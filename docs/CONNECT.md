@@ -231,11 +231,13 @@ Adapter contract:
 TriChat verifies required `trichat.*` + `task.*` tooling at startup and retries MCP tool calls on transient failures.
 Each adapter channel (bridge command + Ollama fallback) uses per-agent circuit breakers with recovery windows, so transient bridge/model failures degrade gracefully without stalling fanout turns.
 Circuit state and breaker events can be persisted via `trichat.adapter_telemetry` for restart-safe reliability diagnostics.
+Consensus analysis is available via `trichat.consensus`, allowing reliability views to auto-flag cross-agent disagreements per user turn.
 The TUI exposes the same runtime path with an interactive split-pane UX (timeline, slash input, reliability sidebar, and settings menu).
 
 TriChat runtime commands for housekeeping:
 
 - `/adapters status|reset [all|codex|cursor|local-imprint]` for adapter breaker inspection/reset.
+- `/consensus` for latest cross-agent agreement/disagreement breakdown on the active thread.
 - `/retention [days] [apply] [all]` for one-shot pruning (`dry_run` by default).
 - `/retentiond status|start|stop|run_once` for daemonized tri-chat retention.
 

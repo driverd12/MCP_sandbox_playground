@@ -4,6 +4,7 @@ import { mutationSchema, runIdempotentMutation } from "./mutation.js";
 
 const threadStatusSchema = z.enum(["active", "archived"]);
 const adapterChannelSchema = z.enum(["command", "model"]);
+const DEFAULT_CONSENSUS_AGENT_IDS = ["codex", "cursor", "local-imprint"] as const;
 
 export const trichatThreadOpenSchema = z.object({
   mutation: mutationSchema,
@@ -50,6 +51,14 @@ export const trichatRetentionSchema = z.object({
 
 export const trichatSummarySchema = z.object({
   busiest_limit: z.number().int().min(1).max(200).optional(),
+});
+
+export const trichatConsensusSchema = z.object({
+  thread_id: z.string().min(1),
+  limit: z.number().int().min(1).max(2000).optional(),
+  agent_ids: z.array(z.string().min(1)).min(1).max(12).optional(),
+  min_agents: z.number().int().min(2).max(12).optional(),
+  recent_turn_limit: z.number().int().min(1).max(50).optional(),
 });
 
 const trichatAdapterStateSchema = z.object({
@@ -271,6 +280,97 @@ export function trichatSummary(storage: Storage, input: z.infer<typeof trichatSu
   };
 }
 
+export function trichatConsensus(storage: Storage, input: z.infer<typeof trichatConsensusSchema>) {
+  const timeline = storage.getTriChatTimeline({
+    thread_id: input.thread_id,
+    limit: input.limit ?? 240,
+  });
+  const agentIds = normalizeConsensusAgentIds(input.agent_ids);
+  const agentSet = new Set(agentIds);
+  const minAgents = Math.max(2, Math.min(input.min_agents ?? agentIds.length, agentIds.length));
+  const recentTurnLimit = input.recent_turn_limit ?? 8;
+
+  const turnsByUserMessageId = new Map<
+    string,
+    {
+      user_message_id: string;
+      user_created_at: string;
+      user_excerpt: string;
+      responses: Map<string, (typeof timeline)[number]>;
+    }
+  >();
+  const orderedTurns: Array<{
+    user_message_id: string;
+    user_created_at: string;
+    user_excerpt: string;
+    responses: Map<string, (typeof timeline)[number]>;
+  }> = [];
+
+  for (const message of timeline) {
+    if (message.role !== "user") {
+      continue;
+    }
+    const turn = {
+      user_message_id: message.message_id,
+      user_created_at: message.created_at,
+      user_excerpt: compactConsensusText(message.content, 160),
+      responses: new Map<string, (typeof timeline)[number]>(),
+    };
+    turnsByUserMessageId.set(message.message_id, turn);
+    orderedTurns.push(turn);
+  }
+
+  for (const message of timeline) {
+    if (message.role !== "assistant") {
+      continue;
+    }
+    const normalizedAgentId = normalizeConsensusAgentId(message.agent_id);
+    if (!normalizedAgentId || !agentSet.has(normalizedAgentId)) {
+      continue;
+    }
+    const replyToId = message.reply_to_message_id?.trim();
+    if (!replyToId) {
+      continue;
+    }
+    const turn = turnsByUserMessageId.get(replyToId);
+    if (!turn) {
+      continue;
+    }
+    turn.responses.set(normalizedAgentId, message);
+  }
+
+  const evaluatedTurns = orderedTurns
+    .map((turn) => evaluateConsensusTurn(turn, agentIds, minAgents))
+    .filter((turn) => turn.response_count > 0);
+
+  const consensusTurns = evaluatedTurns.filter((turn) => turn.status === "consensus").length;
+  const disagreementTurns = evaluatedTurns.filter((turn) => turn.status === "disagreement").length;
+  const incompleteTurns = evaluatedTurns.filter((turn) => turn.status === "incomplete").length;
+  const analyzedTurns = consensusTurns + disagreementTurns;
+  const latestTurn = evaluatedTurns.length ? evaluatedTurns[evaluatedTurns.length - 1] : null;
+  const latestDisagreement =
+    [...evaluatedTurns].reverse().find((turn) => turn.status === "disagreement") ?? null;
+
+  return {
+    generated_at: new Date().toISOString(),
+    mode: "basic",
+    thread_id: input.thread_id,
+    agent_ids: agentIds,
+    min_agents: minAgents,
+    turns_total: orderedTurns.length,
+    turns_with_any_response: evaluatedTurns.length,
+    analyzed_turns: analyzedTurns,
+    consensus_turns: consensusTurns,
+    disagreement_turns: disagreementTurns,
+    incomplete_turns: incompleteTurns,
+    disagreement_rate: analyzedTurns > 0 ? Number((disagreementTurns / analyzedTurns).toFixed(4)) : null,
+    flagged: latestTurn?.status === "disagreement",
+    latest_turn: latestTurn,
+    latest_disagreement: latestDisagreement,
+    recent_turns: evaluatedTurns.slice(-recentTurnLimit),
+  };
+}
+
 export function trichatAdapterTelemetry(storage: Storage, input: z.infer<typeof trichatAdapterTelemetrySchema>) {
   if (input.action === "status") {
     return buildAdapterTelemetryStatus(storage, input);
@@ -462,6 +562,200 @@ function buildAdapterTelemetryStatus(
     recent_events: recentEvents,
     last_open_events: lastOpenEvents,
   };
+}
+
+function evaluateConsensusTurn(
+  turn: {
+    user_message_id: string;
+    user_created_at: string;
+    user_excerpt: string;
+    responses: Map<string, TriChatTimelineMessage>;
+  },
+  agentIds: string[],
+  minAgents: number
+) {
+  const answers = agentIds
+    .map((agentId) => {
+      const message = turn.responses.get(agentId);
+      if (!message) {
+        return null;
+      }
+      const canonical = canonicalizeConsensusAnswer(message.content);
+      return {
+        agent_id: agentId,
+        message_id: message.message_id,
+        created_at: message.created_at,
+        answer_excerpt: compactConsensusText(message.content, 140),
+        mode: canonical.mode,
+        normalized: canonical.normalized,
+        numeric_value: canonical.numeric_value,
+        canonical: canonical.canonical,
+      };
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+  const responseCount = answers.length;
+  const groups = new Map<string, { canonical: string; normalized: string; agents: string[] }>();
+  for (const answer of answers) {
+    const existing = groups.get(answer.canonical);
+    if (existing) {
+      existing.agents.push(answer.agent_id);
+      continue;
+    }
+    groups.set(answer.canonical, {
+      canonical: answer.canonical,
+      normalized: answer.normalized,
+      agents: [answer.agent_id],
+    });
+  }
+  const rankedGroups = Array.from(groups.values()).sort((left, right) => {
+    if (right.agents.length !== left.agents.length) {
+      return right.agents.length - left.agents.length;
+    }
+    return left.canonical.localeCompare(right.canonical);
+  });
+  const majorityGroup = rankedGroups[0] ?? null;
+  const disagreementAgents = majorityGroup
+    ? answers
+        .filter((answer) => answer.canonical !== majorityGroup.canonical)
+        .map((answer) => answer.agent_id)
+    : [];
+
+  let status: "incomplete" | "consensus" | "disagreement" = "incomplete";
+  if (responseCount >= minAgents) {
+    status = groups.size <= 1 ? "consensus" : "disagreement";
+  }
+
+  return {
+    user_message_id: turn.user_message_id,
+    user_created_at: turn.user_created_at,
+    user_excerpt: turn.user_excerpt,
+    status,
+    response_count: responseCount,
+    required_count: minAgents,
+    agents_responded: answers.map((answer) => answer.agent_id),
+    majority_answer: majorityGroup?.normalized ?? null,
+    disagreement_agents: disagreementAgents,
+    answers: answers.map((answer) => ({
+      agent_id: answer.agent_id,
+      message_id: answer.message_id,
+      created_at: answer.created_at,
+      answer_excerpt: answer.answer_excerpt,
+      mode: answer.mode,
+      normalized: answer.normalized,
+      numeric_value: answer.numeric_value,
+    })),
+  };
+}
+
+type TriChatTimelineMessage = ReturnType<Storage["getTriChatTimeline"]>[number];
+
+function normalizeConsensusAgentIds(agentIds: readonly string[] | undefined): string[] {
+  const values = (agentIds?.length ? agentIds : DEFAULT_CONSENSUS_AGENT_IDS).map((agentId) =>
+    normalizeConsensusAgentId(agentId)
+  );
+  const deduped = new Set<string>();
+  for (const value of values) {
+    if (value) {
+      deduped.add(value);
+    }
+  }
+  if (deduped.size > 0) {
+    return Array.from(deduped);
+  }
+  return [...DEFAULT_CONSENSUS_AGENT_IDS];
+}
+
+function normalizeConsensusAgentId(agentId: string | null | undefined): string {
+  return String(agentId ?? "")
+    .trim()
+    .toLowerCase();
+}
+
+function compactConsensusText(value: string, limit: number): string {
+  const compact = String(value ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (compact.length <= limit) {
+    return compact;
+  }
+  if (limit <= 3) {
+    return compact.slice(0, limit);
+  }
+  return `${compact.slice(0, limit - 3)}...`;
+}
+
+function canonicalizeConsensusAnswer(value: string): {
+  mode: "numeric" | "text";
+  normalized: string;
+  numeric_value: number | null;
+  canonical: string;
+} {
+  const normalized = normalizeConsensusText(value);
+  const numericValue = extractConsensusNumericValue(normalized);
+  if (numericValue !== null) {
+    const canonicalNumber = Number(numericValue.toPrecision(12));
+    return {
+      mode: "numeric",
+      normalized: canonicalNumber.toString(),
+      numeric_value: canonicalNumber,
+      canonical: `n:${canonicalNumber.toString()}`,
+    };
+  }
+  return {
+    mode: "text",
+    normalized,
+    numeric_value: null,
+    canonical: `t:${normalized}`,
+  };
+}
+
+function normalizeConsensusText(value: string): string {
+  return String(value ?? "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/[`*_>#~]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+    .replace(/^(answer|result|final answer)\s*[:=-]\s*/i, "")
+    .trim();
+}
+
+function extractConsensusNumericValue(normalized: string): number | null {
+  const numericLiteral = /[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?/gi;
+
+  if (/^[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?$/i.test(normalized)) {
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const answerMatch = normalized.match(
+    /(?:answer|result|final answer)\s*[:=-]\s*([-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?)/i
+  );
+  if (answerMatch?.[1]) {
+    const parsed = Number(answerMatch[1]);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  const eqMatches = Array.from(normalized.matchAll(/=\s*([-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?)/gi));
+  if (eqMatches.length > 0) {
+    const parsed = Number(eqMatches[eqMatches.length - 1]?.[1]);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  const numbers = Array.from(normalized.matchAll(numericLiteral));
+  if (numbers.length === 0) {
+    return null;
+  }
+  const parsed = Number(numbers[numbers.length - 1]?.[0]);
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return parsed;
 }
 
 function getAutoRetentionStatus() {

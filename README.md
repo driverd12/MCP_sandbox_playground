@@ -24,6 +24,7 @@ Local-first is non-negotiable: everything lives on your machine, centered on `./
 - Task queue with leases and full event history (`task.*`, `task.timeline`, `task.summary`)
 - Retry daemon with deterministic backoff (`task.auto_retry`)
 - Adapter circuit breakers with persisted telemetry (`trichat.adapter_telemetry`)
+- Consensus mode for cross-agent agreement/disagreement detection (`trichat.consensus`)
 - Imprint continuity (`imprint.profile_set`, `imprint.snapshot`, `imprint.bootstrap`)
 - Inbox worker for autonomous execution (`imprint.inbox.*`, `agent_loop.py`)
 - ADR support (`adr.create`) writing to `./docs/adrs/` and SQLite
@@ -91,8 +92,10 @@ TriChat TUI gives you:
 - Live timeline pane (durable thread history)
 - Input bar for natural chat + optional slash commands
 - Reliability sidebar (task counts, daemons, lease owners, adapter trips)
+- Consensus status line with auto-flag on disagreement (latest tri-agent turn)
 - Settings panel for fanout target, gate mode, failover timeouts, and circuit breaker tuning
 - Help panel with command reference
+- Optional `/consensus` command in CLI mode for explicit turn-by-turn agreement inspection
 
 Theme direction:
 
@@ -201,6 +204,7 @@ TriChat bus and telemetry:
 - `trichat.bus` (`status|start|stop|publish|tail`)
 - `trichat.timeline`
 - `trichat.summary`
+- `trichat.consensus`
 - `trichat.retention`
 - `trichat.auto_retention`
 - `trichat.adapter_telemetry`

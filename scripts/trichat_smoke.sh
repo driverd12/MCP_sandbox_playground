@@ -166,6 +166,18 @@ try {
     }
   }
 
+  const consensus = await callTool("trichat.consensus", {
+    thread_id: threadId,
+    limit: 80,
+    recent_turn_limit: 5,
+  });
+  if (typeof consensus?.mode !== "string") {
+    throw new Error("trichat.consensus missing mode");
+  }
+  if (typeof consensus?.disagreement_turns !== "number") {
+    throw new Error("trichat.consensus missing disagreement_turns");
+  }
+
   const busStatus = await callTool("trichat.bus", {
     action: "status",
   });
@@ -273,6 +285,8 @@ try {
         adapter_channels: adapterTelemetry.summary.total_channels,
         adapter_open_channels: adapterTelemetry.summary.open_channels,
         router_message_id: routerMessage?.message?.message_id ?? null,
+        consensus_mode: consensus.mode,
+        consensus_latest: consensus.latest_turn?.status ?? null,
         smoke_keep_active: keepActive,
       },
       null,

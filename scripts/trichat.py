@@ -921,6 +921,7 @@ class TriChatApp:
             "trichat.message_post",
             "trichat.timeline",
             "trichat.bus",
+            "trichat.consensus",
             "trichat.retention",
             "trichat.summary",
             "trichat.auto_retention",
@@ -962,6 +963,9 @@ class TriChatApp:
             return True
         if command == "/panel":
             self.render_reliability_panel()
+            return True
+        if command == "/consensus":
+            self.render_consensus_status()
             return True
         if command == "/adapters":
             self.route_adapters(tail)
@@ -1849,6 +1853,14 @@ class TriChatApp:
             auto_retry = self.mcp.call_tool("task.auto_retry", {"action": "status"})
             auto_squish = self.mcp.call_tool("transcript.auto_squish", {"action": "status"})
             trichat_summary = self.mcp.call_tool("trichat.summary", {"busiest_limit": 5})
+            consensus = self.mcp.call_tool(
+                "trichat.consensus",
+                {
+                    "thread_id": self.thread_id,
+                    "limit": 240,
+                    "recent_turn_limit": 6,
+                },
+            )
             trichat_retention = self.mcp.call_tool("trichat.auto_retention", {"action": "status"})
             adapter_persistent = self.mcp.call_tool(
                 "trichat.adapter_telemetry",
@@ -1863,6 +1875,13 @@ class TriChatApp:
         last_failed = summary.get("last_failed") if isinstance(summary, dict) else None
         thread_counts = trichat_summary.get("thread_counts", {}) if isinstance(trichat_summary, dict) else {}
         message_count = trichat_summary.get("message_count", 0) if isinstance(trichat_summary, dict) else 0
+        latest_turn = consensus.get("latest_turn", {}) if isinstance(consensus, dict) else {}
+        latest_status = latest_turn.get("status", "n/a") if isinstance(latest_turn, dict) else "n/a"
+        consensus_mode = consensus.get("mode", "basic") if isinstance(consensus, dict) else "basic"
+        consensus_disagree = int(consensus.get("disagreement_turns", 0)) if isinstance(consensus, dict) else 0
+        consensus_agree = int(consensus.get("consensus_turns", 0)) if isinstance(consensus, dict) else 0
+        consensus_incomplete = int(consensus.get("incomplete_turns", 0)) if isinstance(consensus, dict) else 0
+        consensus_flagged = bool(consensus.get("flagged")) if isinstance(consensus, dict) else False
         persistent_summary = adapter_persistent.get("summary", {}) if isinstance(adapter_persistent, dict) else {}
 
         print("")
@@ -1886,6 +1905,11 @@ class TriChatApp:
             f"threads(active={thread_counts.get('active', 0)}, archived={thread_counts.get('archived', 0)}, "
             f"total={thread_counts.get('total', 0)})  "
             f"messages={message_count}"
+        )
+        print(
+            "Consensus  "
+            f"mode={consensus_mode}  latest={latest_status}  "
+            f"agree={consensus_agree} disagree={consensus_disagree} incomplete={consensus_incomplete}"
         )
         adapter_rows = self._adapter_status_rows()
         command_open_count = sum(1 for row in adapter_rows if row["command"]["open"])
@@ -1916,6 +1940,14 @@ class TriChatApp:
             )
         else:
             print("Last failure  none")
+        if consensus_flagged:
+            disagreement_agents = latest_turn.get("disagreement_agents", []) if isinstance(latest_turn, dict) else []
+            user_excerpt = compact_single_line(str(latest_turn.get("user_excerpt", "")), 90) if isinstance(latest_turn, dict) else ""
+            print(
+                "Consensus alert  "
+                f"disagreement_agents={','.join(str(agent) for agent in disagreement_agents) or 'n/a'}  "
+                f"user='{user_excerpt}'"
+            )
 
         print("-" * 72)
         if not running:
@@ -1928,6 +1960,46 @@ class TriChatApp:
             expiry = row.get("lease_expires_at") or "n/a"
             objective = compact_single_line(str(row.get("objective", "")), 64)
             print(f"- {task_id} owner={owner} lease_expires_at={expiry} :: {objective}")
+
+    def render_consensus_status(self) -> None:
+        try:
+            consensus = self.mcp.call_tool(
+                "trichat.consensus",
+                {
+                    "thread_id": self.thread_id,
+                    "limit": 240,
+                    "recent_turn_limit": 8,
+                },
+            )
+        except Exception as error:  # noqa: BLE001
+            print(f"Consensus status unavailable: {error}")
+            return
+        print("")
+        print("Consensus Status")
+        print("-" * 72)
+        if not isinstance(consensus, dict):
+            print(consensus)
+            return
+        latest = consensus.get("latest_turn", {})
+        print(
+            "summary  "
+            f"mode={consensus.get('mode', 'basic')} "
+            f"latest={latest.get('status', 'n/a') if isinstance(latest, dict) else 'n/a'} "
+            f"agree={consensus.get('consensus_turns', 0)} "
+            f"disagree={consensus.get('disagreement_turns', 0)} "
+            f"incomplete={consensus.get('incomplete_turns', 0)}"
+        )
+        if isinstance(latest, dict):
+            print(f"user  {compact_single_line(str(latest.get('user_excerpt', '')), 120)}")
+            answers = latest.get("answers", [])
+            if isinstance(answers, list):
+                for answer in answers:
+                    if not isinstance(answer, dict):
+                        continue
+                    print(
+                        f"- {answer.get('agent_id', '?')} [{answer.get('mode', '?')}] "
+                        f"{compact_single_line(str(answer.get('answer_excerpt', '')), 100)}"
+                    )
 
     def render_thread_timeline(self, limit: int = 30, compact: bool = False) -> None:
         timeline = self.get_timeline(limit=limit)
@@ -2050,6 +2122,7 @@ class TriChatApp:
         print("/help                              Show this help")
         print("/history [limit]                   Show thread timeline")
         print("/panel                             Show reliability panel")
+        print("/consensus                         Show cross-agent consensus/disagreement status")
         print("/adapters [status|reset ...]       Show/reset adapter circuit state")
         print("/plan <request>                    Fanout with planning framing")
         print("/propose <request>                 Fanout with proposal framing")

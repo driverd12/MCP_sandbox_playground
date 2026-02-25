@@ -55,6 +55,7 @@ const EXPECTED_TOOLS = [
   "task.auto_retry",
   "trichat.adapter_telemetry",
   "trichat.bus",
+  "trichat.consensus",
   "trichat.message_post",
   "trichat.auto_retention",
   "trichat.retention",
@@ -507,6 +508,57 @@ test("MCP v0.2 integration and safety invariants", async () => {
         (message) => message.reply_to_message_id === triChatCursorMessage.message.message_id
       )
     );
+
+    const triChatConsensusUserMessage = await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-consensus-user", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      agent_id: "user",
+      role: "user",
+      content: `consensus test expression ${testId}: 2 + 3 * 4`,
+    });
+    assert.equal(triChatConsensusUserMessage.ok, true);
+    assert.ok(triChatConsensusUserMessage.message.message_id);
+
+    await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-consensus-codex", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      agent_id: "codex",
+      role: "assistant",
+      content: "14",
+      reply_to_message_id: triChatConsensusUserMessage.message.message_id,
+    });
+
+    await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-consensus-cursor", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      agent_id: "cursor",
+      role: "assistant",
+      content: "14",
+      reply_to_message_id: triChatConsensusUserMessage.message.message_id,
+    });
+
+    await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-consensus-imprint", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      agent_id: "local-imprint",
+      role: "assistant",
+      content: "20",
+      reply_to_message_id: triChatConsensusUserMessage.message.message_id,
+    });
+
+    const triChatConsensus = await callTool(client, "trichat.consensus", {
+      thread_id: triChatThreadId,
+      limit: 120,
+      recent_turn_limit: 5,
+    });
+    assert.equal(triChatConsensus.mode, "basic");
+    assert.ok(triChatConsensus.turns_with_any_response >= 1);
+    assert.ok(triChatConsensus.disagreement_turns >= 1);
+    assert.equal(triChatConsensus.latest_turn.status, "disagreement");
+    assert.ok(Array.isArray(triChatConsensus.latest_turn.answers));
+    assert.ok(triChatConsensus.latest_turn.answers.length >= 3);
+    assert.ok(triChatConsensus.latest_turn.disagreement_agents.includes("local-imprint"));
+    assert.equal(triChatConsensus.flagged, true);
 
     const triChatBusStatus = await callTool(client, "trichat.bus", {
       action: "status",

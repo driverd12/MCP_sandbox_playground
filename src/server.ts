@@ -68,6 +68,8 @@ import {
 import {
   trichatAdapterTelemetry,
   trichatAdapterTelemetrySchema,
+  trichatConsensus,
+  trichatConsensusSchema,
   initializeTriChatAutoRetentionDaemon,
   trichatAutoRetentionControl,
   trichatAutoRetentionSchema,
@@ -475,6 +477,13 @@ registerTool("trichat.timeline", "Read ordered messages for a tri-chat thread.",
 
 registerTool("trichat.summary", "Summarize tri-chat thread/message bus state.", trichatSummarySchema, (input) =>
   trichatSummary(storage, input)
+);
+
+registerTool(
+  "trichat.consensus",
+  "Compare codex/cursor/local-imprint answers per user turn and flag disagreement.",
+  trichatConsensusSchema,
+  (input) => trichatConsensus(storage, input)
 );
 
 registerTool(

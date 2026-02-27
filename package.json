@@ -17,6 +17,7 @@
     "mvp:smoke": "./scripts/mvp_smoke.sh",
     "imprint:bootstrap": "./scripts/imprint_bootstrap.sh",
     "launchd:install": "./scripts/launchd_install.sh",
+    "launchd:install:reliability": "ANAMNESIS_TRICHAT_RELIABILITY_LOOP_ENABLED=true ./scripts/launchd_install.sh",
     "launchd:uninstall": "./scripts/launchd_uninstall.sh",
     "agents:on": "./scripts/agents_switch.sh on",
     "agents:off": "./scripts/agents_switch.sh off",
@@ -30,6 +31,12 @@
     "trichat:bus:tail": "python3 ./bridges/trichat_bus_client.py tail --limit 50",
     "trichat:bridges:doctor": "python3 ./bridges/bridge_doctor.py",
     "trichat:smoke": "./scripts/trichat_smoke.sh",
+    "trichat:dogfood": "./scripts/trichat_dogfood.sh",
+    "trichat:dogfood:smoke": "./scripts/trichat_dogfood_smoke.sh",
+    "trichat:reliability:run_once": "./scripts/trichat_reliability_run_once.sh",
+    "trichat:reliability:status": "./scripts/trichat_reliability_ctl.sh status",
+    "trichat:reliability:start": "./scripts/trichat_reliability_ctl.sh start",
+    "trichat:reliability:stop": "./scripts/trichat_reliability_ctl.sh stop",
     "imprint:math:smoke": "./scripts/imprint_math_smoke.sh"
   },
   "dependencies": {

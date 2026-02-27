@@ -13,11 +13,14 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from common import (
+    BRIDGE_PROTOCOL_VERSION,
     BridgeError,
     build_prompt,
     compact_single_line,
     emit_content,
+    emit_pong,
     emit_status,
+    is_ping,
     parse_bool_env,
     parse_int_env,
     publish_bus_event,
@@ -120,9 +123,24 @@ def run_self_test() -> int:
 
 def run_adapter() -> int:
     payload = read_payload()
+    request_id = str(payload.get("request_id") or "").strip()
+    agent_id = str(payload.get("agent_id") or "codex").strip() or "codex"
     thread_id = str(payload.get("thread_id") or "").strip()
     bus_enabled = parse_bool_env("TRICHAT_BRIDGE_BUS_EVENTS", True) and bool(thread_id)
     bus_warn = parse_bool_env("TRICHAT_BRIDGE_BUS_WARN", False)
+
+    if is_ping(payload):
+        emit_pong(
+            request_id=request_id,
+            agent_id=agent_id,
+            bridge_name="codex-bridge",
+            meta={
+                "adapter": "codex-bridge",
+                "binary": resolve_codex_binary(),
+                "protocol_version": BRIDGE_PROTOCOL_VERSION,
+            },
+        )
+        return 0
 
     def emit_bus(event_type: str, *, content: str = "", metadata: Dict[str, Any] | None = None) -> None:
         if not bus_enabled:
@@ -146,11 +164,14 @@ def run_adapter() -> int:
         emit_content(
             f"[dry-run] codex bridge received prompt: {compact_single_line(prompt, 160)}",
             meta={"adapter": "codex-bridge", "dry_run": True},
+            request_id=request_id,
+            agent_id=agent_id,
+            bridge_name="codex-bridge",
         )
         emit_bus(
             "adapter.turn.dry_run",
             content=compact_single_line(prompt, 180),
-            metadata={"adapter": "codex-bridge"},
+            metadata={"adapter": "codex-bridge", "request_id": request_id},
         )
         return 0
 
@@ -174,6 +195,7 @@ def run_adapter() -> int:
                 "adapter": "codex-bridge",
                 "workspace": str(workspace),
                 "timeout_seconds": timeout_seconds,
+                "request_id": request_id,
             },
         )
         proc = run_command(
@@ -193,6 +215,7 @@ def run_adapter() -> int:
                     "return_code": proc.returncode,
                     "stderr": stderr_tail,
                     "stdout": stdout_tail,
+                    "request_id": request_id,
                 },
             )
             raise BridgeError(
@@ -214,6 +237,9 @@ def run_adapter() -> int:
                 "timeout_seconds": timeout_seconds,
             },
             max_chars=max_chars,
+            request_id=request_id,
+            agent_id=agent_id,
+            bridge_name="codex-bridge",
         )
         emit_bus(
             "adapter.turn.succeeded",
@@ -223,6 +249,7 @@ def run_adapter() -> int:
                 "workspace": str(workspace),
                 "timeout_seconds": timeout_seconds,
                 "output_chars": len(content),
+                "request_id": request_id,
             },
         )
         return 0

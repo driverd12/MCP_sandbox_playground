@@ -10,10 +10,14 @@ import shutil
 import socket
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+BRIDGE_PROTOCOL_VERSION = "trichat-bridge-v1"
+ADAPTER_RESPONSE_KIND = "trichat.adapter.response"
+ADAPTER_PONG_KIND = "trichat.adapter.pong"
 
 
 class BridgeError(RuntimeError):
@@ -68,7 +72,44 @@ def read_payload() -> Dict[str, Any]:
         raise BridgeError(f"invalid JSON payload: {error}") from error
     if not isinstance(parsed, dict):
         raise BridgeError("payload must be a JSON object")
-    return parsed
+    return validate_bridge_payload(parsed)
+
+
+def validate_bridge_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    op = str(payload.get("op") or "ask").strip().lower()
+    if op not in {"ask", "ping"}:
+        raise BridgeError(f"unsupported bridge operation: {op}")
+
+    protocol_version = str(payload.get("protocol_version") or "").strip()
+    if not protocol_version:
+        raise BridgeError("missing protocol_version in payload")
+    if protocol_version != BRIDGE_PROTOCOL_VERSION:
+        raise BridgeError(
+            f"unsupported protocol_version: {protocol_version} (expected {BRIDGE_PROTOCOL_VERSION})"
+        )
+
+    request_id = str(payload.get("request_id") or "").strip()
+    if not request_id:
+        raise BridgeError("missing request_id in payload")
+
+    agent_id = str(payload.get("agent_id") or "").strip()
+    if not agent_id:
+        raise BridgeError("missing agent_id in payload")
+
+    if op == "ask":
+        prompt = str(payload.get("prompt") or "").strip()
+        if not prompt:
+            raise BridgeError("missing prompt for ask operation")
+
+    payload["op"] = op
+    payload["protocol_version"] = protocol_version
+    payload["request_id"] = request_id
+    payload["agent_id"] = agent_id
+    return payload
+
+
+def is_ping(payload: Dict[str, Any]) -> bool:
+    return str(payload.get("op") or "ask").strip().lower() == "ping"
 
 
 def workspace_from_payload(payload: Dict[str, Any]) -> Path:
@@ -112,6 +153,11 @@ def build_prompt(payload: Dict[str, Any], *, bridge_name: str, max_history: int 
     history = payload.get("history") if isinstance(payload.get("history"), list) else []
     peer_context = str(payload.get("peer_context") or "").strip()
     bootstrap_text = str(payload.get("bootstrap_text") or "").strip()
+    turn_phase = str(payload.get("turn_phase") or "").strip()
+    role_hint = str(payload.get("role_hint") or "").strip()
+    role_objective = str(payload.get("role_objective") or "").strip()
+    collaboration_contract = str(payload.get("collaboration_contract") or "").strip()
+    response_mode = str(payload.get("response_mode") or "plain").strip().lower()
 
     history_lines: List[str] = []
     for entry in history[-max_history:]:
@@ -123,24 +169,56 @@ def build_prompt(payload: Dict[str, Any], *, bridge_name: str, max_history: int 
         history_lines.append(f"[{agent_id}/{role}] {content}")
     history_block = "\n".join(history_lines) if history_lines else "(no prior timeline messages)"
 
-    parts: List[str] = [
-        f"TriChat adapter target: {bridge_name}",
-        "",
-        "Output contract:",
-        "- reply with direct plain-text answer only",
-        "- keep output concise (max 6 lines) unless user asks for detail",
-        "- for arithmetic, apply order of operations and verify the final numeric answer",
-        "- do not include thread recap, next-action scaffolding, or debug dumps",
-        "",
-        "User request:",
-        prompt or "(empty prompt)",
-        "",
-        "Recent timeline:",
-        history_block,
-        "",
-        "Peer context:",
-        peer_context or "(no peer context)",
-    ]
+    parts: List[str] = [f"TriChat adapter target: {bridge_name}"]
+    if turn_phase or role_hint:
+        parts.extend(
+            [
+                "",
+                "Coordination context:",
+                f"- turn_phase: {turn_phase or 'unknown'}",
+                f"- role_hint: {role_hint or 'unspecified'}",
+            ]
+        )
+    if role_objective:
+        parts.append(f"- role_objective: {compact_single_line(role_objective, 240)}")
+    if collaboration_contract:
+        parts.append(f"- collaboration_contract: {compact_single_line(collaboration_contract, 360)}")
+
+    if response_mode == "json":
+        parts.extend(
+            [
+                "",
+                "Output contract:",
+                "- return one valid JSON object only (no markdown fences)",
+                "- preserve required keys exactly as requested",
+                "- avoid extra wrapper fields or explanatory prose",
+            ]
+        )
+    else:
+        parts.extend(
+            [
+                "",
+                "Output contract:",
+                "- reply with direct plain-text answer only",
+                "- keep output concise (max 6 lines) unless user asks for detail",
+                "- for arithmetic, apply order of operations and verify the final numeric answer",
+                "- do not include thread recap, next-action scaffolding, or debug dumps",
+            ]
+        )
+
+    parts.extend(
+        [
+            "",
+            "User request:",
+            prompt or "(empty prompt)",
+            "",
+            "Recent timeline:",
+            history_block,
+            "",
+            "Peer context:",
+            peer_context or "(no peer context)",
+        ]
+    )
     if bootstrap_text:
         parts.extend(
             [
@@ -175,13 +253,37 @@ def run_command(
         raise BridgeError(f"command timed out after {timeout_seconds}s: {' '.join(command)}") from error
 
 
-def emit_content(content: str, *, meta: Dict[str, Any] | None = None, max_chars: int = 12000) -> None:
+def emit_content(
+    content: str,
+    *,
+    meta: Dict[str, Any] | None = None,
+    max_chars: int = 12000,
+    request_id: str,
+    agent_id: str,
+    bridge_name: str,
+) -> None:
     text = (content or "").strip()
     if not text:
         raise BridgeError("adapter produced empty content")
     if len(text) > max_chars:
         text = text[: max_chars - 3] + "..."
-    payload: Dict[str, Any] = {"content": text}
+    normalized_request_id = str(request_id or "").strip()
+    normalized_agent_id = str(agent_id or "").strip()
+    normalized_bridge = str(bridge_name or "").strip()
+    if not normalized_request_id:
+        raise BridgeError("missing request_id while emitting adapter response")
+    if not normalized_agent_id:
+        raise BridgeError("missing agent_id while emitting adapter response")
+    payload: Dict[str, Any] = {
+        "kind": ADAPTER_RESPONSE_KIND,
+        "protocol_version": BRIDGE_PROTOCOL_VERSION,
+        "request_id": normalized_request_id,
+        "agent_id": normalized_agent_id,
+        "bridge": normalized_bridge or None,
+        "content": text,
+    }
+    if payload.get("bridge") is None:
+        payload.pop("bridge", None)
     if meta:
         payload["meta"] = meta
     sys.stdout.write(json.dumps(payload, ensure_ascii=True) + "\n")
@@ -189,6 +291,28 @@ def emit_content(content: str, *, meta: Dict[str, Any] | None = None, max_chars:
 
 def emit_status(status: Dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(status, ensure_ascii=True, indent=2) + "\n")
+
+
+def emit_pong(
+    *,
+    request_id: str,
+    agent_id: str,
+    bridge_name: str,
+    meta: Dict[str, Any] | None = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "kind": ADAPTER_PONG_KIND,
+        "protocol_version": BRIDGE_PROTOCOL_VERSION,
+        "request_id": str(request_id or "").strip(),
+        "agent_id": str(agent_id or "").strip(),
+        "bridge": str(bridge_name or "").strip() or None,
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    if payload.get("bridge") is None:
+        payload.pop("bridge", None)
+    if meta:
+        payload["meta"] = meta
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
 
 def default_bus_socket_path() -> Path:

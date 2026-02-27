@@ -8,10 +8,12 @@ DOMAIN="gui/$(id -u)"
 MCP_LABEL="com.anamnesis.mcp.server"
 AUTO_LABEL="com.anamnesis.imprint.autosnapshot"
 WORKER_LABEL="com.anamnesis.imprint.inboxworker"
+RELIABILITY_LABEL="com.anamnesis.trichat.reliabilityloop"
 
 MCP_PLIST="${LAUNCH_DIR}/${MCP_LABEL}.plist"
 AUTO_PLIST="${LAUNCH_DIR}/${AUTO_LABEL}.plist"
 WORKER_PLIST="${LAUNCH_DIR}/${WORKER_LABEL}.plist"
+RELIABILITY_PLIST="${LAUNCH_DIR}/${RELIABILITY_LABEL}.plist"
 
 "${REPO_ROOT}/scripts/imprint_auto_snapshot_ctl.sh" stop >/dev/null 2>&1 || true
 
@@ -33,4 +35,10 @@ if [[ -f "${WORKER_PLIST}" ]]; then
   rm -f "${WORKER_PLIST}"
 fi
 
-echo "{\"ok\":true,\"removed\":[\"${MCP_LABEL}\",\"${AUTO_LABEL}\",\"${WORKER_LABEL}\"]}" >&2
+if [[ -f "${RELIABILITY_PLIST}" ]]; then
+  launchctl bootout "${DOMAIN}" "${RELIABILITY_PLIST}" >/dev/null 2>&1 || true
+  launchctl disable "${DOMAIN}/${RELIABILITY_LABEL}" >/dev/null 2>&1 || true
+  rm -f "${RELIABILITY_PLIST}"
+fi
+
+echo "{\"ok\":true,\"removed\":[\"${MCP_LABEL}\",\"${AUTO_LABEL}\",\"${WORKER_LABEL}\",\"${RELIABILITY_LABEL}\"]}" >&2

@@ -82,7 +82,7 @@ npm test
 - `run.begin`, `run.step`, `run.end`, `run.timeline`
 - `task.create`, `task.list`, `task.timeline`, `task.claim`, `task.heartbeat`, `task.complete`, `task.fail`, `task.retry`, `task.auto_retry`
 - `task.summary`
-- `trichat.thread_open`, `trichat.thread_list`, `trichat.thread_get`, `trichat.message_post`, `trichat.timeline`, `trichat.summary`, `trichat.adapter_telemetry`, `trichat.retention`, `trichat.auto_retention`
+- `trichat.thread_open`, `trichat.thread_list`, `trichat.thread_get`, `trichat.message_post`, `trichat.timeline`, `trichat.summary`, `trichat.adapter_telemetry`, `trichat.adapter_protocol_check`, `trichat.turn_start`, `trichat.turn_advance`, `trichat.turn_artifact`, `trichat.turn_get`, `trichat.turn_orchestrate`, `trichat.workboard`, `trichat.novelty`, `trichat.verify`, `trichat.retention`, `trichat.auto_retention`
 - `mutation.check`
 - `preflight.check`, `postflight.verify`
 - `lock.acquire`, `lock.release`
@@ -218,6 +218,11 @@ Bridge adapters:
 - If auth is missing:
   - `codex login`
   - `cursor-agent login`
+- Bridge protocol:
+  - requests include `op`, `protocol_version=trichat-bridge-v1`, `request_id`, and `agent_id`
+  - ask responses must return `kind=trichat.adapter.response` with matching `request_id`
+  - ping responses must return `kind=trichat.adapter.pong` with matching `request_id`
+  - malformed envelopes fail fast and route through fallback adapters
 - Manual overrides (only if needed):
   - `TRICHAT_CODEX_CMD`
   - `TRICHAT_CURSOR_CMD`
@@ -233,6 +238,10 @@ Each adapter channel (bridge command + Ollama fallback) uses per-agent circuit b
 Circuit state and breaker events can be persisted via `trichat.adapter_telemetry` for restart-safe reliability diagnostics.
 Consensus analysis is available via `trichat.consensus`, allowing reliability views to auto-flag cross-agent disagreements per user turn.
 When a thread flips into disagreement, the server publishes `consensus.alert` on `trichat.bus` for adapter-side automation hooks.
+Turn orchestration is persisted via `trichat.turn_*`, with `trichat.workboard` for phase visibility and `trichat.novelty` for forced-delta retry hints before merge.
+Use `trichat.turn_orchestrate` to keep merge/execute and verify-finalization deterministic on the server side instead of replicating those transitions in every client.
+`trichat.verify` can run local checks during execute/verify transitions so turn completion reflects real project health.
+For internal reliability heartbeat threads (`trichat-reliability-*`), novelty includes a dedupe guard that suppresses repeated retries when novelty and selected strategy remain effectively unchanged across consecutive turns.
 In TUI Settings, `Consensus Min Agents` toggles between `2` and `3` for live consensus calculations.
 The TUI exposes the same runtime path with an interactive split-pane UX (timeline, slash input, reliability sidebar, and settings menu).
 
@@ -240,6 +249,8 @@ TriChat runtime commands for housekeeping:
 
 - `/adapters status|reset [all|codex|cursor|local-imprint]` for adapter breaker inspection/reset.
 - `/consensus` for latest cross-agent agreement/disagreement breakdown on the active thread.
+- `/workboard [limit]` for orchestration phase/state summary of active thread turns.
+- `/turn show [turn_id]` and `/turn phase <phase> [phase_status]` for turn lifecycle debugging.
 - `/retention [days] [apply] [all]` for one-shot pruning (`dry_run` by default).
 - `/retentiond status|start|stop|run_once` for daemonized tri-chat retention.
 
@@ -261,6 +272,32 @@ Run TriChat message-bus smoke check:
 
 ```bash
 npm run trichat:smoke
+```
+
+Run deterministic dogfood orchestration check (bridge fanout + turn orchestration + verify finalize):
+
+```bash
+npm run trichat:dogfood:smoke
+```
+
+Run one internal reliability heartbeat cycle (archived thread, non-user-facing):
+
+```bash
+npm run trichat:reliability:run_once
+```
+
+Enable background reliability loop at login (optional launchd agent):
+
+```bash
+npm run launchd:install:reliability
+```
+
+Control the reliability loop agent:
+
+```bash
+npm run trichat:reliability:status
+npm run trichat:reliability:start
+npm run trichat:reliability:stop
 ```
 
 Run local-imprint arithmetic reliability smoke check:

@@ -1,4 +1,6 @@
 import path from "node:path";
+import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -66,10 +68,26 @@ import {
   initializeTaskAutoRetryDaemon,
 } from "./tools/task.js";
 import {
+  trichatAdapterProtocolCheck,
+  trichatAdapterProtocolCheckSchema,
   trichatAdapterTelemetry,
   trichatAdapterTelemetrySchema,
   trichatConsensus,
   trichatConsensusSchema,
+  trichatNovelty,
+  trichatNoveltySchema,
+  trichatTurnAdvance,
+  trichatTurnAdvanceSchema,
+  trichatTurnArtifact,
+  trichatTurnArtifactSchema,
+  trichatTurnGet,
+  trichatTurnGetSchema,
+  trichatTurnOrchestrate,
+  trichatTurnOrchestrateSchema,
+  trichatTurnStart,
+  trichatTurnStartSchema,
+  trichatWorkboard,
+  trichatWorkboardSchema,
   initializeTriChatAutoRetentionDaemon,
   trichatAutoRetentionControl,
   trichatAutoRetentionSchema,
@@ -133,6 +151,8 @@ triChatBusRuntime.initialize({
 const SERVER_NAME = "anamnesis";
 const SERVER_VERSION = "0.2.0";
 const CONSENSUS_ALERT_MIN_AGENTS = parseConsensusMinAgents(process.env.TRICHAT_CONSENSUS_ALERT_MIN_AGENTS);
+const DEFAULT_TRICHAT_VERIFY_COMMAND = String(process.env.TRICHAT_VERIFY_COMMAND ?? "").trim();
+const DEFAULT_TRICHAT_VERIFY_TIMEOUT_SECONDS = parseBoundedInt(process.env.TRICHAT_VERIFY_TIMEOUT_SECONDS, 90, 5, 1800);
 
 const server = new Server(
   {
@@ -151,6 +171,13 @@ type ToolEntry = {
   tool: Tool;
   handler: (input: any) => Promise<unknown> | unknown;
 };
+
+const trichatVerifySchema = z.object({
+  project_dir: z.string().min(1).optional(),
+  command: z.string().min(1).optional(),
+  timeout_seconds: z.number().int().min(5).max(1800).optional(),
+  capture_limit: z.number().int().min(200).max(20000).optional(),
+});
 
 const toolRegistry = new Map<string, ToolEntry>();
 
@@ -539,6 +566,229 @@ registerTool("trichat.message_post", "Append a message into a tri-chat thread ti
   })
 );
 
+registerTool(
+  "trichat.turn_start",
+  "Start or reuse a durable tri-chat turn state machine entry for a user message.",
+  trichatTurnStartSchema,
+  (input) =>
+    runIdempotentMutation({
+      storage,
+      tool_name: "trichat.turn_start",
+      mutation: input.mutation,
+      payload: input,
+      execute: () => {
+        const started = trichatTurnStart(storage, input);
+        let busEvent: unknown = null;
+        let busWarning: string | null = null;
+        try {
+          const publishResult = triChatBusRuntime.publish({
+            thread_id: started.turn.thread_id,
+            event_type: "trichat.turn_start",
+            source_agent: "turn-orchestrator",
+            source_client: "mcp:trichat.turn_start",
+            role: "system",
+            content: `turn ${started.turn.turn_id} started for user message ${started.turn.user_message_id}`,
+            metadata: {
+              kind: "trichat.turn_start",
+              turn_id: started.turn.turn_id,
+              user_message_id: started.turn.user_message_id,
+              phase: started.turn.phase,
+              phase_status: started.turn.phase_status,
+              status: started.turn.status,
+              created: started.created,
+            },
+          });
+          busEvent = publishResult.event;
+        } catch (error) {
+          busWarning = error instanceof Error ? error.message : String(error);
+          console.error(`[trichat.bus] turn_start publish failed: ${busWarning}`);
+        }
+        return {
+          ...started,
+          bus_event: busEvent,
+          bus_warning: busWarning,
+        };
+      },
+    })
+);
+
+registerTool(
+  "trichat.turn_advance",
+  "Advance tri-chat turn phase/status with persisted decision and verification metadata.",
+  trichatTurnAdvanceSchema,
+  (input) =>
+    runIdempotentMutation({
+      storage,
+      tool_name: "trichat.turn_advance",
+      mutation: input.mutation,
+      payload: input,
+      execute: () => {
+        const advanced = trichatTurnAdvance(storage, input);
+        let busEvent: unknown = null;
+        let busWarning: string | null = null;
+        try {
+          const publishResult = triChatBusRuntime.publish({
+            thread_id: advanced.turn.thread_id,
+            event_type: "trichat.turn_phase",
+            source_agent: "turn-orchestrator",
+            source_client: "mcp:trichat.turn_advance",
+            role: "system",
+            content: `turn ${advanced.turn.turn_id} phase=${advanced.turn.phase} phase_status=${advanced.turn.phase_status} status=${advanced.turn.status}`,
+            metadata: {
+              kind: "trichat.turn_phase",
+              turn_id: advanced.turn.turn_id,
+              user_message_id: advanced.turn.user_message_id,
+              phase: advanced.turn.phase,
+              phase_status: advanced.turn.phase_status,
+              status: advanced.turn.status,
+              retry_required: advanced.turn.retry_required,
+              retry_agents: advanced.turn.retry_agents,
+              novelty_score: advanced.turn.novelty_score,
+              novelty_threshold: advanced.turn.novelty_threshold,
+              disagreement: advanced.turn.disagreement,
+              selected_agent: advanced.turn.selected_agent,
+            },
+          });
+          busEvent = publishResult.event;
+        } catch (error) {
+          busWarning = error instanceof Error ? error.message : String(error);
+          console.error(`[trichat.bus] turn_advance publish failed: ${busWarning}`);
+        }
+        return {
+          ...advanced,
+          bus_event: busEvent,
+          bus_warning: busWarning,
+        };
+      },
+    })
+);
+
+registerTool(
+  "trichat.turn_artifact",
+  "Append structured turn artifact content (plan/proposal/critique/merge/verify/summary).",
+  trichatTurnArtifactSchema,
+  (input) =>
+    runIdempotentMutation({
+      storage,
+      tool_name: "trichat.turn_artifact",
+      mutation: input.mutation,
+      payload: input,
+      execute: () => {
+        const result = trichatTurnArtifact(storage, input);
+        let busEvent: unknown = null;
+        let busWarning: string | null = null;
+        try {
+          const turn = storage.getTriChatTurnById(result.artifact.turn_id);
+          if (turn) {
+            const publishResult = triChatBusRuntime.publish({
+              thread_id: turn.thread_id,
+              event_type: "trichat.turn_artifact",
+              source_agent: input.agent_id ?? "turn-orchestrator",
+              source_client: "mcp:trichat.turn_artifact",
+              role: "system",
+              content: `turn ${turn.turn_id} artifact ${result.artifact.artifact_type} from ${result.artifact.agent_id ?? "n/a"}`,
+              metadata: {
+                kind: "trichat.turn_artifact",
+                turn_id: turn.turn_id,
+                artifact_id: result.artifact.artifact_id,
+                artifact_type: result.artifact.artifact_type,
+                phase: result.artifact.phase,
+                agent_id: result.artifact.agent_id,
+                score: result.artifact.score,
+              },
+            });
+            busEvent = publishResult.event;
+          }
+        } catch (error) {
+          busWarning = error instanceof Error ? error.message : String(error);
+          console.error(`[trichat.bus] turn_artifact publish failed: ${busWarning}`);
+        }
+        return {
+          ...result,
+          bus_event: busEvent,
+          bus_warning: busWarning,
+        };
+      },
+    })
+);
+
+registerTool(
+  "trichat.turn_get",
+  "Read latest turn state and optional artifacts for a thread or specific turn id.",
+  trichatTurnGetSchema,
+  (input) => trichatTurnGet(storage, input)
+);
+
+registerTool(
+  "trichat.workboard",
+  "Summarize tri-chat orchestration workboard state (turn counts, phases, latest decision).",
+  trichatWorkboardSchema,
+  (input) => trichatWorkboard(storage, input)
+);
+
+registerTool(
+  "trichat.novelty",
+  "Evaluate proposal novelty and recommend forced-delta retries before merge.",
+  trichatNoveltySchema,
+  (input) => trichatNovelty(storage, input)
+);
+
+registerTool(
+  "trichat.turn_orchestrate",
+  "Run server-side turn orchestration actions (decision merge and verify finalization).",
+  trichatTurnOrchestrateSchema,
+  (input) =>
+    runIdempotentMutation({
+      storage,
+      tool_name: "trichat.turn_orchestrate",
+      mutation: input.mutation,
+      payload: input,
+      execute: () => {
+        const orchestrated = trichatTurnOrchestrate(storage, input) as Record<string, unknown>;
+        let busEvent: unknown = null;
+        let busWarning: string | null = null;
+        try {
+          const turn = (orchestrated.turn ?? null) as { turn_id?: string; thread_id?: string; phase?: string; status?: string } | null;
+          const threadId = String(turn?.thread_id ?? "").trim();
+          const turnId = String(turn?.turn_id ?? "").trim();
+          if (threadId && turnId) {
+            const publishResult = triChatBusRuntime.publish({
+              thread_id: threadId,
+              event_type: "trichat.turn_orchestrate",
+              source_agent: "turn-orchestrator",
+              source_client: "mcp:trichat.turn_orchestrate",
+              role: "system",
+              content: `turn ${turnId} orchestrated action=${String(input.action ?? "decide")}`,
+              metadata: {
+                kind: "trichat.turn_orchestrate",
+                action: input.action ?? "decide",
+                turn_id: turnId,
+                phase: String(turn?.phase ?? ""),
+                status: String(turn?.status ?? ""),
+              },
+            });
+            busEvent = publishResult.event;
+          }
+        } catch (error) {
+          busWarning = error instanceof Error ? error.message : String(error);
+          console.error(`[trichat.bus] turn_orchestrate publish failed: ${busWarning}`);
+        }
+        return {
+          ...orchestrated,
+          bus_event: busEvent,
+          bus_warning: busWarning,
+        };
+      },
+    })
+);
+
+registerTool(
+  "trichat.verify",
+  "Run local project verification checks for execute-phase gating and reliability.",
+  trichatVerifySchema,
+  (input) => runTriChatVerify(input)
+);
+
 registerTool("trichat.timeline", "Read ordered messages for a tri-chat thread.", trichatTimelineSchema, (input) =>
   trichatTimeline(storage, input)
 );
@@ -559,6 +809,13 @@ registerTool(
   "Record and read persistent tri-chat adapter circuit-breaker telemetry.",
   trichatAdapterTelemetrySchema,
   (input) => trichatAdapterTelemetry(storage, input)
+);
+
+registerTool(
+  "trichat.adapter_protocol_check",
+  "Run bridge protocol diagnostics (ping + optional dry-run ask) for codex/cursor/local-imprint adapters.",
+  trichatAdapterProtocolCheckSchema,
+  (input) => trichatAdapterProtocolCheck(storage, input)
 );
 
 registerTool(
@@ -829,6 +1086,90 @@ function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean 
     return false;
   }
   return fallback;
+}
+
+function parseBoundedInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.round(parsed)));
+}
+
+function runTriChatVerify(input: z.infer<typeof trichatVerifySchema>) {
+  const cwd = input.project_dir?.trim() ? path.resolve(input.project_dir) : repoRoot;
+  const command = resolveTriChatVerifyCommand(input.command, cwd);
+  const timeoutSeconds = parseBoundedInt(
+    input.timeout_seconds,
+    DEFAULT_TRICHAT_VERIFY_TIMEOUT_SECONDS,
+    5,
+    1800
+  );
+  const captureLimit = parseBoundedInt(input.capture_limit, 4000, 200, 20000);
+
+  if (!command) {
+    return {
+      ok: true,
+      executed: false,
+      passed: null,
+      cwd,
+      command: null,
+      reason: "No verify command configured or auto-detected.",
+    };
+  }
+
+  const startedAt = new Date().toISOString();
+  const child = spawnSync(command, {
+    cwd,
+    shell: true,
+    encoding: "utf8",
+    timeout: timeoutSeconds * 1000,
+    maxBuffer: 8 * 1024 * 1024,
+    env: process.env,
+  });
+  const finishedAt = new Date().toISOString();
+  const stdout = truncate(String(child.stdout ?? ""), captureLimit);
+  const stderr = truncate(String(child.stderr ?? ""), captureLimit);
+  const timedOut = child.error?.name === "Error" && /ETIMEDOUT|timed out/i.test(String(child.error.message ?? ""));
+  const signal = child.signal ?? null;
+  const code = typeof child.status === "number" ? child.status : null;
+  const passed = !timedOut && signal === null && code === 0;
+  return {
+    ok: true,
+    executed: true,
+    passed,
+    cwd,
+    command,
+    timeout_seconds: timeoutSeconds,
+    started_at: startedAt,
+    finished_at: finishedAt,
+    exit_code: code,
+    signal,
+    timed_out: timedOut,
+    stdout,
+    stderr,
+    error: child.error ? truncate(String(child.error.message ?? child.error), captureLimit) : null,
+  };
+}
+
+function resolveTriChatVerifyCommand(inputCommand: string | undefined, cwd: string): string | null {
+  const explicit = String(inputCommand ?? "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  if (DEFAULT_TRICHAT_VERIFY_COMMAND) {
+    return DEFAULT_TRICHAT_VERIFY_COMMAND;
+  }
+  if (fs.existsSync(path.join(cwd, "package.json"))) {
+    return "npm test --silent";
+  }
+  if (fs.existsSync(path.join(cwd, "go.mod"))) {
+    return "go test ./...";
+  }
+  if (fs.existsSync(path.join(cwd, "pyproject.toml")) || fs.existsSync(path.join(cwd, "requirements.txt"))) {
+    return "pytest -q";
+  }
+  return null;
 }
 
 main().catch((error) => {

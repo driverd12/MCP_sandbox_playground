@@ -54,12 +54,21 @@ const EXPECTED_TOOLS = [
   "task.retry",
   "task.auto_retry",
   "trichat.adapter_telemetry",
+  "trichat.adapter_protocol_check",
   "trichat.bus",
   "trichat.consensus",
   "trichat.message_post",
+  "trichat.novelty",
   "trichat.auto_retention",
   "trichat.retention",
   "trichat.summary",
+  "trichat.turn_advance",
+  "trichat.turn_artifact",
+  "trichat.turn_get",
+  "trichat.turn_orchestrate",
+  "trichat.turn_start",
+  "trichat.verify",
+  "trichat.workboard",
   "trichat.thread_get",
   "trichat.thread_list",
   "trichat.thread_open",
@@ -99,6 +108,10 @@ const MUTATION_REQUIRED_TOOLS = [
   "task.heartbeat",
   "task.retry",
   "trichat.message_post",
+  "trichat.turn_advance",
+  "trichat.turn_artifact",
+  "trichat.turn_orchestrate",
+  "trichat.turn_start",
   "trichat.retention",
   "trichat.thread_open",
   "transcript.log",
@@ -509,6 +522,332 @@ test("MCP v0.2 integration and safety invariants", async () => {
       )
     );
 
+    const triChatTurnStart = await callTool(client, "trichat.turn_start", {
+      mutation: nextMutation(testId, "trichat.turn_start", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      user_message_id: triChatUserMessage.message.message_id,
+      user_prompt: `integration orchestration prompt ${testId}`,
+      expected_agents: ["codex", "cursor", "local-imprint"],
+      min_agents: 3,
+      metadata: {
+        source: "integration-test",
+      },
+    });
+    assert.equal(triChatTurnStart.created, true);
+    assert.equal(triChatTurnStart.turn.phase, "plan");
+    assert.equal(triChatTurnStart.turn.status, "running");
+
+    const triChatTurnAdvance = await callTool(client, "trichat.turn_advance", {
+      mutation: nextMutation(testId, "trichat.turn_advance", () => mutationCounter++),
+      turn_id: triChatTurnStart.turn.turn_id,
+      phase: "propose",
+      phase_status: "running",
+      status: "running",
+    });
+    assert.equal(triChatTurnAdvance.ok, true);
+    assert.equal(triChatTurnAdvance.turn.phase, "propose");
+
+    const triChatTurnInvalidRegression = await callToolExpectError(client, "trichat.turn_advance", {
+      mutation: nextMutation(testId, "trichat.turn_advance-invalid", () => mutationCounter++),
+      turn_id: triChatTurnStart.turn.turn_id,
+      phase: "plan",
+      phase_status: "running",
+      status: "running",
+    });
+    assert.match(triChatTurnInvalidRegression, /phase regression|invalid/i);
+
+    const triChatTurnArtifactCodex = await callTool(client, "trichat.turn_artifact", {
+      mutation: nextMutation(testId, "trichat.turn_artifact-codex", () => mutationCounter++),
+      turn_id: triChatTurnStart.turn.turn_id,
+      phase: "propose",
+      artifact_type: "proposal",
+      agent_id: "codex",
+      content: "Use deterministic parser and task queue validation.",
+      structured: {
+        strategy: "deterministic parser and task queue validation",
+        plan_steps: ["parse", "validate", "execute"],
+        risks: ["parser edge-cases"],
+        commands: ["npm test"],
+        confidence: 0.82,
+      },
+      score: 0.82,
+      metadata: {
+        source: "integration-test",
+      },
+    });
+    assert.equal(triChatTurnArtifactCodex.ok, true);
+    assert.equal(triChatTurnArtifactCodex.artifact.phase, "propose");
+
+    const triChatTurnArtifactCursor = await callTool(client, "trichat.turn_artifact", {
+      mutation: nextMutation(testId, "trichat.turn_artifact-cursor", () => mutationCounter++),
+      turn_id: triChatTurnStart.turn.turn_id,
+      phase: "propose",
+      artifact_type: "proposal",
+      agent_id: "cursor",
+      content: "Use deterministic parser and task queue validation with UI-first steps.",
+      structured: {
+        strategy: "deterministic parser and task queue validation with ui-first steps",
+        plan_steps: ["design UX", "parse", "validate"],
+        risks: ["UI drift"],
+        commands: ["npm run build"],
+        confidence: 0.74,
+      },
+      score: 0.74,
+      metadata: {
+        source: "integration-test",
+      },
+    });
+    assert.equal(triChatTurnArtifactCursor.ok, true);
+
+    const triChatTurnGet = await callTool(client, "trichat.turn_get", {
+      turn_id: triChatTurnStart.turn.turn_id,
+      include_artifacts: true,
+      artifact_limit: 20,
+    });
+    assert.equal(triChatTurnGet.found, true);
+    assert.ok(triChatTurnGet.artifact_count >= 2);
+
+    const triChatNovelty = await callTool(client, "trichat.novelty", {
+      turn_id: triChatTurnStart.turn.turn_id,
+      novelty_threshold: 0.35,
+      max_similarity: 0.8,
+    });
+    assert.equal(triChatNovelty.found, true);
+    assert.equal(typeof triChatNovelty.novelty_score, "number");
+    assert.ok(Array.isArray(triChatNovelty.pairs));
+
+    const triChatTurnOrchestrateDecision = await callTool(client, "trichat.turn_orchestrate", {
+      mutation: nextMutation(testId, "trichat.turn_orchestrate-decide", () => mutationCounter++),
+      turn_id: triChatTurnStart.turn.turn_id,
+      action: "decide",
+      novelty_threshold: 0.35,
+      max_similarity: 0.8,
+    });
+    assert.equal(triChatTurnOrchestrateDecision.ok, true);
+    assert.equal(triChatTurnOrchestrateDecision.action, "decide");
+    assert.equal(triChatTurnOrchestrateDecision.turn.phase, "execute");
+    assert.equal(triChatTurnOrchestrateDecision.turn.status, "running");
+
+    const triChatWorkboard = await callTool(client, "trichat.workboard", {
+      thread_id: triChatThreadId,
+      limit: 20,
+    });
+    assert.equal(typeof triChatWorkboard.counts.total, "number");
+    assert.ok(triChatWorkboard.counts.total >= 1);
+    assert.ok(Array.isArray(triChatWorkboard.turns));
+
+    const triChatVerify = await callTool(client, "trichat.verify", {
+      command: "node -e \"process.exit(0)\"",
+      project_dir: REPO_ROOT,
+      timeout_seconds: 10,
+    });
+    assert.equal(triChatVerify.ok, true);
+    assert.equal(triChatVerify.executed, true);
+    assert.equal(triChatVerify.passed, true);
+
+    const triChatTurnOrchestrateFinalize = await callTool(client, "trichat.turn_orchestrate", {
+      mutation: nextMutation(testId, "trichat.turn_orchestrate-verify_finalize", () => mutationCounter++),
+      turn_id: triChatTurnStart.turn.turn_id,
+      action: "verify_finalize",
+      verify_status: triChatVerify.passed ? "passed" : "failed",
+      verify_summary: `integration verify status=${triChatVerify.passed ? "passed" : "failed"}`,
+      verify_details: {
+        command: triChatVerify.command,
+        exit_code: triChatVerify.exit_code,
+        timed_out: triChatVerify.timed_out,
+      },
+    });
+    assert.equal(triChatTurnOrchestrateFinalize.ok, true);
+    assert.equal(triChatTurnOrchestrateFinalize.action, "verify_finalize");
+    assert.equal(triChatTurnOrchestrateFinalize.turn.phase, "summarize");
+    assert.equal(triChatTurnOrchestrateFinalize.turn.status, "completed");
+    assert.equal(triChatTurnOrchestrateFinalize.turn.verify_status, "passed");
+
+    const triChatFailUserMessage = await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-verify-fail-user", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      agent_id: "user",
+      role: "user",
+      content: `verify fail turn seed ${testId}`,
+    });
+    assert.equal(triChatFailUserMessage.ok, true);
+
+    const triChatFailTurnStart = await callTool(client, "trichat.turn_start", {
+      mutation: nextMutation(testId, "trichat.turn_start-verify-fail", () => mutationCounter++),
+      thread_id: triChatThreadId,
+      user_message_id: triChatFailUserMessage.message.message_id,
+      user_prompt: `verify fail orchestration prompt ${testId}`,
+      expected_agents: ["codex"],
+      min_agents: 1,
+      metadata: {
+        source: "integration-test",
+        mode: "verify-fail",
+      },
+    });
+    assert.equal(triChatFailTurnStart.turn.phase, "plan");
+
+    const triChatFailTurnToExecute = await callTool(client, "trichat.turn_advance", {
+      mutation: nextMutation(testId, "trichat.turn_advance-verify-fail-to-execute", () => mutationCounter++),
+      turn_id: triChatFailTurnStart.turn.turn_id,
+      phase: "execute",
+      phase_status: "running",
+      status: "running",
+      metadata: {
+        allow_phase_skip: true,
+      },
+    });
+    assert.equal(triChatFailTurnToExecute.turn.phase, "execute");
+
+    const triChatTurnOrchestrateFinalizeFailed = await callTool(client, "trichat.turn_orchestrate", {
+      mutation: nextMutation(testId, "trichat.turn_orchestrate-verify_finalize-failed", () => mutationCounter++),
+      turn_id: triChatFailTurnStart.turn.turn_id,
+      action: "verify_finalize",
+      verify_status: "failed",
+      verify_summary: "integration forced verify failure",
+    });
+    assert.equal(triChatTurnOrchestrateFinalizeFailed.ok, true);
+    assert.equal(triChatTurnOrchestrateFinalizeFailed.action, "verify_finalize");
+    assert.equal(triChatTurnOrchestrateFinalizeFailed.turn.phase, "summarize");
+    assert.equal(triChatTurnOrchestrateFinalizeFailed.turn.status, "failed");
+    assert.equal(triChatTurnOrchestrateFinalizeFailed.turn.verify_status, "failed");
+
+    const triChatReliabilityThreadId = `trichat-reliability-integration-${testId}`;
+    const triChatReliabilityThread = await callTool(client, "trichat.thread_open", {
+      mutation: nextMutation(testId, "trichat.thread_open-reliability", () => mutationCounter++),
+      thread_id: triChatReliabilityThreadId,
+      title: `TriChat Reliability ${testId}`,
+      status: "archived",
+      metadata: {
+        source: "integration-test",
+      },
+    });
+    assert.equal(triChatReliabilityThread.thread.thread_id, triChatReliabilityThreadId);
+
+    const reliabilityPrompt = `internal reliability heartbeat dedupe ${testId}`;
+    const reliabilityUser1 = await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-reliability-user1", () => mutationCounter++),
+      thread_id: triChatReliabilityThreadId,
+      agent_id: "user",
+      role: "user",
+      content: reliabilityPrompt,
+    });
+    const reliabilityTurn1 = await callTool(client, "trichat.turn_start", {
+      mutation: nextMutation(testId, "trichat.turn_start-reliability-1", () => mutationCounter++),
+      thread_id: triChatReliabilityThreadId,
+      user_message_id: reliabilityUser1.message.message_id,
+      user_prompt: reliabilityPrompt,
+      expected_agents: ["codex", "cursor"],
+      min_agents: 2,
+    });
+    await callTool(client, "trichat.turn_advance", {
+      mutation: nextMutation(testId, "trichat.turn_advance-reliability-1", () => mutationCounter++),
+      turn_id: reliabilityTurn1.turn.turn_id,
+      phase: "propose",
+      phase_status: "running",
+      status: "running",
+    });
+    const reliabilityProposalContent = "deterministic sqlite checkpoint cache with bounded retry backoff";
+    await callTool(client, "trichat.turn_artifact", {
+      mutation: nextMutation(testId, "trichat.turn_artifact-reliability-1-codex", () => mutationCounter++),
+      turn_id: reliabilityTurn1.turn.turn_id,
+      phase: "propose",
+      artifact_type: "proposal",
+      agent_id: "codex",
+      content: reliabilityProposalContent,
+      structured: {
+        strategy: reliabilityProposalContent,
+        confidence: 0.75,
+      },
+    });
+    await callTool(client, "trichat.turn_artifact", {
+      mutation: nextMutation(testId, "trichat.turn_artifact-reliability-1-cursor", () => mutationCounter++),
+      turn_id: reliabilityTurn1.turn.turn_id,
+      phase: "propose",
+      artifact_type: "proposal",
+      agent_id: "cursor",
+      content: reliabilityProposalContent,
+      structured: {
+        strategy: reliabilityProposalContent,
+        confidence: 0.75,
+      },
+    });
+    const reliabilityNovelty1 = await callTool(client, "trichat.novelty", {
+      turn_id: reliabilityTurn1.turn.turn_id,
+      novelty_threshold: 0.35,
+      max_similarity: 0.8,
+    });
+    assert.equal(reliabilityNovelty1.found, true);
+    assert.equal(reliabilityNovelty1.retry_required, true);
+    assert.equal(reliabilityNovelty1.retry_suppressed, false);
+    const reliabilityDecision1 = await callTool(client, "trichat.turn_orchestrate", {
+      mutation: nextMutation(testId, "trichat.turn_orchestrate-reliability-1", () => mutationCounter++),
+      turn_id: reliabilityTurn1.turn.turn_id,
+      action: "decide",
+      novelty_threshold: 0.35,
+      max_similarity: 0.8,
+    });
+    assert.equal(reliabilityDecision1.ok, true);
+    assert.equal(reliabilityDecision1.turn.phase, "execute");
+
+    const reliabilityUser2 = await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-reliability-user2", () => mutationCounter++),
+      thread_id: triChatReliabilityThreadId,
+      agent_id: "user",
+      role: "user",
+      content: reliabilityPrompt,
+    });
+    const reliabilityTurn2 = await callTool(client, "trichat.turn_start", {
+      mutation: nextMutation(testId, "trichat.turn_start-reliability-2", () => mutationCounter++),
+      thread_id: triChatReliabilityThreadId,
+      user_message_id: reliabilityUser2.message.message_id,
+      user_prompt: reliabilityPrompt,
+      expected_agents: ["codex", "cursor"],
+      min_agents: 2,
+    });
+    await callTool(client, "trichat.turn_advance", {
+      mutation: nextMutation(testId, "trichat.turn_advance-reliability-2", () => mutationCounter++),
+      turn_id: reliabilityTurn2.turn.turn_id,
+      phase: "propose",
+      phase_status: "running",
+      status: "running",
+    });
+    await callTool(client, "trichat.turn_artifact", {
+      mutation: nextMutation(testId, "trichat.turn_artifact-reliability-2-codex", () => mutationCounter++),
+      turn_id: reliabilityTurn2.turn.turn_id,
+      phase: "propose",
+      artifact_type: "proposal",
+      agent_id: "codex",
+      content: reliabilityProposalContent,
+      structured: {
+        strategy: reliabilityProposalContent,
+        confidence: 0.75,
+      },
+    });
+    await callTool(client, "trichat.turn_artifact", {
+      mutation: nextMutation(testId, "trichat.turn_artifact-reliability-2-cursor", () => mutationCounter++),
+      turn_id: reliabilityTurn2.turn.turn_id,
+      phase: "propose",
+      artifact_type: "proposal",
+      agent_id: "cursor",
+      content: reliabilityProposalContent,
+      structured: {
+        strategy: reliabilityProposalContent,
+        confidence: 0.75,
+      },
+    });
+    const reliabilityNovelty2 = await callTool(client, "trichat.novelty", {
+      turn_id: reliabilityTurn2.turn.turn_id,
+      novelty_threshold: 0.35,
+      max_similarity: 0.8,
+    });
+    assert.equal(reliabilityNovelty2.found, true);
+    assert.equal(reliabilityNovelty2.retry_suppressed, true);
+    assert.equal(reliabilityNovelty2.retry_required, false);
+    assert.equal(
+      reliabilityNovelty2.retry_suppression_reference_turn_id,
+      reliabilityTurn1.turn.turn_id
+    );
+
     const triChatConsensusUserMessage = await callTool(client, "trichat.message_post", {
       mutation: nextMutation(testId, "trichat.message_post-consensus-user", () => mutationCounter++),
       thread_id: triChatThreadId,
@@ -636,6 +975,18 @@ test("MCP v0.2 integration and safety invariants", async () => {
       triChatBusTail.events.some((event) => event.event_type === "consensus.alert"),
       "Expected consensus.alert in bus tail output after disagreement flip"
     );
+    assert.ok(
+      triChatBusTail.events.some((event) => event.event_type === "trichat.turn_phase"),
+      "Expected trichat.turn_phase in bus tail output after turn advancement"
+    );
+    assert.ok(
+      triChatBusTail.events.some((event) => event.event_type === "trichat.turn_artifact"),
+      "Expected trichat.turn_artifact in bus tail output after artifact append"
+    );
+    assert.ok(
+      triChatBusTail.events.some((event) => event.event_type === "trichat.turn_orchestrate"),
+      "Expected trichat.turn_orchestrate in bus tail output after orchestration actions"
+    );
 
     const triChatRetentionDryRun = await callTool(client, "trichat.retention", {
       mutation: nextMutation(testId, "trichat.retention", () => mutationCounter++),
@@ -732,6 +1083,23 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(adapterTelemetryStatus.summary.total_trips >= 1);
     assert.ok(
       adapterTelemetryStatus.last_open_events.some((event) => event.event_type === "trip_opened")
+    );
+
+    const adapterProtocolCheck = await callTool(client, "trichat.adapter_protocol_check", {
+      agent_ids: ["codex", "cursor", "local-imprint"],
+      run_ask_check: true,
+      ask_dry_run: true,
+      timeout_seconds: 10,
+      workspace: REPO_ROOT,
+      thread_id: `trichat-adapter-protocol-test-${testId}`,
+    });
+    assert.equal(adapterProtocolCheck.protocol_version, "trichat-bridge-v1");
+    assert.ok(Array.isArray(adapterProtocolCheck.results));
+    assert.equal(adapterProtocolCheck.results.length, 3);
+    assert.ok(
+      adapterProtocolCheck.results.every(
+        (entry) => typeof entry.agent_id === "string" && entry.ping && typeof entry.ping.ok === "boolean"
+      )
     );
 
     const triChatAutoRetentionRunOnce = await callTool(client, "trichat.auto_retention", {

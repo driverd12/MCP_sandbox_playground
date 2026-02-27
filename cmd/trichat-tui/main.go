@@ -31,16 +31,19 @@ import (
 )
 
 const (
-	defaultModel       = "llama3.2:3b"
-	defaultOllamaAPI   = "http://127.0.0.1:11434"
-	defaultThreadTitle = "TriChat TUI"
-	historyWindowSize  = 14
-	historyLineChars   = 180
-	bootstrapMaxChars  = 1200
-	timelineMaxLines   = 8
-	timelineMaxChars   = 900
-	busStripMaxEvents  = 240
-	busStripMaxRows    = 5
+	defaultModel        = "llama3.2:3b"
+	defaultOllamaAPI    = "http://127.0.0.1:11434"
+	defaultThreadTitle  = "TriChat TUI"
+	historyWindowSize   = 14
+	historyLineChars    = 180
+	bootstrapMaxChars   = 1200
+	timelineMaxLines    = 8
+	timelineMaxChars    = 900
+	busStripMaxEvents   = 240
+	busStripMaxRows     = 5
+	adapterProtocol     = "trichat-bridge-v1"
+	adapterResponseKind = "trichat.adapter.response"
+	adapterPongKind     = "trichat.adapter.pong"
 )
 
 const (
@@ -301,6 +304,192 @@ type triChatConsensusResp struct {
 	RecentTurns        []triChatConsensusTurn `json:"recent_turns"`
 }
 
+type triChatTurn struct {
+	TurnID           string         `json:"turn_id"`
+	ThreadID         string         `json:"thread_id"`
+	UserMessageID    string         `json:"user_message_id"`
+	UserPrompt       string         `json:"user_prompt"`
+	CreatedAt        string         `json:"created_at"`
+	UpdatedAt        string         `json:"updated_at"`
+	StartedAt        string         `json:"started_at"`
+	FinishedAt       string         `json:"finished_at"`
+	Status           string         `json:"status"`
+	Phase            string         `json:"phase"`
+	PhaseStatus      string         `json:"phase_status"`
+	ExpectedAgents   []string       `json:"expected_agents"`
+	MinAgents        int            `json:"min_agents"`
+	NoveltyScore     *float64       `json:"novelty_score"`
+	NoveltyThreshold *float64       `json:"novelty_threshold"`
+	RetryRequired    bool           `json:"retry_required"`
+	RetryAgents      []string       `json:"retry_agents"`
+	Disagreement     bool           `json:"disagreement"`
+	DecisionSummary  string         `json:"decision_summary"`
+	SelectedAgent    string         `json:"selected_agent"`
+	SelectedStrategy string         `json:"selected_strategy"`
+	VerifyStatus     string         `json:"verify_status"`
+	VerifySummary    string         `json:"verify_summary"`
+	Metadata         map[string]any `json:"metadata"`
+}
+
+type triChatTurnArtifact struct {
+	ArtifactID   string         `json:"artifact_id"`
+	TurnID       string         `json:"turn_id"`
+	ThreadID     string         `json:"thread_id"`
+	CreatedAt    string         `json:"created_at"`
+	Phase        string         `json:"phase"`
+	ArtifactType string         `json:"artifact_type"`
+	AgentID      string         `json:"agent_id"`
+	Content      string         `json:"content"`
+	Structured   map[string]any `json:"structured"`
+	Score        *float64       `json:"score"`
+	Metadata     map[string]any `json:"metadata"`
+}
+
+type triChatTurnStartResp struct {
+	Created bool        `json:"created"`
+	Turn    triChatTurn `json:"turn"`
+}
+
+type triChatTurnGetResp struct {
+	Found         bool                  `json:"found"`
+	Turn          triChatTurn           `json:"turn"`
+	ArtifactCount int                   `json:"artifact_count"`
+	Artifacts     []triChatTurnArtifact `json:"artifacts"`
+}
+
+type triChatWorkboardDecision struct {
+	TurnID           string   `json:"turn_id"`
+	DecisionSummary  string   `json:"decision_summary"`
+	SelectedAgent    string   `json:"selected_agent"`
+	SelectedStrategy string   `json:"selected_strategy"`
+	UpdatedAt        string   `json:"updated_at"`
+	NoveltyScore     *float64 `json:"novelty_score"`
+}
+
+type triChatWorkboardResp struct {
+	ThreadID       string                    `json:"thread_id"`
+	StatusFilter   string                    `json:"status_filter"`
+	Counts         map[string]int            `json:"counts"`
+	PhaseCounts    map[string]int            `json:"phase_counts"`
+	LatestTurn     *triChatTurn              `json:"latest_turn"`
+	ActiveTurn     *triChatTurn              `json:"active_turn"`
+	LatestDecision *triChatWorkboardDecision `json:"latest_decision"`
+	Turns          []triChatTurn             `json:"turns"`
+}
+
+type triChatNoveltyProposal struct {
+	AgentID    string `json:"agent_id"`
+	Content    string `json:"content"`
+	Normalized string `json:"normalized"`
+	TokenCount int    `json:"token_count"`
+	Source     string `json:"source"`
+	CreatedAt  string `json:"created_at"`
+}
+
+type triChatNoveltyPair struct {
+	LeftAgent     string  `json:"left_agent"`
+	RightAgent    string  `json:"right_agent"`
+	Similarity    float64 `json:"similarity"`
+	OverlapTokens int     `json:"overlap_tokens"`
+	TotalTokens   int     `json:"total_tokens"`
+}
+
+type triChatNoveltyResp struct {
+	Found             bool                     `json:"found"`
+	TurnID            string                   `json:"turn_id"`
+	ThreadID          string                   `json:"thread_id"`
+	UserMessageID     string                   `json:"user_message_id"`
+	ProposalCount     int                      `json:"proposal_count"`
+	Proposals         []triChatNoveltyProposal `json:"proposals"`
+	Pairs             []triChatNoveltyPair     `json:"pairs"`
+	AverageSimilarity float64                  `json:"average_similarity"`
+	NoveltyScore      float64                  `json:"novelty_score"`
+	NoveltyThreshold  float64                  `json:"novelty_threshold"`
+	MaxSimilarity     float64                  `json:"max_similarity"`
+	RetryRequired     bool                     `json:"retry_required"`
+	RetryAgents       []string                 `json:"retry_agents"`
+	RetrySuppressed   bool                     `json:"retry_suppressed"`
+	RetryReason       string                   `json:"retry_suppression_reason"`
+	RetryReference    string                   `json:"retry_suppression_reference_turn_id"`
+	Disagreement      bool                     `json:"disagreement"`
+	DecisionHint      string                   `json:"decision_hint"`
+}
+
+type triChatTurnOrchestrateResp struct {
+	OK       bool        `json:"ok"`
+	Action   string      `json:"action"`
+	Turn     triChatTurn `json:"turn"`
+	Decision struct {
+		SelectedAgent    string `json:"selected_agent"`
+		SelectedStrategy string `json:"selected_strategy"`
+		DecisionSummary  string `json:"decision_summary"`
+	} `json:"decision"`
+	Verify struct {
+		Status  string `json:"status"`
+		Summary string `json:"summary"`
+		Failed  bool   `json:"failed"`
+	} `json:"verify"`
+}
+
+type triChatVerifyResp struct {
+	OK             bool   `json:"ok"`
+	Executed       bool   `json:"executed"`
+	Passed         *bool  `json:"passed"`
+	Cwd            string `json:"cwd"`
+	Command        string `json:"command"`
+	Reason         string `json:"reason"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	StartedAt      string `json:"started_at"`
+	FinishedAt     string `json:"finished_at"`
+	ExitCode       *int   `json:"exit_code"`
+	Signal         string `json:"signal"`
+	TimedOut       bool   `json:"timed_out"`
+	Stdout         string `json:"stdout"`
+	Stderr         string `json:"stderr"`
+	Error          string `json:"error"`
+}
+
+type triChatAdapterProtocolCheckStep struct {
+	OK              bool   `json:"ok"`
+	DurationMS      int    `json:"duration_ms"`
+	RequestID       string `json:"request_id"`
+	EnvelopeKind    string `json:"envelope_kind"`
+	ProtocolVersion string `json:"protocol_version"`
+	Error           string `json:"error"`
+	StdoutExcerpt   string `json:"stdout_excerpt"`
+	StderrExcerpt   string `json:"stderr_excerpt"`
+	ExitCode        *int   `json:"exit_code"`
+	Signal          string `json:"signal"`
+}
+
+type triChatAdapterProtocolCheckResult struct {
+	AgentID           string                           `json:"agent_id"`
+	Command           string                           `json:"command"`
+	CommandSource     string                           `json:"command_source"`
+	WrapperCandidates []string                         `json:"wrapper_candidates"`
+	OK                bool                             `json:"ok"`
+	Ping              triChatAdapterProtocolCheckStep  `json:"ping"`
+	Ask               *triChatAdapterProtocolCheckStep `json:"ask"`
+}
+
+type triChatAdapterProtocolCheckResp struct {
+	GeneratedAt     string `json:"generated_at"`
+	ProtocolVersion string `json:"protocol_version"`
+	Workspace       string `json:"workspace"`
+	TimeoutSeconds  int    `json:"timeout_seconds"`
+	RunAskCheck     bool   `json:"run_ask_check"`
+	AskDryRun       bool   `json:"ask_dry_run"`
+	ThreadID        string `json:"thread_id"`
+	AllOK           bool   `json:"all_ok"`
+	Counts          struct {
+		Total  int `json:"total"`
+		OK     int `json:"ok"`
+		PingOK int `json:"ping_ok"`
+		AskOK  int `json:"ask_ok"`
+	} `json:"counts"`
+	Results []triChatAdapterProtocolCheckResult `json:"results"`
+}
+
 type adapterTelemetryStatusResp struct {
 	Summary struct {
 		TotalChannels      int    `json:"total_channels"`
@@ -368,6 +557,9 @@ type reliabilitySnapshot struct {
 	triRetention     daemonStatusResp
 	triSummary       triChatSummaryResp
 	consensus        triChatConsensusResp
+	workboard        triChatWorkboardResp
+	activeTurn       triChatTurnGetResp
+	novelty          triChatNoveltyResp
 	adapterTelemetry adapterTelemetryStatusResp
 	busStatus        triChatBusStatusResp
 	updatedAt        time.Time
@@ -437,10 +629,13 @@ type agentRuntime struct {
 	agentID      string
 	systemPrompt string
 
-	commandBreaker breakerState
-	modelBreaker   breakerState
-	turnCount      int
-	degradedTurns  int
+	commandBreaker          breakerState
+	modelBreaker            breakerState
+	turnCount               int
+	degradedTurns           int
+	lastCommandHandshakeAt  time.Time
+	lastCommandHandshakeOK  bool
+	lastCommandHandshakeFor string
 }
 
 type agentResponse struct {
@@ -448,6 +643,26 @@ type agentResponse struct {
 	content         string
 	adapterMeta     map[string]any
 	telemetryEvents []map[string]any
+}
+
+type commandAdapterResponse struct {
+	Kind            string         `json:"kind"`
+	ProtocolVersion string         `json:"protocol_version"`
+	RequestID       string         `json:"request_id"`
+	AgentID         string         `json:"agent_id"`
+	Bridge          string         `json:"bridge"`
+	Content         string         `json:"content"`
+	Meta            map[string]any `json:"meta"`
+}
+
+type commandAdapterPong struct {
+	Kind            string         `json:"kind"`
+	ProtocolVersion string         `json:"protocol_version"`
+	RequestID       string         `json:"request_id"`
+	AgentID         string         `json:"agent_id"`
+	Bridge          string         `json:"bridge"`
+	Timestamp       string         `json:"timestamp"`
+	Meta            map[string]any `json:"meta"`
 }
 
 type orchestrator struct {
@@ -594,11 +809,13 @@ func breakerToStatePayload(agentID, channel, now string, turnCount, degraded int
 
 func (o *orchestrator) fanout(
 	prompt string,
+	promptOverrides map[string]string,
 	history []triChatMessage,
 	cfg appConfig,
 	settings runtimeSettings,
 	target string,
 	threadID string,
+	peerContext string,
 ) ([]agentResponse, []map[string]any) {
 	agents := fanoutTargets(target)
 	responses := make([]agentResponse, 0, len(agents))
@@ -615,7 +832,21 @@ func (o *orchestrator) fanout(
 		go func(runtime *agentRuntime) {
 			defer wg.Done()
 			command := commandForAgent(runtime.agentID, cfg)
-			response := runtime.respond(prompt, history, o.bootstrapText(), command, cfg, settings, o.ollamaAPI, threadID)
+			agentPrompt := prompt
+			if override, ok := promptOverrides[runtime.agentID]; ok && strings.TrimSpace(override) != "" {
+				agentPrompt = strings.TrimSpace(override)
+			}
+			response := runtime.respond(
+				agentPrompt,
+				history,
+				o.bootstrapText(),
+				command,
+				cfg,
+				settings,
+				o.ollamaAPI,
+				threadID,
+				peerContext,
+			)
 			results <- response
 		}(agent)
 	}
@@ -666,6 +897,7 @@ func (a *agentRuntime) respond(
 	settings runtimeSettings,
 	ollamaAPI string,
 	threadID string,
+	peerContext string,
 ) agentResponse {
 	start := time.Now()
 	deadline := start.Add(time.Duration(maxInt(1, settings.adapterFailoverTimeoutSecond)) * time.Second)
@@ -685,7 +917,7 @@ func (a *agentRuntime) respond(
 		channels = []string{"command", "model"}
 	}
 
-	messages := buildOllamaMessages(a.systemPrompt, prompt, history, bootstrapText)
+	messages := buildOllamaMessages(a.systemPrompt, prompt, history, bootstrapText, peerContext)
 
 	for _, channel := range channels {
 		now := time.Now()
@@ -704,16 +936,77 @@ func (a *agentRuntime) respond(
 				continue
 			}
 
+			handshakeTTL := adapterHandshakeTTL()
+			a.mu.Lock()
+			needsHandshake := strings.TrimSpace(command) != a.lastCommandHandshakeFor ||
+				!a.lastCommandHandshakeOK ||
+				a.lastCommandHandshakeAt.IsZero() ||
+				now.Sub(a.lastCommandHandshakeAt) >= handshakeTTL
+			a.mu.Unlock()
+			if needsHandshake {
+				pingRequestID := adapterRequestID(a.agentID, "ping")
+				pingPayload := map[string]any{
+					"op":               "ping",
+					"protocol_version": adapterProtocol,
+					"request_id":       pingRequestID,
+					"agent_id":         a.agentID,
+					"thread_id":        threadID,
+					"workspace":        cfg.repoRoot,
+					"timestamp":        time.Now().UTC().Format(time.RFC3339),
+				}
+				pingTimeout := minDuration(remaining, 5*time.Second)
+				pingErr := pingCommandAdapter(command, pingPayload, pingTimeout)
+				a.mu.Lock()
+				a.lastCommandHandshakeAt = time.Now().UTC()
+				a.lastCommandHandshakeFor = strings.TrimSpace(command)
+				a.lastCommandHandshakeOK = pingErr == nil
+				a.mu.Unlock()
+				if pingErr != nil {
+					errText := fmt.Sprintf("RuntimeError: adapter handshake failed: %v", pingErr)
+					events = append(events, telemetryEvent(a.agentID, "command", "handshake_failed", errText, "", map[string]any{
+						"path":       "command",
+						"request_id": pingRequestID,
+					}))
+					a.mu.Lock()
+					tripped := a.commandBreaker.recordFailure(time.Now(), errText)
+					openUntil := a.commandBreaker.openUntil
+					lastError := a.commandBreaker.lastError
+					a.mu.Unlock()
+					if tripped {
+						events = append(events, telemetryEvent(a.agentID, "command", "trip_opened", lastError, openUntil.Format(time.RFC3339), map[string]any{
+							"path":      "command",
+							"stage":     "handshake",
+							"threshold": maxInt(1, settings.adapterCircuitThreshold),
+						}))
+					}
+					attempts = append(attempts, "command:handshake("+compactSingleLine(errText, 120)+")")
+					continue
+				}
+			}
+
+			requestID := adapterRequestID(a.agentID, "ask")
+			turnPhase := adapterDirective(prompt, "TRICHAT_TURN_PHASE")
+			roleHint := adapterDirective(prompt, "TRICHAT_ROLE")
+			roleObjective := adapterDirective(prompt, "TRICHAT_ROLE_OBJECTIVE")
+			responseMode := inferAdapterResponseMode(prompt)
 			timeout := minDuration(remaining, time.Duration(maxInt(1, settings.bridgeTimeoutSeconds))*time.Second)
-			content, err := callCommandAdapter(command, map[string]any{
-				"agent_id":       a.agentID,
-				"thread_id":      threadID,
-				"prompt":         prompt,
-				"history":        history,
-				"bootstrap_text": bootstrapText,
-				"peer_context":   "",
-				"workspace":      cfg.repoRoot,
-				"timestamp":      time.Now().UTC().Format(time.RFC3339),
+			envelope, err := callCommandAdapter(command, map[string]any{
+				"op":                     "ask",
+				"protocol_version":       adapterProtocol,
+				"request_id":             requestID,
+				"agent_id":               a.agentID,
+				"thread_id":              threadID,
+				"prompt":                 prompt,
+				"history":                history,
+				"bootstrap_text":         bootstrapText,
+				"peer_context":           peerContext,
+				"workspace":              cfg.repoRoot,
+				"timestamp":              time.Now().UTC().Format(time.RFC3339),
+				"turn_phase":             turnPhase,
+				"role_hint":              roleHint,
+				"role_objective":         roleObjective,
+				"response_mode":          responseMode,
+				"collaboration_contract": "coordinate with other agents and avoid duplicate strategy",
 			}, timeout)
 			if err == nil {
 				a.mu.Lock()
@@ -725,12 +1018,17 @@ func (a *agentRuntime) respond(
 				if recovered {
 					events = append(events, telemetryEvent(a.agentID, "command", "recovered", "", "", map[string]any{"path": "command"}))
 				}
+				content := envelope.Content
 				meta := map[string]any{
-					"adapter":  "command",
-					"command":  command,
-					"degraded": false,
-					"attempts": attempts,
-					"circuit":  status,
+					"adapter":          "command",
+					"command":          command,
+					"degraded":         false,
+					"attempts":         attempts,
+					"circuit":          status,
+					"request_id":       envelope.RequestID,
+					"protocol_version": envelope.ProtocolVersion,
+					"bridge":           nullIfEmpty(envelope.Bridge),
+					"bridge_meta":      envelope.Meta,
 				}
 				if len(attempts) > 0 {
 					content = "[failover recovered via command after: " + strings.Join(attempts, "; ") + "]\n\n" + content
@@ -875,7 +1173,13 @@ func telemetryEvent(agentID, channel, eventType, errorText, openUntil string, de
 	return payload
 }
 
-func buildOllamaMessages(systemPrompt, prompt string, history []triChatMessage, bootstrap string) []map[string]string {
+func buildOllamaMessages(
+	systemPrompt string,
+	prompt string,
+	history []triChatMessage,
+	bootstrap string,
+	peerContext string,
+) []map[string]string {
 	historyLines := make([]string, 0, 30)
 	start := 0
 	if len(history) > historyWindowSize {
@@ -900,6 +1204,9 @@ func buildOllamaMessages(systemPrompt, prompt string, history []triChatMessage, 
 		"- keep under 6 lines unless the user asks for deep detail",
 		"- do not include boilerplate sections like next actions or thread recap",
 	}
+	if strings.TrimSpace(peerContext) != "" {
+		parts = append(parts, "", "Peer context:", truncate(compactSingleLine(peerContext, 1500), 1500))
+	}
 	if strings.TrimSpace(bootstrap) != "" {
 		parts = append(parts, "", "Imprint bootstrap context:", truncate(bootstrap, bootstrapMaxChars))
 	}
@@ -910,10 +1217,69 @@ func buildOllamaMessages(systemPrompt, prompt string, history []triChatMessage, 
 	}
 }
 
-func callCommandAdapter(command string, payload map[string]any, timeout time.Duration) (string, error) {
+func adapterHandshakeTTL() time.Duration {
+	seconds := clampInt(envOrInt("TRICHAT_ADAPTER_HANDSHAKE_TTL_SECONDS", 120), 10, 900)
+	return time.Duration(seconds) * time.Second
+}
+
+func adapterRequestID(agentID string, operation string) string {
+	safeAgent := safeToolPattern.ReplaceAllString(strings.ToLower(strings.TrimSpace(agentID)), "-")
+	safeAgent = strings.Trim(safeAgent, "-")
+	if safeAgent == "" {
+		safeAgent = "agent"
+	}
+	safeOp := safeToolPattern.ReplaceAllString(strings.ToLower(strings.TrimSpace(operation)), "-")
+	safeOp = strings.Trim(safeOp, "-")
+	if safeOp == "" {
+		safeOp = "ask"
+	}
+	return fmt.Sprintf("trichat-%s-%s-%d", safeAgent, safeOp, time.Now().UnixNano())
+}
+
+func asTrimmedString(value any) string {
+	if value == nil {
+		return ""
+	}
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		return strings.TrimSpace(fmt.Sprint(value))
+	}
+}
+
+func adapterDirective(prompt string, key string) string {
+	lines := strings.Split(strings.ReplaceAll(prompt, "\r", ""), "\n")
+	prefix := strings.ToUpper(strings.TrimSpace(key)) + "="
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToUpper(trimmed), prefix) {
+			continue
+		}
+		value := strings.TrimSpace(trimmed[len(prefix):])
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func inferAdapterResponseMode(prompt string) string {
+	mode := strings.ToLower(strings.TrimSpace(adapterDirective(prompt, "TRICHAT_RESPONSE_MODE")))
+	if mode == "json" {
+		return "json"
+	}
+	normalized := strings.ToLower(prompt)
+	if strings.Contains(normalized, "return only json") || strings.Contains(normalized, "valid json object") {
+		return "json"
+	}
+	return "plain"
+}
+
+func runCommandAdapterRaw(command string, payload map[string]any, timeout time.Duration) (string, string, error) {
 	parts := splitCommand(command)
 	if len(parts) == 0 {
-		return "", errors.New("empty command adapter")
+		return "", "", errors.New("empty command adapter")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), maxDuration(time.Second, timeout))
 	defer cancel()
@@ -926,32 +1292,118 @@ func callCommandAdapter(command string, payload map[string]any, timeout time.Dur
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return "", fmt.Errorf("bridge timeout")
+			return "", strings.TrimSpace(stderr.String()), fmt.Errorf("bridge timeout")
 		}
 		errText := strings.TrimSpace(stderr.String())
 		if errText == "" {
 			errText = err.Error()
 		}
-		return "", fmt.Errorf("bridge command failed: %s", errText)
+		return "", errText, fmt.Errorf("bridge command failed: %s", errText)
 	}
 	output := strings.TrimSpace(stdout.String())
 	if output == "" {
-		return "", errors.New("bridge command returned empty stdout")
+		return "", strings.TrimSpace(stderr.String()), errors.New("bridge command returned empty stdout")
 	}
-	var parsed any
-	if err := json.Unmarshal([]byte(output), &parsed); err == nil {
-		switch value := parsed.(type) {
-		case map[string]any:
-			if content, ok := value["content"].(string); ok && strings.TrimSpace(content) != "" {
-				return strings.TrimSpace(content), nil
-			}
-		case string:
-			if strings.TrimSpace(value) != "" {
-				return strings.TrimSpace(value), nil
-			}
-		}
+	return output, strings.TrimSpace(stderr.String()), nil
+}
+
+func callCommandAdapter(command string, payload map[string]any, timeout time.Duration) (commandAdapterResponse, error) {
+	expectedRequestID := asTrimmedString(payload["request_id"])
+	expectedAgentID := asTrimmedString(payload["agent_id"])
+	if expectedRequestID == "" {
+		return commandAdapterResponse{}, errors.New("adapter payload missing request_id")
 	}
-	return output, nil
+	if expectedAgentID == "" {
+		return commandAdapterResponse{}, errors.New("adapter payload missing agent_id")
+	}
+	output, stderr, err := runCommandAdapterRaw(command, payload, timeout)
+	if err != nil {
+		return commandAdapterResponse{}, err
+	}
+	var envelope commandAdapterResponse
+	if decodeErr := json.Unmarshal([]byte(output), &envelope); decodeErr != nil {
+		return commandAdapterResponse{}, fmt.Errorf(
+			"bridge protocol violation: invalid JSON envelope: %v stdout=%s stderr=%s",
+			decodeErr,
+			compactSingleLine(output, 220),
+			compactSingleLine(stderr, 180),
+		)
+	}
+	if strings.TrimSpace(envelope.Kind) != adapterResponseKind {
+		return commandAdapterResponse{}, fmt.Errorf("bridge protocol violation: expected kind=%s got=%s", adapterResponseKind, strings.TrimSpace(envelope.Kind))
+	}
+	if strings.TrimSpace(envelope.ProtocolVersion) != adapterProtocol {
+		return commandAdapterResponse{}, fmt.Errorf(
+			"bridge protocol violation: expected protocol_version=%s got=%s",
+			adapterProtocol,
+			strings.TrimSpace(envelope.ProtocolVersion),
+		)
+	}
+	if strings.TrimSpace(envelope.RequestID) != expectedRequestID {
+		return commandAdapterResponse{}, fmt.Errorf(
+			"bridge protocol violation: request_id mismatch expected=%s got=%s",
+			expectedRequestID,
+			strings.TrimSpace(envelope.RequestID),
+		)
+	}
+	if strings.TrimSpace(envelope.AgentID) != expectedAgentID {
+		return commandAdapterResponse{}, fmt.Errorf(
+			"bridge protocol violation: agent_id mismatch expected=%s got=%s",
+			expectedAgentID,
+			strings.TrimSpace(envelope.AgentID),
+		)
+	}
+	envelope.Content = strings.TrimSpace(envelope.Content)
+	if envelope.Content == "" {
+		return commandAdapterResponse{}, errors.New("bridge protocol violation: empty content in adapter response")
+	}
+	if envelope.Meta == nil {
+		envelope.Meta = map[string]any{}
+	}
+	return envelope, nil
+}
+
+func pingCommandAdapter(command string, payload map[string]any, timeout time.Duration) error {
+	expectedRequestID := asTrimmedString(payload["request_id"])
+	expectedAgentID := asTrimmedString(payload["agent_id"])
+	output, stderr, err := runCommandAdapterRaw(command, payload, timeout)
+	if err != nil {
+		return err
+	}
+	var pong commandAdapterPong
+	if decodeErr := json.Unmarshal([]byte(output), &pong); decodeErr != nil {
+		return fmt.Errorf(
+			"adapter handshake invalid JSON: %v stdout=%s stderr=%s",
+			decodeErr,
+			compactSingleLine(output, 220),
+			compactSingleLine(stderr, 180),
+		)
+	}
+	if strings.TrimSpace(pong.Kind) != adapterPongKind {
+		return fmt.Errorf("adapter handshake invalid kind: expected=%s got=%s", adapterPongKind, strings.TrimSpace(pong.Kind))
+	}
+	if strings.TrimSpace(pong.ProtocolVersion) != adapterProtocol {
+		return fmt.Errorf(
+			"adapter handshake protocol mismatch: expected=%s got=%s",
+			adapterProtocol,
+			strings.TrimSpace(pong.ProtocolVersion),
+		)
+	}
+	if strings.TrimSpace(pong.RequestID) != expectedRequestID {
+		return fmt.Errorf(
+			"adapter handshake request_id mismatch: expected=%s got=%s",
+			expectedRequestID,
+			strings.TrimSpace(pong.RequestID),
+		)
+	}
+	if strings.TrimSpace(pong.AgentID) != expectedAgentID {
+		return fmt.Errorf(
+			"adapter handshake agent_id mismatch: expected=%s got=%s",
+			expectedAgentID,
+			strings.TrimSpace(pong.AgentID),
+		)
+	}
+	return nil
 }
 
 func callOllama(apiBase, model string, messages []map[string]string, timeout time.Duration) (string, error) {
@@ -1325,10 +1777,19 @@ func (m model) initCmd() tea.Cmd {
 			"trichat.thread_list",
 			"trichat.thread_get",
 			"trichat.message_post",
+			"trichat.turn_start",
+			"trichat.turn_advance",
+			"trichat.turn_artifact",
+			"trichat.turn_get",
+			"trichat.turn_orchestrate",
+			"trichat.workboard",
+			"trichat.novelty",
+			"trichat.verify",
 			"trichat.timeline",
 			"trichat.bus",
 			"trichat.summary",
 			"trichat.consensus",
+			"trichat.adapter_protocol_check",
 			"trichat.adapter_telemetry",
 			"task.summary",
 			"task.auto_retry",
@@ -1507,6 +1968,28 @@ func (m model) refreshCmd() tea.Cmd {
 		})
 		if err == nil {
 			reliability.consensus, _ = decodeAny[triChatConsensusResp](consensusPayload)
+		}
+		workboardPayload, err := caller.callTool("trichat.workboard", map[string]any{
+			"thread_id": threadID,
+			"limit":     24,
+		})
+		if err == nil {
+			reliability.workboard, _ = decodeAny[triChatWorkboardResp](workboardPayload)
+		}
+		if reliability.workboard.ActiveTurn != nil && strings.TrimSpace(reliability.workboard.ActiveTurn.TurnID) != "" {
+			turnPayload, err := caller.callTool("trichat.turn_get", map[string]any{
+				"turn_id":           reliability.workboard.ActiveTurn.TurnID,
+				"include_artifacts": false,
+			})
+			if err == nil {
+				reliability.activeTurn, _ = decodeAny[triChatTurnGetResp](turnPayload)
+			}
+			noveltyPayload, err := caller.callTool("trichat.novelty", map[string]any{
+				"turn_id": reliability.workboard.ActiveTurn.TurnID,
+			})
+			if err == nil {
+				reliability.novelty, _ = decodeAny[triChatNoveltyResp](noveltyPayload)
+			}
 		}
 		busStatusPayload, err := caller.callTool("trichat.bus", map[string]any{"action": "status"})
 		if err == nil {
@@ -1771,6 +2254,44 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 			} `json:"message"`
 		}](postResult)
 		userMessageID := posted.Message.MessageID
+		turnID := ""
+		turnWarning := ""
+
+		expectedAgents := fanoutTargets(target)
+		minAgents := settings.consensusMinAgents
+		if len(expectedAgents) < minAgents {
+			minAgents = len(expectedAgents)
+		}
+		minAgents = maxInt(1, minAgents)
+		turnStartPayload, err := caller.callTool("trichat.turn_start", map[string]any{
+			"mutation":        mutation.next("trichat.turn_start"),
+			"thread_id":       threadID,
+			"user_message_id": userMessageID,
+			"user_prompt":     prompt,
+			"expected_agents": expectedAgents,
+			"min_agents":      minAgents,
+			"metadata": map[string]any{
+				"source":      "trichat-tui",
+				"fanout_mode": target,
+			},
+		})
+		if err == nil {
+			turnStart, decodeErr := decodeAny[triChatTurnStartResp](turnStartPayload)
+			if decodeErr == nil {
+				turnID = strings.TrimSpace(turnStart.Turn.TurnID)
+				if turnID != "" {
+					_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+						"mutation":     mutation.next("trichat.turn_advance"),
+						"turn_id":      turnID,
+						"phase":        "propose",
+						"phase_status": "running",
+						"status":       "running",
+					})
+				}
+			}
+		} else {
+			turnWarning = compactSingleLine(err.Error(), 140)
+		}
 
 		historyPayload, err := caller.callTool("trichat.timeline", map[string]any{"thread_id": threadID, "limit": 48})
 		if err != nil {
@@ -1781,8 +2302,11 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 			history.Messages = currentMessages
 		}
 
-		responses, events := orch.fanout(prompt, history.Messages, cfg, settings, target, threadID)
+		proposalPrompt := buildProposalPrompt(prompt, target)
+		proposalPromptOverrides := buildProposalPromptOverrides(prompt, target, expectedAgents)
+		responses, events := orch.fanout(proposalPrompt, proposalPromptOverrides, history.Messages, cfg, settings, target, threadID, "")
 		for _, response := range responses {
+			structured := parseProposalStructured(response.content, response.agentID, false)
 			postArgs := map[string]any{
 				"mutation":            mutation.next("trichat.message_post"),
 				"thread_id":           threadID,
@@ -1791,14 +2315,276 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 				"content":             response.content,
 				"reply_to_message_id": userMessageID,
 				"metadata": map[string]any{
-					"kind":    "fanout-response",
-					"source":  "trichat-tui",
-					"adapter": response.adapterMeta,
+					"kind":         "fanout-proposal",
+					"source":       "trichat-tui",
+					"adapter":      response.adapterMeta,
+					"phase":        "propose",
+					"structured_v": 1,
+					"structured":   structured,
 				},
 			}
 			if _, err := caller.callTool("trichat.message_post", postArgs); err != nil {
 				return actionDoneMsg{err: err}
 			}
+			if turnID != "" {
+				_, _ = caller.callTool("trichat.turn_artifact", map[string]any{
+					"mutation":      mutation.next("trichat.turn_artifact"),
+					"turn_id":       turnID,
+					"phase":         "propose",
+					"artifact_type": "proposal",
+					"agent_id":      response.agentID,
+					"content":       response.content,
+					"structured":    structured,
+					"score":         proposalConfidence(structured),
+					"metadata": map[string]any{
+						"source": "trichat-tui",
+						"target": target,
+					},
+				})
+			}
+		}
+
+		novelty := triChatNoveltyResp{}
+		if turnID != "" {
+			noveltyPayload, noveltyErr := caller.callTool("trichat.novelty", map[string]any{
+				"turn_id":           turnID,
+				"novelty_threshold": 0.35,
+				"max_similarity":    0.82,
+			})
+			if noveltyErr == nil {
+				decoded, decodeErr := decodeAny[triChatNoveltyResp](noveltyPayload)
+				if decodeErr == nil {
+					novelty = decoded
+				}
+			}
+		}
+
+		if novelty.Found && novelty.RetryRequired && len(novelty.RetryAgents) > 0 {
+			_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+				"mutation":          mutation.next("trichat.turn_advance"),
+				"turn_id":           turnID,
+				"phase":             "propose",
+				"phase_status":      "running",
+				"status":            "running",
+				"retry_required":    true,
+				"retry_agents":      novelty.RetryAgents,
+				"novelty_score":     novelty.NoveltyScore,
+				"novelty_threshold": novelty.NoveltyThreshold,
+				"disagreement":      novelty.Disagreement,
+			})
+			peerContext := buildPeerContext(novelty.Proposals)
+			for _, retryAgent := range novelty.RetryAgents {
+				agent := strings.ToLower(strings.TrimSpace(retryAgent))
+				if agent == "" {
+					continue
+				}
+				deltaPrompt := buildDeltaRetryPrompt(prompt, agent, peerContext)
+				deltaResponses, deltaEvents := orch.fanout(
+					deltaPrompt,
+					nil,
+					history.Messages,
+					cfg,
+					settings,
+					agent,
+					threadID,
+					peerContext,
+				)
+				events = append(events, deltaEvents...)
+				for _, delta := range deltaResponses {
+					deltaStructured := parseProposalStructured(delta.content, delta.agentID, true)
+					_, err := caller.callTool("trichat.message_post", map[string]any{
+						"mutation":            mutation.next("trichat.message_post"),
+						"thread_id":           threadID,
+						"agent_id":            delta.agentID,
+						"role":                "assistant",
+						"content":             delta.content,
+						"reply_to_message_id": userMessageID,
+						"metadata": map[string]any{
+							"kind":         "fanout-proposal-delta",
+							"source":       "trichat-tui",
+							"adapter":      delta.adapterMeta,
+							"phase":        "propose",
+							"structured_v": 1,
+							"structured":   deltaStructured,
+						},
+					})
+					if err != nil {
+						return actionDoneMsg{err: err}
+					}
+					if turnID != "" {
+						_, _ = caller.callTool("trichat.turn_artifact", map[string]any{
+							"mutation":      mutation.next("trichat.turn_artifact"),
+							"turn_id":       turnID,
+							"phase":         "propose",
+							"artifact_type": "proposal_retry",
+							"agent_id":      delta.agentID,
+							"content":       delta.content,
+							"structured":    deltaStructured,
+							"score":         proposalConfidence(deltaStructured),
+							"metadata": map[string]any{
+								"source":      "trichat-tui",
+								"retry_agent": agent,
+							},
+						})
+					}
+				}
+			}
+
+			noveltyPayload, noveltyErr := caller.callTool("trichat.novelty", map[string]any{
+				"turn_id":           turnID,
+				"novelty_threshold": 0.35,
+				"max_similarity":    0.82,
+			})
+			if noveltyErr == nil {
+				decoded, decodeErr := decodeAny[triChatNoveltyResp](noveltyPayload)
+				if decodeErr == nil {
+					novelty = decoded
+				}
+			}
+		}
+
+		if turnID != "" {
+			_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+				"mutation":          mutation.next("trichat.turn_advance"),
+				"turn_id":           turnID,
+				"phase":             "propose",
+				"phase_status":      "completed",
+				"status":            "running",
+				"novelty_score":     novelty.NoveltyScore,
+				"novelty_threshold": novelty.NoveltyThreshold,
+				"retry_required":    novelty.RetryRequired,
+				"retry_agents":      novelty.RetryAgents,
+				"disagreement":      novelty.Disagreement,
+			})
+		}
+
+		peerContext := buildPeerContext(novelty.Proposals)
+		critiqueAgents := resolveCritiqueAgents(novelty, responses)
+		if turnID != "" {
+			if len(critiqueAgents) > 1 {
+				_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+					"mutation":     mutation.next("trichat.turn_advance"),
+					"turn_id":      turnID,
+					"phase":        "critique",
+					"phase_status": "running",
+					"status":       "running",
+				})
+				for index, critic := range critiqueAgents {
+					targetAgent := critiqueAgents[(index+1)%len(critiqueAgents)]
+					critiquePrompt := buildCritiquePrompt(prompt, critic, targetAgent, peerContext)
+					critiqueResponses, critiqueEvents := orch.fanout(
+						critiquePrompt,
+						nil,
+						history.Messages,
+						cfg,
+						settings,
+						critic,
+						threadID,
+						peerContext,
+					)
+					events = append(events, critiqueEvents...)
+					for _, critiqueResponse := range critiqueResponses {
+						critiqueStructured := parseCritiqueStructured(critiqueResponse.content, critic, targetAgent)
+						_, err := caller.callTool("trichat.message_post", map[string]any{
+							"mutation":            mutation.next("trichat.message_post"),
+							"thread_id":           threadID,
+							"agent_id":            critiqueResponse.agentID,
+							"role":                "assistant",
+							"content":             critiqueResponse.content,
+							"reply_to_message_id": userMessageID,
+							"metadata": map[string]any{
+								"kind":         "fanout-critique",
+								"source":       "trichat-tui",
+								"adapter":      critiqueResponse.adapterMeta,
+								"phase":        "critique",
+								"structured_v": 1,
+								"structured":   critiqueStructured,
+							},
+						})
+						if err != nil {
+							return actionDoneMsg{err: err}
+						}
+						_, _ = caller.callTool("trichat.turn_artifact", map[string]any{
+							"mutation":      mutation.next("trichat.turn_artifact"),
+							"turn_id":       turnID,
+							"phase":         "critique",
+							"artifact_type": "critique",
+							"agent_id":      critiqueResponse.agentID,
+							"content":       critiqueResponse.content,
+							"structured":    critiqueStructured,
+							"score":         critiqueConfidence(critiqueStructured),
+							"metadata": map[string]any{
+								"source":       "trichat-tui",
+								"target_agent": targetAgent,
+							},
+						})
+					}
+				}
+				_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+					"mutation":     mutation.next("trichat.turn_advance"),
+					"turn_id":      turnID,
+					"phase":        "critique",
+					"phase_status": "completed",
+					"status":       "running",
+				})
+			} else {
+				_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+					"mutation":     mutation.next("trichat.turn_advance"),
+					"turn_id":      turnID,
+					"phase":        "critique",
+					"phase_status": "skipped",
+					"status":       "running",
+				})
+			}
+		}
+
+		selectedAgent, selectedStrategy, decisionSummary := deriveTurnDecision(novelty, responses)
+		if turnID != "" {
+			orchestratePayload, orchestrateErr := caller.callTool("trichat.turn_orchestrate", map[string]any{
+				"mutation":          mutation.next("trichat.turn_orchestrate"),
+				"turn_id":           turnID,
+				"action":            "decide",
+				"novelty_threshold": 0.35,
+				"max_similarity":    0.82,
+			})
+			if orchestrateErr != nil {
+				turnWarning = compactSingleLine(orchestrateErr.Error(), 140)
+			} else {
+				orchestrated, decodeErr := decodeAny[triChatTurnOrchestrateResp](orchestratePayload)
+				if decodeErr != nil {
+					turnWarning = compactSingleLine("turn_orchestrate decode failed: "+decodeErr.Error(), 140)
+				} else {
+					if strings.TrimSpace(orchestrated.Decision.SelectedAgent) != "" {
+						selectedAgent = strings.TrimSpace(orchestrated.Decision.SelectedAgent)
+					}
+					if strings.TrimSpace(orchestrated.Decision.SelectedStrategy) != "" {
+						selectedStrategy = strings.TrimSpace(orchestrated.Decision.SelectedStrategy)
+					}
+					if strings.TrimSpace(orchestrated.Decision.DecisionSummary) != "" {
+						decisionSummary = strings.TrimSpace(orchestrated.Decision.DecisionSummary)
+					} else if strings.TrimSpace(orchestrated.Turn.DecisionSummary) != "" {
+						decisionSummary = strings.TrimSpace(orchestrated.Turn.DecisionSummary)
+					}
+				}
+			}
+		}
+		if strings.TrimSpace(decisionSummary) != "" {
+			_, _ = caller.callTool("trichat.message_post", map[string]any{
+				"mutation":  mutation.next("trichat.message_post"),
+				"thread_id": threadID,
+				"agent_id":  "router",
+				"role":      "system",
+				"content":   decisionSummary,
+				"metadata": map[string]any{
+					"kind":              "turn-decision",
+					"turn_id":           turnID,
+					"selected_agent":    selectedAgent,
+					"selected_strategy": compactSingleLine(selectedStrategy, 220),
+					"retry_required":    novelty.RetryRequired,
+					"novelty_score":     novelty.NoveltyScore,
+					"source":            "trichat-tui",
+				},
+			})
 		}
 
 		states := orch.collectStates(cfg, settings)
@@ -1812,11 +2598,700 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 		}
 		_, _ = caller.callTool("trichat.adapter_telemetry", recordArgs)
 
-		if target == "all" {
-			return actionDoneMsg{status: "fanout complete: codex, cursor, local-imprint", refresh: true}
+		turnStatus := ""
+		if turnID != "" {
+			turnStatus = " turn=" + turnID
 		}
-		return actionDoneMsg{status: "response complete: " + target, refresh: true}
+		noveltyStatus := ""
+		if novelty.Found {
+			noveltyStatus = fmt.Sprintf(" novelty=%.2f retry=%s", novelty.NoveltyScore, onOff(novelty.RetryRequired))
+			if novelty.RetrySuppressed {
+				noveltyStatus += " dedupe=on"
+			}
+		}
+		decisionStatus := ""
+		if strings.TrimSpace(selectedAgent) != "" {
+			decisionStatus = " selected=" + selectedAgent
+		}
+		warningStatus := ""
+		if strings.TrimSpace(turnWarning) != "" {
+			warningStatus = " turn_warn=" + turnWarning
+		}
+		if target == "all" {
+			return actionDoneMsg{
+				status:  "fanout complete: codex, cursor, local-imprint" + turnStatus + noveltyStatus + decisionStatus + warningStatus,
+				refresh: true,
+			}
+		}
+		return actionDoneMsg{
+			status:  "response complete: " + target + turnStatus + noveltyStatus + decisionStatus + warningStatus,
+			refresh: true,
+		}
 	}
+}
+
+type proposalRoleProfile struct {
+	RoleID          string
+	RoleLabel       string
+	PrimaryFocus    string
+	DistinctiveMove string
+	CoordinationTip string
+}
+
+func proposalRoleForAgent(agentID string) proposalRoleProfile {
+	switch strings.ToLower(strings.TrimSpace(agentID)) {
+	case "codex":
+		return proposalRoleProfile{
+			RoleID:          "implementer",
+			RoleLabel:       "Implementation Lead",
+			PrimaryFocus:    "translate objective into concrete build steps with executable commands",
+			DistinctiveMove: "optimize for direct, testable implementation velocity",
+			CoordinationTip: "ask planner and critic lanes for constraints before final command list",
+		}
+	case "cursor":
+		return proposalRoleProfile{
+			RoleID:          "planner",
+			RoleLabel:       "Planning Strategist",
+			PrimaryFocus:    "decompose objective into milestones, tradeoffs, and execution sequence",
+			DistinctiveMove: "optimize for architecture coherence and change sequencing",
+			CoordinationTip: "handoff implementation-ready checklist to implementer lane",
+		}
+	default:
+		return proposalRoleProfile{
+			RoleID:          "reliability-critic",
+			RoleLabel:       "Reliability Critic",
+			PrimaryFocus:    "surface failure modes, safety constraints, and rollback planning",
+			DistinctiveMove: "optimize for resilience, observability, and idempotent operations",
+			CoordinationTip: "return edge cases and verifier hooks for peer lanes",
+		}
+	}
+}
+
+func buildProposalPrompt(userPrompt string, target string) string {
+	return strings.TrimSpace(
+		fmt.Sprintf(
+			`TRICHAT_TURN_PHASE=propose
+TRICHAT_RESPONSE_MODE=json
+User objective:
+%s
+
+Multi-agent contract:
+- Produce a distinct strategy, not a copy of peers.
+- Favor your agent's natural bias and strengths.
+- Return ONLY JSON with keys: strategy, plan_steps, risks, commands, confidence, role_lane, coordination_handoff.
+- "plan_steps", "risks", and "commands" must be arrays of short strings.
+- confidence must be a number from 0 to 1.
+- role_lane and coordination_handoff must be short strings.
+- Do not add markdown fences or extra commentary.
+
+Execution target:
+%s`,
+			strings.TrimSpace(userPrompt),
+			strings.TrimSpace(target),
+		),
+	)
+}
+
+func buildProposalPromptOverrides(userPrompt string, target string, agents []string) map[string]string {
+	overrides := make(map[string]string, len(agents))
+	normalizedAgents := make([]string, 0, len(agents))
+	seen := make(map[string]struct{}, len(agents))
+	for _, agent := range agents {
+		normalized := strings.ToLower(strings.TrimSpace(agent))
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		normalizedAgents = append(normalizedAgents, normalized)
+	}
+	if len(normalizedAgents) == 0 {
+		normalizedAgents = fanoutTargets(target)
+	}
+
+	for _, agent := range normalizedAgents {
+		collaborators := make([]string, 0, len(normalizedAgents)-1)
+		for _, other := range normalizedAgents {
+			if other == agent {
+				continue
+			}
+			collaborators = append(collaborators, other)
+		}
+		overrides[agent] = buildProposalPromptForAgent(userPrompt, target, agent, collaborators)
+	}
+	return overrides
+}
+
+func buildProposalPromptForAgent(userPrompt string, target string, agentID string, collaborators []string) string {
+	profile := proposalRoleForAgent(agentID)
+	collabLabel := strings.Join(collaborators, ",")
+	if collabLabel == "" {
+		collabLabel = "(none)"
+	}
+	return strings.TrimSpace(
+		fmt.Sprintf(
+			`TRICHAT_TURN_PHASE=propose
+TRICHAT_RESPONSE_MODE=json
+TRICHAT_ROLE=%s
+TRICHAT_ROLE_OBJECTIVE=%s
+TRICHAT_AGENT=%s
+TRICHAT_COLLABORATORS=%s
+User objective:
+%s
+
+Lane contract:
+- You are the %s (%s lane).
+- Primary focus: %s.
+- Distinctive move: %s.
+- Coordination tip: %s.
+
+Multi-agent contract:
+- Do not mirror peer wording or structure.
+- Include one handoff the next lane can execute immediately.
+- Return ONLY JSON with keys: strategy, plan_steps, risks, commands, confidence, role_lane, coordination_handoff.
+- "plan_steps", "risks", and "commands" must be arrays of short strings.
+- confidence must be a number from 0 to 1.
+- role_lane and coordination_handoff must be short strings.
+
+Execution target:
+%s`,
+			profile.RoleID,
+			profile.PrimaryFocus,
+			strings.TrimSpace(agentID),
+			collabLabel,
+			strings.TrimSpace(userPrompt),
+			profile.RoleLabel,
+			profile.RoleID,
+			profile.PrimaryFocus,
+			profile.DistinctiveMove,
+			profile.CoordinationTip,
+			strings.TrimSpace(target),
+		),
+	)
+}
+
+func buildPeerContext(proposals []triChatNoveltyProposal) string {
+	if len(proposals) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(proposals))
+	for _, proposal := range proposals {
+		lines = append(lines, fmt.Sprintf("%s: %s", proposal.AgentID, compactSingleLine(proposal.Content, 180)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func buildDeltaRetryPrompt(userPrompt string, agentID string, peerContext string) string {
+	profile := proposalRoleForAgent(agentID)
+	return strings.TrimSpace(
+		fmt.Sprintf(
+			`TRICHAT_TURN_PHASE=propose_delta
+TRICHAT_RESPONSE_MODE=json
+TRICHAT_ROLE=%s
+TRICHAT_ROLE_OBJECTIVE=%s
+User objective:
+%s
+
+You are %s.
+Your previous strategy was too similar to peers. Stay in your lane (%s) and increase novelty materially.
+Generate a materially different plan from the peer context below.
+Peer context:
+%s
+
+Return ONLY JSON with keys: strategy, plan_steps, risks, commands, confidence, role_lane, coordination_handoff.
+Do not copy or lightly paraphrase existing strategies.`,
+			profile.RoleID,
+			profile.PrimaryFocus,
+			strings.TrimSpace(userPrompt),
+			strings.TrimSpace(agentID),
+			profile.RoleID,
+			truncate(peerContext, 1200),
+		),
+	)
+}
+
+func buildCritiquePrompt(userPrompt string, criticAgent string, targetAgent string, peerContext string) string {
+	profile := proposalRoleForAgent(criticAgent)
+	return strings.TrimSpace(
+		fmt.Sprintf(
+			`TRICHAT_TURN_PHASE=critique
+TRICHAT_RESPONSE_MODE=json
+TRICHAT_ROLE=%s
+TRICHAT_ROLE_OBJECTIVE=%s
+User objective:
+%s
+
+You are %s reviewing %s's proposal.
+Peer context:
+%s
+
+Return ONLY JSON with keys: critique, concerns, recommendation, confidence.
+- concerns must be an array of short strings.
+- recommendation is one concrete improvement.
+- confidence is a number from 0 to 1.`,
+			profile.RoleID,
+			profile.PrimaryFocus,
+			strings.TrimSpace(userPrompt),
+			strings.TrimSpace(criticAgent),
+			strings.TrimSpace(targetAgent),
+			truncate(peerContext, 1200),
+		),
+	)
+}
+
+func resolveCritiqueAgents(novelty triChatNoveltyResp, responses []agentResponse) []string {
+	unique := make(map[string]struct{}, 3)
+	if novelty.Found {
+		for _, proposal := range novelty.Proposals {
+			agent := strings.ToLower(strings.TrimSpace(proposal.AgentID))
+			if agent != "" {
+				unique[agent] = struct{}{}
+			}
+		}
+	}
+	if len(unique) == 0 {
+		for _, response := range responses {
+			agent := strings.ToLower(strings.TrimSpace(response.agentID))
+			if agent != "" {
+				unique[agent] = struct{}{}
+			}
+		}
+	}
+	agents := make([]string, 0, len(unique))
+	for agent := range unique {
+		agents = append(agents, agent)
+	}
+	sort.Strings(agents)
+	return agents
+}
+
+func parseProposalStructured(content string, agentID string, delta bool) map[string]any {
+	raw := strings.TrimSpace(content)
+	parsed := map[string]any{}
+	profile := proposalRoleForAgent(agentID)
+	if extracted := extractJSONObject(raw); extracted != "" {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(extracted), &obj); err == nil {
+			parsed = obj
+		}
+	}
+
+	strategy := compactSingleLine(raw, 280)
+	if value, ok := parsed["strategy"].(string); ok && strings.TrimSpace(value) != "" {
+		strategy = compactSingleLine(value, 280)
+	}
+	planSteps := normalizeAnyStringSlice(parsed["plan_steps"])
+	if len(planSteps) == 0 {
+		planSteps = inferPlanSteps(raw, 4)
+	}
+	risks := normalizeAnyStringSlice(parsed["risks"])
+	if len(risks) == 0 {
+		risks = []string{"unknown risk surface"}
+	}
+	commands := normalizeAnyStringSlice(parsed["commands"])
+	if len(commands) == 0 {
+		commands = []string{}
+	}
+	confidence := 0.62
+	switch value := parsed["confidence"].(type) {
+	case float64:
+		confidence = clampFloat(value, 0.05, 0.99)
+	case int:
+		confidence = clampFloat(float64(value), 0.05, 0.99)
+	case string:
+		if parsedValue, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+			confidence = clampFloat(parsedValue, 0.05, 0.99)
+		}
+	}
+	roleLane := profile.RoleID
+	if value, ok := parsed["role_lane"].(string); ok && strings.TrimSpace(value) != "" {
+		roleLane = compactSingleLine(value, 80)
+	}
+	coordinationHandoff := profile.CoordinationTip
+	if value, ok := parsed["coordination_handoff"].(string); ok && strings.TrimSpace(value) != "" {
+		coordinationHandoff = compactSingleLine(value, 160)
+	}
+
+	return map[string]any{
+		"agent_id":             agentID,
+		"delta_retry":          delta,
+		"strategy":             strategy,
+		"plan_steps":           planSteps,
+		"risks":                risks,
+		"commands":             commands,
+		"confidence":           confidence,
+		"role_lane":            roleLane,
+		"coordination_handoff": coordinationHandoff,
+		"raw_excerpt":          compactSingleLine(raw, 360),
+	}
+}
+
+func parseCritiqueStructured(content string, criticAgent string, targetAgent string) map[string]any {
+	raw := strings.TrimSpace(content)
+	parsed := map[string]any{}
+	if extracted := extractJSONObject(raw); extracted != "" {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(extracted), &obj); err == nil {
+			parsed = obj
+		}
+	}
+
+	critique := compactSingleLine(raw, 260)
+	if value, ok := parsed["critique"].(string); ok && strings.TrimSpace(value) != "" {
+		critique = compactSingleLine(value, 260)
+	}
+	recommendation := ""
+	if value, ok := parsed["recommendation"].(string); ok && strings.TrimSpace(value) != "" {
+		recommendation = compactSingleLine(value, 220)
+	}
+	concerns := normalizeAnyStringSlice(parsed["concerns"])
+	if len(concerns) == 0 {
+		concerns = inferPlanSteps(raw, 3)
+	}
+	confidence := 0.58
+	switch value := parsed["confidence"].(type) {
+	case float64:
+		confidence = clampFloat(value, 0.05, 0.99)
+	case int:
+		confidence = clampFloat(float64(value), 0.05, 0.99)
+	case string:
+		if parsedValue, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+			confidence = clampFloat(parsedValue, 0.05, 0.99)
+		}
+	}
+	return map[string]any{
+		"critic_agent":   criticAgent,
+		"target_agent":   targetAgent,
+		"critique":       critique,
+		"concerns":       concerns,
+		"recommendation": recommendation,
+		"confidence":     confidence,
+		"raw_excerpt":    compactSingleLine(raw, 320),
+	}
+}
+
+func normalizeAnyStringSlice(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		text := strings.TrimSpace(fmt.Sprint(item))
+		if text != "" {
+			out = append(out, compactSingleLine(text, 180))
+		}
+	}
+	return out
+}
+
+func inferPlanSteps(content string, limit int) []string {
+	lines := strings.Split(strings.ReplaceAll(content, "\r", ""), "\n")
+	out := make([]string, 0, limit)
+	for _, line := range lines {
+		clean := strings.TrimSpace(strings.TrimLeft(line, "-*0123456789. "))
+		if clean == "" {
+			continue
+		}
+		out = append(out, compactSingleLine(clean, 140))
+		if len(out) >= limit {
+			break
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, compactSingleLine(content, 140))
+	}
+	return out
+}
+
+func extractJSONObject(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+		return trimmed
+	}
+	start := strings.Index(trimmed, "{")
+	end := strings.LastIndex(trimmed, "}")
+	if start < 0 || end <= start {
+		return ""
+	}
+	return strings.TrimSpace(trimmed[start : end+1])
+}
+
+func proposalConfidence(structured map[string]any) float64 {
+	if structured == nil {
+		return 0.5
+	}
+	switch value := structured["confidence"].(type) {
+	case float64:
+		return clampFloat(value, 0.05, 0.99)
+	case int:
+		return clampFloat(float64(value), 0.05, 0.99)
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err == nil {
+			return clampFloat(parsed, 0.05, 0.99)
+		}
+	}
+	return 0.5
+}
+
+func critiqueConfidence(structured map[string]any) float64 {
+	if structured == nil {
+		return 0.5
+	}
+	switch value := structured["confidence"].(type) {
+	case float64:
+		return clampFloat(value, 0.05, 0.99)
+	case int:
+		return clampFloat(float64(value), 0.05, 0.99)
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err == nil {
+			return clampFloat(parsed, 0.05, 0.99)
+		}
+	}
+	return 0.5
+}
+
+func deriveTurnDecision(novelty triChatNoveltyResp, responses []agentResponse) (string, string, string) {
+	if novelty.Found && len(novelty.Proposals) > 0 {
+		selected := pickDecisionProposal(novelty)
+		agentID := selected.AgentID
+		strategy := compactSingleLine(selected.Content, 220)
+		summary := fmt.Sprintf(
+			"turn decision: selected %s strategy. novelty=%.2f retry_required=%s disagreement=%s",
+			agentID,
+			novelty.NoveltyScore,
+			onOff(novelty.RetryRequired),
+			onOff(novelty.Disagreement),
+		)
+		return agentID, strategy, summary
+	}
+	if len(responses) > 0 {
+		selected := responses[0]
+		return selected.agentID, compactSingleLine(selected.content, 220), "turn decision: selected first response (novelty unavailable)"
+	}
+	return "", "", "turn decision: no proposals available"
+}
+
+func buildVerifySummary(result triChatVerifyResp, err error) string {
+	if err != nil {
+		return "verify error: " + compactSingleLine(err.Error(), 160)
+	}
+	if !result.Executed {
+		if strings.TrimSpace(result.Reason) != "" {
+			return "verify skipped: " + compactSingleLine(result.Reason, 120)
+		}
+		return "verify skipped"
+	}
+	passed := result.Passed != nil && *result.Passed
+	if passed {
+		return fmt.Sprintf("verify passed (cmd=%s exit=%s)", compactSingleLine(result.Command, 80), nullCoalesceInt(result.ExitCode))
+	}
+	reason := compactSingleLine(result.Error, 80)
+	if reason == "" {
+		reason = compactSingleLine(result.Stderr, 80)
+	}
+	return fmt.Sprintf(
+		"verify failed (cmd=%s exit=%s timed_out=%s err=%s)",
+		compactSingleLine(result.Command, 60),
+		nullCoalesceInt(result.ExitCode),
+		onOff(result.TimedOut),
+		nullCoalesce(reason, "n/a"),
+	)
+}
+
+func parseAdapterCheckArgs(parts []string, defaultTimeout int) (runAsk bool, askDryRun bool, timeoutSeconds int, agentIDs []string, usageErr string) {
+	runAsk = true
+	askDryRun = true
+	timeoutSeconds = clampInt(defaultTimeout, 1, 120)
+	uniqueAgents := map[string]struct{}{}
+
+	for _, raw := range parts {
+		token := strings.ToLower(strings.TrimSpace(raw))
+		if token == "" {
+			continue
+		}
+		switch token {
+		case "ping", "ping-only", "--ping-only":
+			runAsk = false
+		case "ask", "ask-dry", "dry", "dry-run", "--dry-run":
+			runAsk = true
+			askDryRun = true
+		case "live", "ask-live", "--live":
+			runAsk = true
+			askDryRun = false
+		default:
+			if parsed, err := strconv.Atoi(token); err == nil {
+				timeoutSeconds = clampInt(parsed, 1, 120)
+				continue
+			}
+			chunks := strings.Split(token, ",")
+			if len(chunks) == 0 {
+				return runAsk, askDryRun, timeoutSeconds, nil, "usage: /adaptercheck [ping|live|dry] [agents] [timeout_s]"
+			}
+			for _, chunk := range chunks {
+				agent := strings.ToLower(strings.TrimSpace(chunk))
+				switch agent {
+				case "codex", "cursor", "local-imprint":
+					uniqueAgents[agent] = struct{}{}
+				default:
+					return runAsk, askDryRun, timeoutSeconds, nil, "usage: /adaptercheck [ping|live|dry] [agents] [timeout_s]"
+				}
+			}
+		}
+	}
+
+	if len(uniqueAgents) > 0 {
+		agentIDs = make([]string, 0, len(uniqueAgents))
+		for agentID := range uniqueAgents {
+			agentIDs = append(agentIDs, agentID)
+		}
+		sort.Strings(agentIDs)
+	}
+	return runAsk, askDryRun, timeoutSeconds, agentIDs, ""
+}
+
+func adapterProtocolStepState(step *triChatAdapterProtocolCheckStep) string {
+	if step == nil {
+		return "skip"
+	}
+	if step.OK {
+		return "ok"
+	}
+	return "fail"
+}
+
+func adapterProtocolPrimaryError(result triChatAdapterProtocolCheckResult) string {
+	if !result.Ping.OK && strings.TrimSpace(result.Ping.Error) != "" {
+		return result.Ping.Error
+	}
+	if result.Ask != nil && !result.Ask.OK && strings.TrimSpace(result.Ask.Error) != "" {
+		return result.Ask.Error
+	}
+	return ""
+}
+
+func buildAdapterProtocolPanel(result triChatAdapterProtocolCheckResp) string {
+	mode := "ping+ask(dry)"
+	if !result.RunAskCheck {
+		mode = "ping-only"
+	} else if !result.AskDryRun {
+		mode = "ping+ask(live)"
+	}
+	protocol := nullCoalesce(strings.TrimSpace(result.ProtocolVersion), "n/a")
+	total := maxInt(result.Counts.Total, len(result.Results))
+	if total <= 0 {
+		total = 1
+	}
+
+	var b strings.Builder
+	b.WriteString(
+		fmt.Sprintf(
+			"[adaptercheck] mode=%s protocol=%s all_ok=%s timeout=%ds",
+			mode,
+			protocol,
+			onOff(result.AllOK),
+			maxInt(1, result.TimeoutSeconds),
+		),
+	)
+	b.WriteString("\n")
+	b.WriteString(
+		fmt.Sprintf(
+			"counts ok=%d/%d ping=%d/%d ask=%d/%d",
+			result.Counts.OK,
+			total,
+			result.Counts.PingOK,
+			total,
+			result.Counts.AskOK,
+			total,
+		),
+	)
+
+	for _, entry := range result.Results {
+		pingState := adapterProtocolStepState(&entry.Ping)
+		askState := adapterProtocolStepState(entry.Ask)
+		askDuration := 0
+		if entry.Ask != nil {
+			askDuration = maxInt(0, entry.Ask.DurationMS)
+		}
+		b.WriteString("\n")
+		b.WriteString(
+			fmt.Sprintf(
+				"- %s %s ping=%s(%dms) ask=%s(%dms) src=%s",
+				nullCoalesce(strings.TrimSpace(entry.AgentID), "unknown"),
+				ternary(entry.OK, "OK", "FAIL"),
+				pingState,
+				maxInt(0, entry.Ping.DurationMS),
+				askState,
+				askDuration,
+				nullCoalesce(strings.TrimSpace(entry.CommandSource), "n/a"),
+			),
+		)
+		if errText := adapterProtocolPrimaryError(entry); errText != "" {
+			b.WriteString("\n  err: " + compactSingleLine(errText, 132))
+		}
+	}
+
+	return strings.TrimSpace(b.String())
+}
+
+func pickDecisionProposal(novelty triChatNoveltyResp) triChatNoveltyProposal {
+	if len(novelty.Proposals) == 1 {
+		return novelty.Proposals[0]
+	}
+	if len(novelty.Pairs) == 0 {
+		return novelty.Proposals[0]
+	}
+
+	avgByAgent := map[string]float64{}
+	countByAgent := map[string]int{}
+	for _, pair := range novelty.Pairs {
+		avgByAgent[pair.LeftAgent] += pair.Similarity
+		countByAgent[pair.LeftAgent] += 1
+		avgByAgent[pair.RightAgent] += pair.Similarity
+		countByAgent[pair.RightAgent] += 1
+	}
+	best := novelty.Proposals[0]
+	bestScore := -1.0
+	for _, proposal := range novelty.Proposals {
+		agent := proposal.AgentID
+		total := avgByAgent[agent]
+		count := countByAgent[agent]
+		avg := 1.0
+		if count > 0 {
+			avg = total / float64(count)
+		}
+		uniqueness := 1 - avg
+		if uniqueness > bestScore {
+			bestScore = uniqueness
+			best = proposal
+			continue
+		}
+		if uniqueness == bestScore && strings.Compare(proposal.AgentID, best.AgentID) < 0 {
+			best = proposal
+		}
+	}
+	return best
+}
+
+func clampFloat(value float64, min float64, max float64) float64 {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func nullCoalesceInt(value *int) string {
+	if value == nil {
+		return "n/a"
+	}
+	return strconv.Itoa(*value)
 }
 
 func (m model) trichatRetentionCmd(days int, applyAll bool, doApply bool) tea.Cmd {
@@ -1985,6 +3460,200 @@ func (m model) threadCommandCmd(parts []string) tea.Cmd {
 	}
 }
 
+func (m model) workboardCmd(limit int) tea.Cmd {
+	caller := m.caller
+	threadID := m.threadID
+	return func() tea.Msg {
+		payload, err := caller.callTool("trichat.workboard", map[string]any{
+			"thread_id": threadID,
+			"limit":     maxInt(1, minInt(limit, 100)),
+		})
+		if err != nil {
+			return actionDoneMsg{err: err}
+		}
+		board, err := decodeAny[triChatWorkboardResp](payload)
+		if err != nil {
+			return actionDoneMsg{err: err}
+		}
+		activePhase := "none"
+		if board.ActiveTurn != nil {
+			activePhase = fmt.Sprintf("%s/%s", nullCoalesce(board.ActiveTurn.Phase, "n/a"), nullCoalesce(board.ActiveTurn.PhaseStatus, "n/a"))
+		}
+		status := fmt.Sprintf(
+			"workboard turns=%d running=%d completed=%d failed=%d active=%s",
+			board.Counts["total"],
+			board.Counts["running"],
+			board.Counts["completed"],
+			board.Counts["failed"],
+			activePhase,
+		)
+		return actionDoneMsg{status: status, refresh: true}
+	}
+}
+
+func (m model) turnCommandCmd(parts []string) tea.Cmd {
+	caller := m.caller
+	mutation := m.mutation
+	threadID := m.threadID
+	if len(parts) == 0 || strings.EqualFold(parts[0], "show") {
+		turnID := ""
+		if len(parts) > 1 {
+			turnID = strings.TrimSpace(parts[1])
+		}
+		return func() tea.Msg {
+			args := map[string]any{
+				"include_artifacts": false,
+				"include_closed":    false,
+			}
+			if turnID != "" {
+				args["turn_id"] = turnID
+			} else {
+				args["thread_id"] = threadID
+			}
+			payload, err := caller.callTool("trichat.turn_get", args)
+			if err != nil {
+				return actionDoneMsg{err: err}
+			}
+			turn, err := decodeAny[triChatTurnGetResp](payload)
+			if err != nil {
+				return actionDoneMsg{err: err}
+			}
+			if !turn.Found {
+				return actionDoneMsg{status: "no active turn"}
+			}
+			status := fmt.Sprintf(
+				"turn %s phase=%s/%s status=%s selected=%s verify=%s",
+				turn.Turn.TurnID,
+				nullCoalesce(turn.Turn.Phase, "n/a"),
+				nullCoalesce(turn.Turn.PhaseStatus, "n/a"),
+				nullCoalesce(turn.Turn.Status, "n/a"),
+				nullCoalesce(turn.Turn.SelectedAgent, "n/a"),
+				nullCoalesce(turn.Turn.VerifyStatus, "n/a"),
+			)
+			return actionDoneMsg{status: status, refresh: true}
+		}
+	}
+
+	action := strings.ToLower(strings.TrimSpace(parts[0]))
+	if action == "phase" {
+		if len(parts) < 2 {
+			return func() tea.Msg {
+				return actionDoneMsg{status: "usage: /turn phase <plan|propose|critique|merge|execute|verify|summarize> [running|completed|failed|skipped]"}
+			}
+		}
+		phase := strings.ToLower(strings.TrimSpace(parts[1]))
+		phaseStatus := "running"
+		if len(parts) > 2 {
+			phaseStatus = strings.ToLower(strings.TrimSpace(parts[2]))
+		}
+		return func() tea.Msg {
+			currentPayload, err := caller.callTool("trichat.turn_get", map[string]any{
+				"thread_id":         threadID,
+				"include_closed":    false,
+				"include_artifacts": false,
+			})
+			if err != nil {
+				return actionDoneMsg{err: err}
+			}
+			current, err := decodeAny[triChatTurnGetResp](currentPayload)
+			if err != nil {
+				return actionDoneMsg{err: err}
+			}
+			if !current.Found {
+				return actionDoneMsg{status: "no active turn to advance"}
+			}
+			_, err = caller.callTool("trichat.turn_advance", map[string]any{
+				"mutation":     mutation.next("trichat.turn_advance"),
+				"turn_id":      current.Turn.TurnID,
+				"phase":        phase,
+				"phase_status": phaseStatus,
+				"status":       current.Turn.Status,
+				"metadata": map[string]any{
+					"source":           "trichat-tui",
+					"allow_phase_skip": true,
+				},
+			})
+			if err != nil {
+				return actionDoneMsg{err: err}
+			}
+			return actionDoneMsg{status: fmt.Sprintf("turn %s advanced to %s/%s", current.Turn.TurnID, phase, phaseStatus), refresh: true}
+		}
+	}
+
+	return func() tea.Msg {
+		return actionDoneMsg{status: "usage: /turn show [turn_id] | /turn phase <phase> [phase_status]"}
+	}
+}
+
+func (m model) adapterProtocolCheckCmd(parts []string) tea.Cmd {
+	caller := m.caller
+	threadID := m.threadID
+	mutation := m.mutation
+	defaultTimeout := clampInt(m.settings.bridgeTimeoutSeconds, 2, 45)
+	runAskCheck, askDryRun, timeoutSeconds, agentIDs, usageErr := parseAdapterCheckArgs(parts, defaultTimeout)
+	if usageErr != "" {
+		return func() tea.Msg {
+			return actionDoneMsg{status: usageErr}
+		}
+	}
+
+	return func() tea.Msg {
+		args := map[string]any{
+			"timeout_seconds": timeoutSeconds,
+			"run_ask_check":   runAskCheck,
+			"ask_dry_run":     askDryRun,
+			"workspace":       m.cfg.repoRoot,
+			"thread_id":       threadID,
+		}
+		if len(agentIDs) > 0 {
+			args["agent_ids"] = agentIDs
+		}
+
+		payload, err := caller.callTool("trichat.adapter_protocol_check", args)
+		if err != nil {
+			return actionDoneMsg{err: err}
+		}
+		result, err := decodeAny[triChatAdapterProtocolCheckResp](payload)
+		if err != nil {
+			return actionDoneMsg{err: err}
+		}
+
+		panel := buildAdapterProtocolPanel(result)
+		_, postErr := caller.callTool("trichat.message_post", map[string]any{
+			"mutation":  mutation.next("trichat.message_post"),
+			"thread_id": threadID,
+			"agent_id":  "router",
+			"role":      "assistant",
+			"content":   panel,
+			"metadata": map[string]any{
+				"kind":            "adapter-protocol-check",
+				"command":         "/adaptercheck",
+				"run_ask_check":   result.RunAskCheck,
+				"ask_dry_run":     result.AskDryRun,
+				"timeout_seconds": result.TimeoutSeconds,
+			},
+		})
+		if postErr != nil {
+			return actionDoneMsg{err: postErr}
+		}
+
+		total := maxInt(result.Counts.Total, len(result.Results))
+		status := fmt.Sprintf(
+			"/adaptercheck posted · ok=%d/%d ping=%d/%d ask=%d/%d",
+			result.Counts.OK,
+			total,
+			result.Counts.PingOK,
+			total,
+			result.Counts.AskOK,
+			total,
+		)
+		if !result.AllOK {
+			status += " · adapter issues detected"
+		}
+		return actionDoneMsg{status: status, refresh: true}
+	}
+}
+
 func (m model) executeCmd(agentID, objective string) tea.Cmd {
 	caller := m.caller
 	threadID := m.threadID
@@ -2027,6 +3696,29 @@ func (m model) executeCmd(agentID, objective string) tea.Cmd {
 			return actionDoneMsg{status: "no objective found from latest agent message"}
 		}
 
+		activeTurnID := ""
+		turnPayload, turnErr := caller.callTool("trichat.turn_get", map[string]any{
+			"thread_id":         threadID,
+			"include_closed":    false,
+			"include_artifacts": false,
+		})
+		if turnErr == nil {
+			turnResp, decodeErr := decodeAny[triChatTurnGetResp](turnPayload)
+			if decodeErr == nil && turnResp.Found {
+				activeTurnID = strings.TrimSpace(turnResp.Turn.TurnID)
+			}
+		}
+		if activeTurnID != "" {
+			_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+				"mutation":       mutation.next("trichat.turn_advance"),
+				"turn_id":        activeTurnID,
+				"phase":          "execute",
+				"phase_status":   "running",
+				"status":         "running",
+				"selected_agent": normalizedAgent,
+			})
+		}
+
 		taskPayload := map[string]any{
 			"mutation":      mutation.next("task.create"),
 			"objective":     objective,
@@ -2038,14 +3730,115 @@ func (m model) executeCmd(agentID, objective string) tea.Cmd {
 				"thread_id": threadID,
 				"agent_id":  normalizedAgent,
 				"gate_mode": gateMode,
+				"turn_id":   activeTurnID,
 			},
 		}
 		createdPayload, err := caller.callTool("task.create", taskPayload)
 		if err != nil {
 			return actionDoneMsg{err: err}
 		}
+
+		verifyPayload, verifyErr := caller.callTool("trichat.verify", map[string]any{
+			"project_dir":     m.cfg.repoRoot,
+			"timeout_seconds": 180,
+			"capture_limit":   4000,
+		})
+		verifyResult := triChatVerifyResp{}
+		if verifyErr == nil {
+			verifyResult, _ = decodeAny[triChatVerifyResp](verifyPayload)
+		}
+		turnFinalizeWarning := ""
+
+		if activeTurnID != "" {
+			verified := verifyErr == nil && verifyResult.Executed && verifyResult.Passed != nil && *verifyResult.Passed
+			verifyStatus := "skipped"
+			if verifyErr != nil {
+				verifyStatus = "error"
+			} else if verifyResult.Executed {
+				if verified {
+					verifyStatus = "passed"
+				} else {
+					verifyStatus = "failed"
+				}
+			}
+			verifySummary := buildVerifySummary(verifyResult, verifyErr)
+			_, orchestrateErr := caller.callTool("trichat.turn_orchestrate", map[string]any{
+				"mutation":      mutation.next("trichat.turn_orchestrate"),
+				"turn_id":       activeTurnID,
+				"action":        "verify_finalize",
+				"verify_status": verifyStatus,
+				"verify_summary": fmt.Sprintf(
+					"execute routed via %s; %s",
+					normalizedAgent,
+					verifySummary,
+				),
+				"verify_details": map[string]any{
+					"executed":  verifyResult.Executed,
+					"passed":    verifyResult.Passed,
+					"command":   verifyResult.Command,
+					"exit_code": verifyResult.ExitCode,
+					"timed_out": verifyResult.TimedOut,
+					"error":     compactSingleLine(nullCoalesce(verifyResult.Error, ""), 160),
+					"objective": compactSingleLine(objective, 220),
+					"agent_id":  normalizedAgent,
+				},
+			})
+			if orchestrateErr != nil {
+				turnFinalizeWarning = compactSingleLine(orchestrateErr.Error(), 140)
+				_, _ = caller.callTool("trichat.turn_artifact", map[string]any{
+					"mutation":      mutation.next("trichat.turn_artifact"),
+					"turn_id":       activeTurnID,
+					"phase":         "verify",
+					"artifact_type": "verifier_result",
+					"agent_id":      "router",
+					"content":       verifySummary,
+					"structured": map[string]any{
+						"executed":  verifyResult.Executed,
+						"passed":    verifyResult.Passed,
+						"command":   verifyResult.Command,
+						"exit_code": verifyResult.ExitCode,
+						"timed_out": verifyResult.TimedOut,
+						"error":     compactSingleLine(nullCoalesce(verifyResult.Error, ""), 160),
+					},
+					"metadata": map[string]any{"source": "trichat-tui-fallback"},
+				})
+				_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+					"mutation":       mutation.next("trichat.turn_advance"),
+					"turn_id":        activeTurnID,
+					"phase":          "verify",
+					"phase_status":   ternary(verifyStatus == "failed" || verifyStatus == "error", "failed", "completed"),
+					"status":         ternary(verifyStatus == "failed" || verifyStatus == "error", "failed", "running"),
+					"verify_status":  verifyStatus,
+					"verify_summary": verifySummary,
+				})
+				_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+					"mutation":          mutation.next("trichat.turn_advance"),
+					"turn_id":           activeTurnID,
+					"phase":             "summarize",
+					"phase_status":      "completed",
+					"status":            ternary(verifyStatus == "failed" || verifyStatus == "error", "failed", "completed"),
+					"verify_status":     verifyStatus,
+					"verify_summary":    verifySummary,
+					"decision_summary":  fmt.Sprintf("execute routed via %s; verify=%s", normalizedAgent, verifyStatus),
+					"selected_agent":    normalizedAgent,
+					"selected_strategy": compactSingleLine(objective, 220),
+				})
+			}
+		}
+
 		createdJSON, _ := json.Marshal(createdPayload)
 		status := "task created: " + compactSingleLine(string(createdJSON), 160)
+		if verifyErr != nil {
+			status += " | verify=error(" + compactSingleLine(verifyErr.Error(), 90) + ")"
+		} else if verifyResult.Executed {
+			passed := verifyResult.Passed != nil && *verifyResult.Passed
+			status += fmt.Sprintf(" | verify=%s", ternary(passed, "passed", "failed"))
+		} else {
+			status += " | verify=skipped"
+		}
+		if strings.TrimSpace(turnFinalizeWarning) != "" {
+			status += " | turn_finalize=fallback(" + turnFinalizeWarning + ")"
+		}
 
 		_, _ = caller.callTool("trichat.message_post", map[string]any{
 			"mutation":  mutation.next("trichat.message_post"),
@@ -2405,6 +4198,8 @@ func (m *model) handleSlash(raw string) tea.Cmd {
 		return nil
 	case "/panel":
 		return m.refreshCmd()
+	case "/adaptercheck":
+		return m.adapterProtocolCheckCmd(tail)
 	case "/fanout":
 		if len(tail) == 0 {
 			m.inflight = false
@@ -2443,6 +4238,16 @@ func (m *model) handleSlash(raw string) tea.Cmd {
 		return m.fanoutCmd(prompt, target)
 	case "/thread":
 		return m.threadCommandCmd(tail)
+	case "/workboard":
+		limit := 20
+		if len(tail) > 0 {
+			if parsed, err := strconv.Atoi(strings.TrimSpace(tail[0])); err == nil {
+				limit = parsed
+			}
+		}
+		return m.workboardCmd(limit)
+	case "/turn":
+		return m.turnCommandCmd(tail)
 	case "/retry":
 		action := "status"
 		if len(tail) > 0 {
@@ -2709,7 +4514,7 @@ func (m *model) renderContent() string {
 			m.theme.panelTitle.Render("Live Timeline") + "\n" + m.timeline.View(),
 		)
 		right := m.theme.panel.Width(rightWidth).Height(mainPanelHeight).Render(
-			m.theme.panelTitle.Render("Reliability Sidebar") + "\n" + m.sidebar.View(),
+			m.theme.panelTitle.Render("Reliability + Workboard") + "\n" + m.sidebar.View(),
 		)
 		top := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 		bus := m.theme.panel.Width(contentWidth).Height(busStripHeight).Render(
@@ -3004,6 +4809,27 @@ func (m *model) renderSidebar() string {
 		r.consensus.DisagreementTurns,
 		r.consensus.IncompleteTurns,
 	))
+	workboardRunning := r.workboard.Counts["running"]
+	workboardTotal := r.workboard.Counts["total"]
+	activePhase := "n/a"
+	if r.workboard.ActiveTurn != nil && strings.TrimSpace(r.workboard.ActiveTurn.Phase) != "" {
+		activePhase = r.workboard.ActiveTurn.Phase + "/" + r.workboard.ActiveTurn.PhaseStatus
+	}
+	b.WriteString(fmt.Sprintf("Workboard  turns=%d running=%d active=%s\n", workboardTotal, workboardRunning, activePhase))
+	if r.novelty.Found {
+		b.WriteString(fmt.Sprintf("Decision  novelty=%.2f retry=%s hint=%s\n",
+			r.novelty.NoveltyScore,
+			onOff(r.novelty.RetryRequired),
+			nullCoalesce(r.novelty.DecisionHint, "n/a"),
+		))
+		if r.novelty.RetrySuppressed {
+			b.WriteString("Retry guard  dedupe=on")
+			if strings.TrimSpace(r.novelty.RetryReason) != "" {
+				b.WriteString(" reason=" + compactSingleLine(r.novelty.RetryReason, 52))
+			}
+			b.WriteString("\n")
+		}
+	}
 	b.WriteString(fmt.Sprintf("Bus  running=%s clients=%d subs=%d events=%d\n",
 		onOff(r.busStatus.Running),
 		r.busStatus.ClientCount,
@@ -3026,6 +4852,15 @@ func (m *model) renderSidebar() string {
 	if r.consensus.Flagged && r.consensus.LatestTurn != nil {
 		userText := compactSingleLine(r.consensus.LatestTurn.UserExcerpt, 70)
 		b.WriteString("Consensus alert  " + userText + "\n")
+	}
+	if r.workboard.LatestDecision != nil && strings.TrimSpace(r.workboard.LatestDecision.DecisionSummary) != "" {
+		b.WriteString("Merge decision  " + compactSingleLine(r.workboard.LatestDecision.DecisionSummary, 72) + "\n")
+	}
+	if r.workboard.ActiveTurn != nil {
+		b.WriteString(fmt.Sprintf("Turn owner  %s status=%s\n",
+			nullCoalesce(r.workboard.ActiveTurn.SelectedAgent, "n/a"),
+			nullCoalesce(r.workboard.ActiveTurn.Status, "n/a"),
+		))
 	}
 
 	if len(r.taskSummary.Running) > 0 {
@@ -3078,6 +4913,45 @@ func (m *model) renderReliabilityDetail() string {
 			b.WriteString(line + "\n")
 		}
 	}
+	b.WriteString("\n\nWorkboard detail:\n")
+	b.WriteString(fmt.Sprintf("- turns total=%d running=%d completed=%d failed=%d\n",
+		m.reliability.workboard.Counts["total"],
+		m.reliability.workboard.Counts["running"],
+		m.reliability.workboard.Counts["completed"],
+		m.reliability.workboard.Counts["failed"],
+	))
+	if m.reliability.workboard.ActiveTurn != nil {
+		active := m.reliability.workboard.ActiveTurn
+		b.WriteString(fmt.Sprintf("- active turn: %s phase=%s/%s status=%s\n",
+			active.TurnID,
+			nullCoalesce(active.Phase, "n/a"),
+			nullCoalesce(active.PhaseStatus, "n/a"),
+			nullCoalesce(active.Status, "n/a"),
+		))
+		if strings.TrimSpace(active.DecisionSummary) != "" {
+			b.WriteString("- decision: " + compactSingleLine(active.DecisionSummary, 100) + "\n")
+		}
+	}
+	if m.reliability.novelty.Found {
+		b.WriteString(fmt.Sprintf("- novelty: %.2f threshold=%.2f retry=%s\n",
+			m.reliability.novelty.NoveltyScore,
+			m.reliability.novelty.NoveltyThreshold,
+			onOff(m.reliability.novelty.RetryRequired),
+		))
+		if m.reliability.novelty.RetrySuppressed {
+			b.WriteString("- retry dedupe guard: on\n")
+			if strings.TrimSpace(m.reliability.novelty.RetryReason) != "" {
+				b.WriteString("- dedupe reason: " + compactSingleLine(m.reliability.novelty.RetryReason, 96) + "\n")
+			}
+			if strings.TrimSpace(m.reliability.novelty.RetryReference) != "" {
+				b.WriteString("- dedupe reference turn: " + m.reliability.novelty.RetryReference + "\n")
+			}
+		}
+		if len(m.reliability.novelty.RetryAgents) > 0 {
+			b.WriteString("- retry agents: " + strings.Join(m.reliability.novelty.RetryAgents, ",") + "\n")
+		}
+	}
+
 	b.WriteString("\n\nBus detail:\n")
 	b.WriteString(fmt.Sprintf("- socket: %s\n", nullCoalesce(m.reliability.busStatus.SocketPath, "(unset)")))
 	b.WriteString(fmt.Sprintf("- io: in=%d out=%d delivered=%d\n",
@@ -3192,16 +5066,22 @@ func (m *model) renderHelp() string {
 		"- Ctrl+C: quit",
 		"- Chat timeline auto-hides system chatter and compacts long responses",
 		"- Reliability sidebar includes consensus status and disagreement alerts",
+		"- Workboard shows turn phase state (plan/propose/merge/execute/verify) and latest decision",
+		"- Novelty scoring can trigger forced delta retries before merge for non-identical strategies",
 		"- Settings includes consensus threshold toggle (2 or 3 required agent responses)",
 		"- Live Bus Strip shows real-time adapter events (socket stream) before timeline persistence",
 		"",
 		"Slash Commands",
+		"- /adaptercheck [ping|live|dry] [agents] [timeout_s]",
 		"- /fanout all|codex|cursor|local-imprint",
 		"- /agent <agent> <message>",
 		"- /thread list [limit]",
 		"- /thread new [title]",
 		"- /thread use <thread_id>",
 		"- /thread archive [thread_id]",
+		"- /workboard [limit]",
+		"- /turn show [turn_id]",
+		"- /turn phase <phase> [phase_status]",
 		"- /retry status|start|stop|run_once",
 		"- /retentiond status|start|stop|run_once",
 		"- /retention [days] [apply] [all]",

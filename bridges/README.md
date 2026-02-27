@@ -9,10 +9,24 @@ Default wrappers:
 - `local-imprint_bridge.py` -> deterministic math assist + local Ollama fallback.
 - `trichat_bus_client.py` -> publish/subscribe CLI for the Unix socket live event bus.
 
-Both wrappers implement the adapter contract:
+All wrappers implement the strict adapter contract:
 
-- read one JSON payload from stdin
-- print JSON to stdout with a `content` field
+- read one JSON payload from stdin with:
+  - `op`: `ask` or `ping`
+  - `protocol_version`: `trichat-bridge-v1`
+  - `request_id`: non-empty correlation id
+  - `agent_id`: target adapter id
+- for `ask`, respond on stdout with one JSON object:
+  - `kind`: `trichat.adapter.response`
+  - `protocol_version`: `trichat-bridge-v1`
+  - `request_id`: must match request
+  - `agent_id`: must match request
+  - `content`: non-empty reply
+- for `ping`, respond on stdout with one JSON object:
+  - `kind`: `trichat.adapter.pong`
+  - `protocol_version`: `trichat-bridge-v1`
+  - `request_id`: must match request
+  - `agent_id`: must match request
 - write all operational/debug logs to stderr only
 
 When `thread_id` is present in the bridge payload, codex/cursor wrappers also emit
@@ -97,6 +111,7 @@ Shared:
 - `TRICHAT_BRIDGE_BUS_EVENTS` (default `1`, enable bridge -> bus publish)
 - `TRICHAT_BRIDGE_BUS_WARN` (default `0`, emit stderr warnings on bus publish failures)
 - `TRICHAT_BUS_SOCKET_PATH` (override Unix socket path; default `./data/trichat.bus.sock`)
+- `TRICHAT_ADAPTER_HANDSHAKE_TTL_SECONDS` (default `120`, how long TUI caches successful command-adapter ping)
 
 ## Bus Client Examples
 

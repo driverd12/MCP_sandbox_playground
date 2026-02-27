@@ -9,9 +9,11 @@ DOMAIN="gui/$(id -u)"
 MCP_LABEL="com.anamnesis.mcp.server"
 AUTO_LABEL="com.anamnesis.imprint.autosnapshot"
 WORKER_LABEL="com.anamnesis.imprint.inboxworker"
+RELIABILITY_LABEL="com.anamnesis.trichat.reliabilityloop"
 MCP_PLIST="${LAUNCH_DIR}/${MCP_LABEL}.plist"
 AUTO_PLIST="${LAUNCH_DIR}/${AUTO_LABEL}.plist"
 WORKER_PLIST="${LAUNCH_DIR}/${WORKER_LABEL}.plist"
+RELIABILITY_PLIST="${LAUNCH_DIR}/${RELIABILITY_LABEL}.plist"
 
 is_loaded() {
   local label="$1"
@@ -40,15 +42,23 @@ case "${ACTION}" in
       launchctl enable "${DOMAIN}/${MCP_LABEL}" >/dev/null 2>&1 || true
       launchctl enable "${DOMAIN}/${AUTO_LABEL}" >/dev/null 2>&1 || true
       launchctl enable "${DOMAIN}/${WORKER_LABEL}" >/dev/null 2>&1 || true
+      if [[ -f "${RELIABILITY_PLIST}" ]]; then
+        launchctl enable "${DOMAIN}/${RELIABILITY_LABEL}" >/dev/null 2>&1 || true
+      fi
       bootout_if_exists "${MCP_PLIST}"
       bootout_if_exists "${AUTO_PLIST}"
       bootout_if_exists "${WORKER_PLIST}"
+      bootout_if_exists "${RELIABILITY_PLIST}"
       bootstrap_if_exists "${MCP_PLIST}"
       bootstrap_if_exists "${AUTO_PLIST}"
       bootstrap_if_exists "${WORKER_PLIST}"
+      bootstrap_if_exists "${RELIABILITY_PLIST}"
       launchctl kickstart -k "${DOMAIN}/${MCP_LABEL}" >/dev/null 2>&1 || true
       launchctl kickstart -k "${DOMAIN}/${AUTO_LABEL}" >/dev/null 2>&1 || true
       launchctl kickstart -k "${DOMAIN}/${WORKER_LABEL}" >/dev/null 2>&1 || true
+      if [[ -f "${RELIABILITY_PLIST}" ]]; then
+        launchctl kickstart -k "${DOMAIN}/${RELIABILITY_LABEL}" >/dev/null 2>&1 || true
+      fi
       for _ in 1 2 3 4 5; do
         if "${REPO_ROOT}/scripts/imprint_auto_snapshot_ctl.sh" start >/dev/null 2>&1; then
           break
@@ -62,6 +72,7 @@ case "${ACTION}" in
     bootout_if_exists "${WORKER_PLIST}"
     bootout_if_exists "${AUTO_PLIST}"
     bootout_if_exists "${MCP_PLIST}"
+    bootout_if_exists "${RELIABILITY_PLIST}"
     ;;
   status)
     ;;
@@ -80,9 +91,11 @@ esac
 MCP_RUNNING=false
 AUTO_AGENT_LOADED=false
 WORKER_AGENT_LOADED=false
+RELIABILITY_AGENT_LOADED=false
 if is_loaded "${MCP_LABEL}"; then MCP_RUNNING=true; fi
 if is_loaded "${AUTO_LABEL}"; then AUTO_AGENT_LOADED=true; fi
 if is_loaded "${WORKER_LABEL}"; then WORKER_AGENT_LOADED=true; fi
+if is_loaded "${RELIABILITY_LABEL}"; then RELIABILITY_AGENT_LOADED=true; fi
 
 AUTO_SNAPSHOT_STATUS="{}"
 if STATUS_JSON="$("${REPO_ROOT}/scripts/imprint_auto_snapshot_ctl.sh" status 2>/dev/null)"; then
@@ -98,9 +111,12 @@ node --input-type=module - <<'NODE' \
 "${AUTO_AGENT_LOADED}" \
 "${WORKER_LABEL}" \
 "${WORKER_AGENT_LOADED}" \
+"${RELIABILITY_LABEL}" \
+"${RELIABILITY_AGENT_LOADED}" \
 "${MCP_PLIST}" \
 "${AUTO_PLIST}" \
 "${WORKER_PLIST}" \
+"${RELIABILITY_PLIST}" \
 "${AUTO_SNAPSHOT_STATUS}"
 const [
   action,
@@ -111,9 +127,12 @@ const [
   autoAgentLoaded,
   workerLabel,
   workerAgentLoaded,
+  reliabilityLabel,
+  reliabilityAgentLoaded,
   mcpPlist,
   autoPlist,
   workerPlist,
+  reliabilityPlist,
   autoSnapshotStatusRaw,
 ] = process.argv.slice(2);
 
@@ -132,6 +151,7 @@ const payload = {
     eyes: mcpRunning === 'true',
     ears: mcpRunning === 'true',
     fingers: workerAgentLoaded === 'true',
+    reliability_loop: reliabilityAgentLoaded === 'true',
   },
   launchd: {
     mcp_label: mcpLabel,
@@ -143,6 +163,9 @@ const payload = {
     inbox_worker_label: workerLabel,
     inbox_worker_loaded: workerAgentLoaded === 'true',
     inbox_worker_plist: workerPlist,
+    reliability_loop_label: reliabilityLabel,
+    reliability_loop_loaded: reliabilityAgentLoaded === 'true',
+    reliability_loop_plist: reliabilityPlist,
   },
   auto_snapshot_runtime: autoSnapshotStatus,
 };

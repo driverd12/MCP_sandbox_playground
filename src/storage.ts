@@ -124,6 +124,51 @@ export type TriChatMessageRecord = {
   metadata: Record<string, unknown>;
 };
 
+export type TriChatTurnStatus = "running" | "completed" | "failed" | "cancelled";
+export type TriChatTurnPhase = "plan" | "propose" | "critique" | "merge" | "execute" | "verify" | "summarize";
+export type TriChatTurnPhaseStatus = "running" | "completed" | "failed" | "skipped";
+
+export type TriChatTurnRecord = {
+  turn_id: string;
+  thread_id: string;
+  user_message_id: string;
+  user_prompt: string;
+  created_at: string;
+  updated_at: string;
+  started_at: string;
+  finished_at: string | null;
+  status: TriChatTurnStatus;
+  phase: TriChatTurnPhase;
+  phase_status: TriChatTurnPhaseStatus;
+  expected_agents: string[];
+  min_agents: number;
+  novelty_score: number | null;
+  novelty_threshold: number | null;
+  retry_required: boolean;
+  retry_agents: string[];
+  disagreement: boolean;
+  decision_summary: string | null;
+  selected_agent: string | null;
+  selected_strategy: string | null;
+  verify_status: string | null;
+  verify_summary: string | null;
+  metadata: Record<string, unknown>;
+};
+
+export type TriChatTurnArtifactRecord = {
+  artifact_id: string;
+  turn_id: string;
+  thread_id: string;
+  created_at: string;
+  phase: TriChatTurnPhase;
+  artifact_type: string;
+  agent_id: string | null;
+  content: string | null;
+  structured: Record<string, unknown>;
+  score: number | null;
+  metadata: Record<string, unknown>;
+};
+
 export type TriChatBusEventRecord = {
   event_seq: number;
   event_id: string;
@@ -415,6 +460,11 @@ export class Storage {
         version: 7,
         name: "add-trichat-unix-bus-schema",
         run: () => this.applyTriChatBusMigration(),
+      },
+      {
+        version: 8,
+        name: "add-trichat-turn-orchestration-schema",
+        run: () => this.applyTriChatTurnSchemaMigration(),
       },
     ]);
     this.ensureRuntimeSchemaCompleteness();
@@ -2437,6 +2487,434 @@ export class Storage {
     return rows.reverse().map((row) => mapTriChatMessageRow(row));
   }
 
+  createOrGetTriChatTurn(params: {
+    turn_id?: string;
+    thread_id: string;
+    user_message_id: string;
+    user_prompt: string;
+    status?: TriChatTurnStatus;
+    phase?: TriChatTurnPhase;
+    phase_status?: TriChatTurnPhaseStatus;
+    expected_agents?: string[];
+    min_agents?: number;
+    novelty_score?: number | null;
+    novelty_threshold?: number | null;
+    retry_required?: boolean;
+    retry_agents?: string[];
+    disagreement?: boolean;
+    decision_summary?: string | null;
+    selected_agent?: string | null;
+    selected_strategy?: string | null;
+    verify_status?: string | null;
+    verify_summary?: string | null;
+    metadata?: Record<string, unknown>;
+  }): { created: boolean; turn: TriChatTurnRecord } {
+    const now = new Date().toISOString();
+    const threadId = params.thread_id.trim();
+    const userMessageId = params.user_message_id.trim();
+    const userPrompt = params.user_prompt.trim();
+    if (!threadId || !userMessageId || !userPrompt) {
+      throw new Error("thread_id, user_message_id, and user_prompt are required");
+    }
+
+    const existing = this.getTriChatTurnByUserMessage(threadId, userMessageId);
+    if (existing) {
+      return {
+        created: false,
+        turn: existing,
+      };
+    }
+
+    const turnId = params.turn_id?.trim() || crypto.randomUUID();
+    const status = normalizeTriChatTurnStatus(params.status);
+    const phase = normalizeTriChatTurnPhase(params.phase);
+    const phaseStatus = normalizeTriChatTurnPhaseStatus(params.phase_status);
+    const expectedAgents = dedupeNonEmpty(params.expected_agents ?? []);
+    const inferredMinAgents = expectedAgents.length >= 1 ? expectedAgents.length : 3;
+    const minAgents = parseBoundedInt(params.min_agents, inferredMinAgents, 1, 12);
+    const retryAgents = dedupeNonEmpty(params.retry_agents ?? []);
+    const metadata = params.metadata ?? {};
+
+    this.db
+      .prepare(
+        `INSERT INTO trichat_turns (
+           turn_id, thread_id, user_message_id, user_prompt, created_at, updated_at,
+           started_at, finished_at, status, phase, phase_status, expected_agents_json,
+           min_agents, novelty_score, novelty_threshold, retry_required, retry_agents_json,
+           disagreement, decision_summary, selected_agent, selected_strategy,
+           verify_status, verify_summary, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        turnId,
+        threadId,
+        userMessageId,
+        userPrompt,
+        now,
+        now,
+        now,
+        null,
+        status,
+        phase,
+        phaseStatus,
+        stableStringify(expectedAgents),
+        minAgents,
+        params.novelty_score ?? null,
+        params.novelty_threshold ?? null,
+        params.retry_required ? 1 : 0,
+        stableStringify(retryAgents),
+        params.disagreement ? 1 : 0,
+        asNullableString(params.decision_summary),
+        asNullableString(params.selected_agent),
+        asNullableString(params.selected_strategy),
+        asNullableString(params.verify_status),
+        asNullableString(params.verify_summary),
+        stableStringify(metadata)
+      );
+
+    const turn = this.getTriChatTurnById(turnId);
+    if (!turn) {
+      throw new Error(`Failed to read tri-chat turn after create: ${turnId}`);
+    }
+    return {
+      created: true,
+      turn,
+    };
+  }
+
+  updateTriChatTurn(params: {
+    turn_id: string;
+    status?: TriChatTurnStatus;
+    phase?: TriChatTurnPhase;
+    phase_status?: TriChatTurnPhaseStatus;
+    finished_at?: string | null;
+    expected_agents?: string[];
+    min_agents?: number;
+    novelty_score?: number | null;
+    novelty_threshold?: number | null;
+    retry_required?: boolean;
+    retry_agents?: string[];
+    disagreement?: boolean;
+    decision_summary?: string | null;
+    selected_agent?: string | null;
+    selected_strategy?: string | null;
+    verify_status?: string | null;
+    verify_summary?: string | null;
+    metadata?: Record<string, unknown>;
+  }): TriChatTurnRecord {
+    const turnId = params.turn_id.trim();
+    if (!turnId) {
+      throw new Error("turn_id is required");
+    }
+    const existing = this.getTriChatTurnById(turnId);
+    if (!existing) {
+      throw new Error(`Tri-chat turn not found: ${turnId}`);
+    }
+    const now = new Date().toISOString();
+
+    const status = normalizeTriChatTurnStatus(params.status ?? existing.status);
+    const phase = normalizeTriChatTurnPhase(params.phase ?? existing.phase);
+    const phaseStatus = normalizeTriChatTurnPhaseStatus(params.phase_status ?? existing.phase_status);
+    const expectedAgents = dedupeNonEmpty(params.expected_agents ?? existing.expected_agents);
+    const inferredMinAgents = expectedAgents.length >= 1 ? expectedAgents.length : existing.min_agents;
+    const minAgents = parseBoundedInt(params.min_agents, inferredMinAgents, 1, 12);
+    const retryAgents = dedupeNonEmpty(params.retry_agents ?? existing.retry_agents);
+    const shouldFinish = status !== "running" || (phase === "summarize" && phaseStatus === "completed");
+    const finishedAt = params.finished_at === null
+      ? null
+      : normalizeOptionalIsoTimestamp(params.finished_at ?? undefined) ??
+          (shouldFinish ? existing.finished_at ?? now : existing.finished_at);
+    const metadata = params.metadata ? { ...existing.metadata, ...params.metadata } : existing.metadata;
+
+    this.db
+      .prepare(
+        `UPDATE trichat_turns
+         SET updated_at = ?,
+             finished_at = ?,
+             status = ?,
+             phase = ?,
+             phase_status = ?,
+             expected_agents_json = ?,
+             min_agents = ?,
+             novelty_score = ?,
+             novelty_threshold = ?,
+             retry_required = ?,
+             retry_agents_json = ?,
+             disagreement = ?,
+             decision_summary = ?,
+             selected_agent = ?,
+             selected_strategy = ?,
+             verify_status = ?,
+             verify_summary = ?,
+             metadata_json = ?
+         WHERE turn_id = ?`
+      )
+      .run(
+        now,
+        finishedAt,
+        status,
+        phase,
+        phaseStatus,
+        stableStringify(expectedAgents),
+        minAgents,
+        params.novelty_score ?? existing.novelty_score ?? null,
+        params.novelty_threshold ?? existing.novelty_threshold ?? null,
+        (params.retry_required ?? existing.retry_required) ? 1 : 0,
+        stableStringify(retryAgents),
+        (params.disagreement ?? existing.disagreement) ? 1 : 0,
+        asNullableString(params.decision_summary ?? existing.decision_summary),
+        asNullableString(params.selected_agent ?? existing.selected_agent),
+        asNullableString(params.selected_strategy ?? existing.selected_strategy),
+        asNullableString(params.verify_status ?? existing.verify_status),
+        asNullableString(params.verify_summary ?? existing.verify_summary),
+        stableStringify(metadata),
+        turnId
+      );
+
+    const updated = this.getTriChatTurnById(turnId);
+    if (!updated) {
+      throw new Error(`Failed to read tri-chat turn after update: ${turnId}`);
+    }
+    return updated;
+  }
+
+  getTriChatTurnById(turnId: string): TriChatTurnRecord | null {
+    const normalized = turnId.trim();
+    if (!normalized) {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT turn_id, thread_id, user_message_id, user_prompt, created_at, updated_at,
+                started_at, finished_at, status, phase, phase_status, expected_agents_json,
+                min_agents, novelty_score, novelty_threshold, retry_required, retry_agents_json,
+                disagreement, decision_summary, selected_agent, selected_strategy,
+                verify_status, verify_summary, metadata_json
+         FROM trichat_turns
+         WHERE turn_id = ?`
+      )
+      .get(normalized) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return mapTriChatTurnRow(row);
+  }
+
+  getTriChatTurnByUserMessage(threadId: string, userMessageId: string): TriChatTurnRecord | null {
+    const normalizedThreadId = threadId.trim();
+    const normalizedMessageId = userMessageId.trim();
+    if (!normalizedThreadId || !normalizedMessageId) {
+      return null;
+    }
+    const row = this.db
+      .prepare(
+        `SELECT turn_id, thread_id, user_message_id, user_prompt, created_at, updated_at,
+                started_at, finished_at, status, phase, phase_status, expected_agents_json,
+                min_agents, novelty_score, novelty_threshold, retry_required, retry_agents_json,
+                disagreement, decision_summary, selected_agent, selected_strategy,
+                verify_status, verify_summary, metadata_json
+         FROM trichat_turns
+         WHERE thread_id = ? AND user_message_id = ?`
+      )
+      .get(normalizedThreadId, normalizedMessageId) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return mapTriChatTurnRow(row);
+  }
+
+  getLatestTriChatTurn(params: { thread_id: string; include_closed?: boolean }): TriChatTurnRecord | null {
+    const threadId = params.thread_id.trim();
+    if (!threadId) {
+      return null;
+    }
+    const includeClosed = params.include_closed ?? true;
+    const row = includeClosed
+      ? (this.db
+          .prepare(
+            `SELECT turn_id, thread_id, user_message_id, user_prompt, created_at, updated_at,
+                    started_at, finished_at, status, phase, phase_status, expected_agents_json,
+                    min_agents, novelty_score, novelty_threshold, retry_required, retry_agents_json,
+                    disagreement, decision_summary, selected_agent, selected_strategy,
+                    verify_status, verify_summary, metadata_json
+             FROM trichat_turns
+             WHERE thread_id = ?
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT 1`
+          )
+          .get(threadId) as Record<string, unknown> | undefined)
+      : (this.db
+          .prepare(
+            `SELECT turn_id, thread_id, user_message_id, user_prompt, created_at, updated_at,
+                    started_at, finished_at, status, phase, phase_status, expected_agents_json,
+                    min_agents, novelty_score, novelty_threshold, retry_required, retry_agents_json,
+                    disagreement, decision_summary, selected_agent, selected_strategy,
+                    verify_status, verify_summary, metadata_json
+             FROM trichat_turns
+             WHERE thread_id = ? AND status = 'running'
+             ORDER BY updated_at DESC, created_at DESC
+             LIMIT 1`
+          )
+          .get(threadId) as Record<string, unknown> | undefined);
+    if (!row) {
+      return null;
+    }
+    return mapTriChatTurnRow(row);
+  }
+
+  listTriChatTurns(params: {
+    thread_id?: string;
+    status?: TriChatTurnStatus;
+    phase?: TriChatTurnPhase;
+    limit: number;
+  }): TriChatTurnRecord[] {
+    const limit = parseBoundedInt(params.limit, 25, 1, 500);
+    const whereClauses: string[] = [];
+    const values: Array<string | number> = [];
+
+    const threadId = params.thread_id?.trim();
+    if (threadId) {
+      whereClauses.push("thread_id = ?");
+      values.push(threadId);
+    }
+    if (params.status) {
+      whereClauses.push("status = ?");
+      values.push(normalizeTriChatTurnStatus(params.status));
+    }
+    if (params.phase) {
+      whereClauses.push("phase = ?");
+      values.push(normalizeTriChatTurnPhase(params.phase));
+    }
+
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT turn_id, thread_id, user_message_id, user_prompt, created_at, updated_at,
+                started_at, finished_at, status, phase, phase_status, expected_agents_json,
+                min_agents, novelty_score, novelty_threshold, retry_required, retry_agents_json,
+                disagreement, decision_summary, selected_agent, selected_strategy,
+                verify_status, verify_summary, metadata_json
+         FROM trichat_turns
+         ${whereSql}
+         ORDER BY updated_at DESC, created_at DESC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapTriChatTurnRow(row));
+  }
+
+  appendTriChatTurnArtifact(params: {
+    turn_id: string;
+    phase: TriChatTurnPhase;
+    artifact_type: string;
+    agent_id?: string;
+    content?: string;
+    structured?: Record<string, unknown>;
+    score?: number | null;
+    metadata?: Record<string, unknown>;
+  }): TriChatTurnArtifactRecord {
+    const now = new Date().toISOString();
+    const turnId = params.turn_id.trim();
+    const artifactType = params.artifact_type.trim();
+    if (!turnId || !artifactType) {
+      throw new Error("turn_id and artifact_type are required");
+    }
+    const turn = this.getTriChatTurnById(turnId);
+    if (!turn) {
+      throw new Error(`Tri-chat turn not found: ${turnId}`);
+    }
+    const artifactId = crypto.randomUUID();
+    const phase = normalizeTriChatTurnPhase(params.phase);
+    const score = typeof params.score === "number" && Number.isFinite(params.score) ? params.score : null;
+    const structured = params.structured ?? {};
+    const metadata = params.metadata ?? {};
+
+    this.db
+      .prepare(
+        `INSERT INTO trichat_turn_artifacts (
+           artifact_id, turn_id, thread_id, created_at, phase, artifact_type,
+           agent_id, content, structured_json, score, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        artifactId,
+        turn.turn_id,
+        turn.thread_id,
+        now,
+        phase,
+        artifactType,
+        asNullableString(params.agent_id),
+        asNullableString(params.content),
+        stableStringify(structured),
+        score,
+        stableStringify(metadata)
+      );
+
+    const row = this.db
+      .prepare(
+        `SELECT artifact_id, turn_id, thread_id, created_at, phase, artifact_type, agent_id, content,
+                structured_json, score, metadata_json
+         FROM trichat_turn_artifacts
+         WHERE artifact_id = ?`
+      )
+      .get(artifactId) as Record<string, unknown> | undefined;
+    if (!row) {
+      throw new Error(`Failed to read tri-chat turn artifact after insert: ${artifactId}`);
+    }
+    return mapTriChatTurnArtifactRow(row);
+  }
+
+  listTriChatTurnArtifacts(params: {
+    turn_id?: string;
+    thread_id?: string;
+    phase?: TriChatTurnPhase;
+    artifact_type?: string;
+    agent_id?: string;
+    limit: number;
+  }): TriChatTurnArtifactRecord[] {
+    const limit = parseBoundedInt(params.limit, 100, 1, 2000);
+    const whereClauses: string[] = [];
+    const values: Array<string | number> = [];
+    const turnId = params.turn_id?.trim();
+    if (turnId) {
+      whereClauses.push("turn_id = ?");
+      values.push(turnId);
+    }
+    const threadId = params.thread_id?.trim();
+    if (threadId) {
+      whereClauses.push("thread_id = ?");
+      values.push(threadId);
+    }
+    if (params.phase) {
+      whereClauses.push("phase = ?");
+      values.push(normalizeTriChatTurnPhase(params.phase));
+    }
+    const artifactType = params.artifact_type?.trim();
+    if (artifactType) {
+      whereClauses.push("artifact_type = ?");
+      values.push(artifactType);
+    }
+    const agentId = params.agent_id?.trim();
+    if (agentId) {
+      whereClauses.push("agent_id = ?");
+      values.push(agentId);
+    }
+    if (whereClauses.length === 0) {
+      return [];
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT artifact_id, turn_id, thread_id, created_at, phase, artifact_type, agent_id, content,
+                structured_json, score, metadata_json
+         FROM trichat_turn_artifacts
+         WHERE ${whereClauses.join(" AND ")}
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    return rows.reverse().map((row) => mapTriChatTurnArtifactRow(row));
+  }
+
   appendTriChatBusEvent(params: {
     thread_id: string;
     event_type: string;
@@ -3603,6 +4081,8 @@ export class Storage {
       "trichat_threads",
       "trichat_messages",
       "trichat_bus_events",
+      "trichat_turns",
+      "trichat_turn_artifacts",
       "trichat_adapter_states",
       "trichat_adapter_events",
     ] as const;
@@ -3681,6 +4161,7 @@ export class Storage {
     this.applyTriChatSchemaMigration();
     this.applyTriChatAdapterTelemetryMigration();
     this.applyTriChatBusMigration();
+    this.applyTriChatTurnSchemaMigration();
   }
 
   private applyCoreSchemaMigration(): void {
@@ -4042,6 +4523,70 @@ export class Storage {
     this.ensureIndex("idx_trichat_bus_events_agent_seq", "trichat_bus_events", "source_agent, event_seq DESC");
   }
 
+  private applyTriChatTurnSchemaMigration(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS trichat_turns (
+        turn_id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        user_message_id TEXT NOT NULL,
+        user_prompt TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        status TEXT NOT NULL DEFAULT 'running',
+        phase TEXT NOT NULL DEFAULT 'plan',
+        phase_status TEXT NOT NULL DEFAULT 'running',
+        expected_agents_json TEXT NOT NULL,
+        min_agents INTEGER NOT NULL DEFAULT 3,
+        novelty_score REAL,
+        novelty_threshold REAL,
+        retry_required INTEGER NOT NULL DEFAULT 0,
+        retry_agents_json TEXT NOT NULL DEFAULT '[]',
+        disagreement INTEGER NOT NULL DEFAULT 0,
+        decision_summary TEXT,
+        selected_agent TEXT,
+        selected_strategy TEXT,
+        verify_status TEXT,
+        verify_summary TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        UNIQUE(thread_id, user_message_id)
+      );
+      CREATE TABLE IF NOT EXISTS trichat_turn_artifacts (
+        artifact_id TEXT PRIMARY KEY,
+        turn_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        artifact_type TEXT NOT NULL,
+        agent_id TEXT,
+        content TEXT,
+        structured_json TEXT NOT NULL,
+        score REAL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+    `);
+
+    this.ensureIndex("idx_trichat_turns_thread_updated", "trichat_turns", "thread_id, updated_at DESC");
+    this.ensureIndex("idx_trichat_turns_status_updated", "trichat_turns", "status, updated_at DESC");
+    this.ensureIndex("idx_trichat_turns_phase_updated", "trichat_turns", "phase, updated_at DESC");
+    this.ensureIndex(
+      "idx_trichat_turn_artifacts_turn_created",
+      "trichat_turn_artifacts",
+      "turn_id, created_at ASC"
+    );
+    this.ensureIndex(
+      "idx_trichat_turn_artifacts_thread_phase",
+      "trichat_turn_artifacts",
+      "thread_id, phase, created_at DESC"
+    );
+    this.ensureIndex(
+      "idx_trichat_turn_artifacts_type_phase",
+      "trichat_turn_artifacts",
+      "artifact_type, phase, created_at DESC"
+    );
+  }
+
   private appendTaskEvent(params: {
     task_id: string;
     event_type: string;
@@ -4259,6 +4804,72 @@ function mapTriChatMessageRow(row: Record<string, unknown>): TriChatMessageRecor
   };
 }
 
+function mapTriChatTurnRow(row: Record<string, unknown>): TriChatTurnRecord {
+  return {
+    turn_id: String(row.turn_id ?? ""),
+    thread_id: String(row.thread_id ?? ""),
+    user_message_id: String(row.user_message_id ?? ""),
+    user_prompt: String(row.user_prompt ?? ""),
+    created_at: String(row.created_at ?? ""),
+    updated_at: String(row.updated_at ?? ""),
+    started_at: String(row.started_at ?? ""),
+    finished_at: asNullableString(row.finished_at),
+    status: normalizeTriChatTurnStatus(row.status),
+    phase: normalizeTriChatTurnPhase(row.phase),
+    phase_status: normalizeTriChatTurnPhaseStatus(row.phase_status),
+    expected_agents: safeParseJsonArray(row.expected_agents_json),
+    min_agents: parseBoundedInt(row.min_agents, 3, 1, 12),
+    novelty_score:
+      typeof row.novelty_score === "number" && Number.isFinite(row.novelty_score)
+        ? Number(row.novelty_score)
+        : row.novelty_score === null || row.novelty_score === undefined
+          ? null
+          : Number.isFinite(Number(row.novelty_score))
+            ? Number(row.novelty_score)
+            : null,
+    novelty_threshold:
+      typeof row.novelty_threshold === "number" && Number.isFinite(row.novelty_threshold)
+        ? Number(row.novelty_threshold)
+        : row.novelty_threshold === null || row.novelty_threshold === undefined
+          ? null
+          : Number.isFinite(Number(row.novelty_threshold))
+            ? Number(row.novelty_threshold)
+            : null,
+    retry_required: Number(row.retry_required ?? 0) === 1,
+    retry_agents: safeParseJsonArray(row.retry_agents_json),
+    disagreement: Number(row.disagreement ?? 0) === 1,
+    decision_summary: asNullableString(row.decision_summary),
+    selected_agent: asNullableString(row.selected_agent),
+    selected_strategy: asNullableString(row.selected_strategy),
+    verify_status: asNullableString(row.verify_status),
+    verify_summary: asNullableString(row.verify_summary),
+    metadata: parseJsonObject(row.metadata_json),
+  };
+}
+
+function mapTriChatTurnArtifactRow(row: Record<string, unknown>): TriChatTurnArtifactRecord {
+  return {
+    artifact_id: String(row.artifact_id ?? ""),
+    turn_id: String(row.turn_id ?? ""),
+    thread_id: String(row.thread_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    phase: normalizeTriChatTurnPhase(row.phase),
+    artifact_type: String(row.artifact_type ?? ""),
+    agent_id: asNullableString(row.agent_id),
+    content: asNullableString(row.content),
+    structured: parseJsonObject(row.structured_json),
+    score:
+      typeof row.score === "number" && Number.isFinite(row.score)
+        ? Number(row.score)
+        : row.score === null || row.score === undefined
+          ? null
+          : Number.isFinite(Number(row.score))
+            ? Number(row.score)
+            : null,
+    metadata: parseJsonObject(row.metadata_json),
+  };
+}
+
 function mapTriChatBusEventRow(row: Record<string, unknown>): TriChatBusEventRecord {
   return {
     event_seq: Number(row.event_seq ?? 0),
@@ -4340,6 +4951,37 @@ function normalizeTaskStatus(value: unknown): TaskStatus {
 
 function normalizeTriChatThreadStatus(value: unknown): TriChatThreadStatus {
   return String(value ?? "active") === "archived" ? "archived" : "active";
+}
+
+function normalizeTriChatTurnStatus(value: unknown): TriChatTurnStatus {
+  const normalized = String(value ?? "running");
+  if (normalized === "completed" || normalized === "failed" || normalized === "cancelled") {
+    return normalized;
+  }
+  return "running";
+}
+
+function normalizeTriChatTurnPhase(value: unknown): TriChatTurnPhase {
+  const normalized = String(value ?? "plan");
+  if (
+    normalized === "propose" ||
+    normalized === "critique" ||
+    normalized === "merge" ||
+    normalized === "execute" ||
+    normalized === "verify" ||
+    normalized === "summarize"
+  ) {
+    return normalized;
+  }
+  return "plan";
+}
+
+function normalizeTriChatTurnPhaseStatus(value: unknown): TriChatTurnPhaseStatus {
+  const normalized = String(value ?? "running");
+  if (normalized === "completed" || normalized === "failed" || normalized === "skipped") {
+    return normalized;
+  }
+  return "running";
 }
 
 function normalizeTriChatAdapterChannel(value: unknown): TriChatAdapterChannel {

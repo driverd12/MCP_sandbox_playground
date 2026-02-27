@@ -25,7 +25,10 @@ Local-first is non-negotiable: everything lives on your machine, centered on `./
 - Task queue with leases and full event history (`task.*`, `task.timeline`, `task.summary`)
 - Retry daemon with deterministic backoff (`task.auto_retry`)
 - Adapter circuit breakers with persisted telemetry (`trichat.adapter_telemetry`)
+- Adapter protocol diagnostics for wrapper compliance (`trichat.adapter_protocol_check`)
 - Consensus mode for cross-agent agreement/disagreement detection (`trichat.consensus`)
+- Turn orchestration state machine (`trichat.turn_start`, `trichat.turn_advance`, `trichat.turn_artifact`, `trichat.turn_get`, `trichat.turn_orchestrate`)
+- Workboard + novelty scoring for forced-delta retries (`trichat.workboard`, `trichat.novelty`) with dedupe guard on internal reliability heartbeats
 - Imprint continuity (`imprint.profile_set`, `imprint.snapshot`, `imprint.bootstrap`)
 - Inbox worker for autonomous execution (`imprint.inbox.*`, `agent_loop.py`)
 - ADR support (`adr.create`) writing to `./docs/adrs/` and SQLite
@@ -93,11 +96,15 @@ TriChat TUI gives you:
 - Live timeline pane (durable thread history)
 - Input bar for natural chat + optional slash commands
 - Reliability sidebar (task counts, daemons, lease owners, adapter trips)
+- Workboard section (active turn phase/status and execution readiness)
+- Decision section (selected strategy + novelty/retry signals)
+- Persisted turn phases (`plan -> propose -> critique -> merge -> execute -> verify -> summarize`)
 - Consensus status line with auto-flag on disagreement (latest tri-agent turn)
 - Settings panel for fanout target, gate mode, failover timeouts, and circuit breaker tuning
 - Settings toggle for consensus threshold (`min_agents=2` or `3`)
 - Help panel with command reference
 - Optional `/consensus` command in CLI mode for explicit turn-by-turn agreement inspection
+- Role-differentiated proposal lanes (`planner` / `implementer` / `reliability-critic`) so fanout responses are intentionally non-identical
 
 Theme direction:
 
@@ -111,6 +118,8 @@ TriChat auto-detects bridge wrappers from `./bridges`:
 - `bridges/codex_bridge.py`
 - `bridges/cursor_bridge.py`
 - `bridges/local-imprint_bridge.py` (deterministic math assist + Ollama fallback)
+
+Bridge protocol is strict (`trichat-bridge-v1`) with request correlation IDs and ping/pong handshake checks before command fanout, so malformed adapter output fails fast and routes to model fallback without stalling turns.
 
 Validate adapters and local auth state:
 
@@ -148,6 +157,13 @@ Health and checks:
 npm test
 npm run mvp:smoke
 npm run trichat:smoke
+npm run trichat:dogfood:smoke
+```
+
+Dogfood loop (uses real bridge adapters + turn orchestration):
+
+```bash
+npm run trichat:dogfood
 ```
 
 Agent lifecycle:
@@ -162,7 +178,19 @@ Launchd services:
 
 ```bash
 npm run launchd:install
+npm run launchd:install:reliability
 npm run launchd:uninstall
+```
+
+`launchd:install:reliability` enables an internal archived-thread heartbeat loop (`trichat-reliability-internal` by default) so reliability telemetry stays out of normal active chat threads.
+
+Reliability loop controls:
+
+```bash
+npm run trichat:reliability:run_once
+npm run trichat:reliability:status
+npm run trichat:reliability:start
+npm run trichat:reliability:stop
 ```
 
 Imprint continuity:
@@ -207,9 +235,18 @@ TriChat bus and telemetry:
 - `trichat.timeline`
 - `trichat.summary`
 - `trichat.consensus`
+- `trichat.turn_start`
+- `trichat.turn_advance`
+- `trichat.turn_artifact`
+- `trichat.turn_get`
+- `trichat.turn_orchestrate`
+- `trichat.workboard`
+- `trichat.novelty`
+- `trichat.verify`
 - `trichat.retention`
 - `trichat.auto_retention`
 - `trichat.adapter_telemetry`
+- `trichat.adapter_protocol_check`
 
 Tasks and execution:
 
@@ -243,6 +280,12 @@ Key env vars:
 - `TRICHAT_EXECUTE_GATE_MODE` (`open`/`allowlist`/`approval`)
 - `TRICHAT_BUS_SOCKET_PATH` (Unix socket for live bus, default `./data/trichat.bus.sock`)
 - `TRICHAT_BUS_AUTOSTART` (`true`/`false`, default `true`)
+- `TRICHAT_ADAPTER_HANDSHAKE_TTL_SECONDS` (cache duration for successful adapter ping checks, default `120`)
+- `ANAMNESIS_TRICHAT_RELIABILITY_LOOP_ENABLED` (`true`/`false`, optional launchd reliability loop)
+- `ANAMNESIS_TRICHAT_RELIABILITY_INTERVAL_SECONDS` (loop interval for launchd, default `300`)
+- `ANAMNESIS_TRICHAT_RELIABILITY_THREAD_ID` (internal archived thread id, default `trichat-reliability-internal`)
+- `ANAMNESIS_TRICHAT_RELIABILITY_DRY_RUN` (`true`/`false`, default `true`)
+- `ANAMNESIS_TRICHAT_RELIABILITY_EXECUTE` (`true`/`false`, default `false`)
 
 ## Suggested Daily Loop
 1. Start server + TriChat.
@@ -250,7 +293,8 @@ Key env vars:
 3. Route concrete actions into durable tasks.
 4. Watch reliability sidebar for leases, retries, and adapter events.
 5. Periodically squish and retain old working memory.
-6. Snapshot imprint context before handoff.
+6. Keep the optional reliability loop running on an internal archived thread for continuous telemetry.
+7. Snapshot imprint context before handoff.
 
 ## Repo Layout
 - `src/` TypeScript MCP server

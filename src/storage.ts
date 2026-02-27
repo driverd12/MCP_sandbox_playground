@@ -365,6 +365,40 @@ export type TriChatAutoRetentionStateRecord = {
   updated_at: string;
 };
 
+export type TriChatTurnWatchdogStateRecord = {
+  enabled: boolean;
+  interval_seconds: number;
+  stale_after_seconds: number;
+  batch_limit: number;
+  updated_at: string;
+};
+
+export type TriChatChaosEventRecord = {
+  event_id: string;
+  created_at: string;
+  action: string;
+  thread_id: string | null;
+  turn_id: string | null;
+  agent_id: string | null;
+  channel: TriChatAdapterChannel | null;
+  outcome: string;
+  details: Record<string, unknown>;
+};
+
+export type TriChatSloSnapshotRecord = {
+  snapshot_id: string;
+  created_at: string;
+  window_minutes: number;
+  adapter_sample_count: number;
+  adapter_error_count: number;
+  adapter_error_rate: number;
+  adapter_latency_p95_ms: number | null;
+  turn_total_count: number;
+  turn_failed_count: number;
+  turn_failure_rate: number;
+  metadata: Record<string, unknown>;
+};
+
 export type ImprintProfileRecord = {
   profile_id: string;
   created_at: string;
@@ -465,6 +499,11 @@ export class Storage {
         version: 8,
         name: "add-trichat-turn-orchestration-schema",
         run: () => this.applyTriChatTurnSchemaMigration(),
+      },
+      {
+        version: 9,
+        name: "add-trichat-reliability-schema",
+        run: () => this.applyTriChatReliabilitySchemaMigration(),
       },
     ]);
     this.ensureRuntimeSchemaCompleteness();
@@ -1229,6 +1268,64 @@ export class Storage {
            updated_at = excluded.updated_at`
       )
       .run("trichat.auto_retention", normalized.enabled ? 1 : 0, configJson, now);
+
+    return {
+      ...normalized,
+      updated_at: now,
+    };
+  }
+
+  getTriChatTurnWatchdogState(): TriChatTurnWatchdogStateRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT enabled, config_json, updated_at
+         FROM daemon_configs
+         WHERE daemon_key = ?`
+      )
+      .get("trichat.turn_watchdog") as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+
+    const config = parseJsonObject(row.config_json);
+    return {
+      enabled: Number(row.enabled ?? 0) === 1,
+      interval_seconds: parseBoundedInt(config.interval_seconds, 30, 5, 3600),
+      stale_after_seconds: parseBoundedInt(config.stale_after_seconds, 180, 15, 86400),
+      batch_limit: parseBoundedInt(config.batch_limit, 10, 1, 200),
+      updated_at: String(row.updated_at ?? ""),
+    };
+  }
+
+  setTriChatTurnWatchdogState(params: {
+    enabled: boolean;
+    interval_seconds: number;
+    stale_after_seconds: number;
+    batch_limit: number;
+  }): TriChatTurnWatchdogStateRecord {
+    const now = new Date().toISOString();
+    const normalized = {
+      enabled: Boolean(params.enabled),
+      interval_seconds: parseBoundedInt(params.interval_seconds, 30, 5, 3600),
+      stale_after_seconds: parseBoundedInt(params.stale_after_seconds, 180, 15, 86400),
+      batch_limit: parseBoundedInt(params.batch_limit, 10, 1, 200),
+    };
+    const configJson = stableStringify({
+      interval_seconds: normalized.interval_seconds,
+      stale_after_seconds: normalized.stale_after_seconds,
+      batch_limit: normalized.batch_limit,
+    });
+
+    this.db
+      .prepare(
+        `INSERT INTO daemon_configs (daemon_key, enabled, config_json, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(daemon_key) DO UPDATE SET
+           enabled = excluded.enabled,
+           config_json = excluded.config_json,
+           updated_at = excluded.updated_at`
+      )
+      .run("trichat.turn_watchdog", normalized.enabled ? 1 : 0, configJson, now);
 
     return {
       ...normalized,
@@ -2803,6 +2900,37 @@ export class Storage {
     return rows.map((row) => mapTriChatTurnRow(row));
   }
 
+  listStaleRunningTriChatTurns(params: {
+    stale_before_iso: string;
+    thread_id?: string;
+    limit: number;
+  }): TriChatTurnRecord[] {
+    const staleBeforeIso = normalizeIsoTimestamp(params.stale_before_iso, new Date().toISOString());
+    const limit = parseBoundedInt(params.limit, 10, 1, 500);
+    const whereClauses = ["status = 'running'", "updated_at <= ?"];
+    const values: Array<string | number> = [staleBeforeIso];
+    const threadId = params.thread_id?.trim();
+    if (threadId) {
+      whereClauses.push("thread_id = ?");
+      values.push(threadId);
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT turn_id, thread_id, user_message_id, user_prompt, created_at, updated_at,
+                started_at, finished_at, status, phase, phase_status, expected_agents_json,
+                min_agents, novelty_score, novelty_threshold, retry_required, retry_agents_json,
+                disagreement, decision_summary, selected_agent, selected_strategy,
+                verify_status, verify_summary, metadata_json
+         FROM trichat_turns
+         WHERE ${whereClauses.join(" AND ")}
+         ORDER BY updated_at ASC, created_at ASC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapTriChatTurnRow(row));
+  }
+
   appendTriChatTurnArtifact(params: {
     turn_id: string;
     phase: TriChatTurnPhase;
@@ -3448,6 +3576,250 @@ export class Storage {
     };
   }
 
+  listTriChatAdapterEventsSince(params: {
+    since_iso: string;
+    limit: number;
+    agent_id?: string;
+    channel?: TriChatAdapterChannel;
+  }): TriChatAdapterEventRecord[] {
+    const sinceIso = normalizeIsoTimestamp(params.since_iso, new Date().toISOString());
+    const limit = parseBoundedInt(params.limit, 5000, 1, 50000);
+    const whereClauses = ["created_at >= ?"];
+    const values: Array<string | number> = [sinceIso];
+    const agentId = params.agent_id?.trim();
+    if (agentId) {
+      whereClauses.push("agent_id = ?");
+      values.push(agentId);
+    }
+    if (params.channel) {
+      whereClauses.push("channel = ?");
+      values.push(normalizeTriChatAdapterChannel(params.channel));
+    }
+
+    const rows = this.db
+      .prepare(
+        `SELECT event_id, created_at, agent_id, channel, event_type, open_until, error_text, details_json
+         FROM trichat_adapter_events
+         WHERE ${whereClauses.join(" AND ")}
+         ORDER BY created_at ASC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapTriChatAdapterEventRow(row));
+  }
+
+  getTriChatTurnOutcomeCountsSince(params: {
+    since_iso: string;
+    thread_id?: string;
+  }): { total_count: number; failed_count: number } {
+    const sinceIso = normalizeIsoTimestamp(params.since_iso, new Date().toISOString());
+    const whereClauses = ["created_at >= ?"];
+    const values: Array<string | number> = [sinceIso];
+    const threadId = params.thread_id?.trim();
+    if (threadId) {
+      whereClauses.push("thread_id = ?");
+      values.push(threadId);
+    }
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS total_count,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count
+         FROM trichat_turns
+         ${whereSql}`
+      )
+      .get(...values) as Record<string, unknown>;
+    return {
+      total_count: Number(row.total_count ?? 0),
+      failed_count: Number(row.failed_count ?? 0),
+    };
+  }
+
+  appendTriChatChaosEvent(params: {
+    action: string;
+    outcome: string;
+    thread_id?: string;
+    turn_id?: string;
+    agent_id?: string;
+    channel?: TriChatAdapterChannel;
+    created_at?: string;
+    details?: Record<string, unknown>;
+  }): TriChatChaosEventRecord {
+    const action = params.action.trim();
+    const outcome = params.outcome.trim();
+    if (!action || !outcome) {
+      throw new Error("action and outcome are required");
+    }
+    const eventId = crypto.randomUUID();
+    const createdAt = normalizeIsoTimestamp(params.created_at, new Date().toISOString());
+    const details = params.details ?? {};
+    const channel = params.channel ? normalizeTriChatAdapterChannel(params.channel) : null;
+
+    this.db
+      .prepare(
+        `INSERT INTO trichat_chaos_events (
+           event_id, created_at, action, thread_id, turn_id, agent_id, channel, outcome, details_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        eventId,
+        createdAt,
+        action,
+        asNullableString(params.thread_id),
+        asNullableString(params.turn_id),
+        asNullableString(params.agent_id),
+        channel,
+        outcome,
+        stableStringify(details)
+      );
+
+    const row = this.db
+      .prepare(
+        `SELECT event_id, created_at, action, thread_id, turn_id, agent_id, channel, outcome, details_json
+         FROM trichat_chaos_events
+         WHERE event_id = ?`
+      )
+      .get(eventId) as Record<string, unknown> | undefined;
+    if (!row) {
+      throw new Error(`Failed to read trichat chaos event after insert: ${eventId}`);
+    }
+    return mapTriChatChaosEventRow(row);
+  }
+
+  listTriChatChaosEvents(params?: {
+    action?: string;
+    outcome?: string;
+    thread_id?: string;
+    limit?: number;
+  }): TriChatChaosEventRecord[] {
+    const whereClauses: string[] = [];
+    const values: Array<string | number> = [];
+    const action = params?.action?.trim();
+    if (action) {
+      whereClauses.push("action = ?");
+      values.push(action);
+    }
+    const outcome = params?.outcome?.trim();
+    if (outcome) {
+      whereClauses.push("outcome = ?");
+      values.push(outcome);
+    }
+    const threadId = params?.thread_id?.trim();
+    if (threadId) {
+      whereClauses.push("thread_id = ?");
+      values.push(threadId);
+    }
+    const limit = parseBoundedInt(params?.limit, 50, 1, 2000);
+    const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(" AND ")}` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT event_id, created_at, action, thread_id, turn_id, agent_id, channel, outcome, details_json
+         FROM trichat_chaos_events
+         ${whereSql}
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(...values, limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapTriChatChaosEventRow(row));
+  }
+
+  appendTriChatSloSnapshot(params: {
+    created_at?: string;
+    window_minutes: number;
+    adapter_sample_count: number;
+    adapter_error_count: number;
+    adapter_error_rate: number;
+    adapter_latency_p95_ms?: number | null;
+    turn_total_count: number;
+    turn_failed_count: number;
+    turn_failure_rate: number;
+    metadata?: Record<string, unknown>;
+  }): TriChatSloSnapshotRecord {
+    const snapshotId = crypto.randomUUID();
+    const createdAt = normalizeIsoTimestamp(params.created_at, new Date().toISOString());
+    const metadata = params.metadata ?? {};
+    const rowValues = {
+      window_minutes: parseBoundedInt(params.window_minutes, 60, 1, 10080),
+      adapter_sample_count: parseBoundedInt(params.adapter_sample_count, 0, 0, 1_000_000),
+      adapter_error_count: parseBoundedInt(params.adapter_error_count, 0, 0, 1_000_000),
+      adapter_error_rate: clampMetricRate(params.adapter_error_rate),
+      adapter_latency_p95_ms:
+        typeof params.adapter_latency_p95_ms === "number" && Number.isFinite(params.adapter_latency_p95_ms)
+          ? Number(params.adapter_latency_p95_ms)
+          : null,
+      turn_total_count: parseBoundedInt(params.turn_total_count, 0, 0, 1_000_000),
+      turn_failed_count: parseBoundedInt(params.turn_failed_count, 0, 0, 1_000_000),
+      turn_failure_rate: clampMetricRate(params.turn_failure_rate),
+    };
+    this.db
+      .prepare(
+        `INSERT INTO trichat_slo_snapshots (
+           snapshot_id, created_at, window_minutes, adapter_sample_count, adapter_error_count,
+           adapter_error_rate, adapter_latency_p95_ms, turn_total_count, turn_failed_count,
+           turn_failure_rate, metadata_json
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        snapshotId,
+        createdAt,
+        rowValues.window_minutes,
+        rowValues.adapter_sample_count,
+        rowValues.adapter_error_count,
+        rowValues.adapter_error_rate,
+        rowValues.adapter_latency_p95_ms,
+        rowValues.turn_total_count,
+        rowValues.turn_failed_count,
+        rowValues.turn_failure_rate,
+        stableStringify(metadata)
+      );
+
+    const row = this.db
+      .prepare(
+        `SELECT snapshot_id, created_at, window_minutes, adapter_sample_count, adapter_error_count,
+                adapter_error_rate, adapter_latency_p95_ms, turn_total_count, turn_failed_count,
+                turn_failure_rate, metadata_json
+         FROM trichat_slo_snapshots
+         WHERE snapshot_id = ?`
+      )
+      .get(snapshotId) as Record<string, unknown> | undefined;
+    if (!row) {
+      throw new Error(`Failed to read trichat SLO snapshot after insert: ${snapshotId}`);
+    }
+    return mapTriChatSloSnapshotRow(row);
+  }
+
+  getLatestTriChatSloSnapshot(): TriChatSloSnapshotRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT snapshot_id, created_at, window_minutes, adapter_sample_count, adapter_error_count,
+                adapter_error_rate, adapter_latency_p95_ms, turn_total_count, turn_failed_count,
+                turn_failure_rate, metadata_json
+         FROM trichat_slo_snapshots
+         ORDER BY created_at DESC
+         LIMIT 1`
+      )
+      .get() as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return mapTriChatSloSnapshotRow(row);
+  }
+
+  listTriChatSloSnapshots(params?: { limit?: number }): TriChatSloSnapshotRecord[] {
+    const limit = parseBoundedInt(params?.limit, 25, 1, 1000);
+    const rows = this.db
+      .prepare(
+        `SELECT snapshot_id, created_at, window_minutes, adapter_sample_count, adapter_error_count,
+                adapter_error_rate, adapter_latency_p95_ms, turn_total_count, turn_failed_count,
+                turn_failure_rate, metadata_json
+         FROM trichat_slo_snapshots
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => mapTriChatSloSnapshotRow(row));
+  }
+
   getTranscriptById(transcriptId: string): TranscriptRecord | null {
     const row = this.db
       .prepare(
@@ -4085,6 +4457,8 @@ export class Storage {
       "trichat_turn_artifacts",
       "trichat_adapter_states",
       "trichat_adapter_events",
+      "trichat_chaos_events",
+      "trichat_slo_snapshots",
     ] as const;
     const counts: Record<string, number> = {};
     for (const table of tables) {
@@ -4162,6 +4536,7 @@ export class Storage {
     this.applyTriChatAdapterTelemetryMigration();
     this.applyTriChatBusMigration();
     this.applyTriChatTurnSchemaMigration();
+    this.applyTriChatReliabilitySchemaMigration();
   }
 
   private applyCoreSchemaMigration(): void {
@@ -4587,6 +4962,53 @@ export class Storage {
     );
   }
 
+  private applyTriChatReliabilitySchemaMigration(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS trichat_chaos_events (
+        event_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        action TEXT NOT NULL,
+        thread_id TEXT,
+        turn_id TEXT,
+        agent_id TEXT,
+        channel TEXT,
+        outcome TEXT NOT NULL,
+        details_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS trichat_slo_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        window_minutes INTEGER NOT NULL,
+        adapter_sample_count INTEGER NOT NULL,
+        adapter_error_count INTEGER NOT NULL,
+        adapter_error_rate REAL NOT NULL,
+        adapter_latency_p95_ms REAL,
+        turn_total_count INTEGER NOT NULL,
+        turn_failed_count INTEGER NOT NULL,
+        turn_failure_rate REAL NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+      );
+    `);
+
+    this.ensureIndex("idx_trichat_chaos_events_created", "trichat_chaos_events", "created_at DESC");
+    this.ensureIndex(
+      "idx_trichat_chaos_events_action_created",
+      "trichat_chaos_events",
+      "action, created_at DESC"
+    );
+    this.ensureIndex(
+      "idx_trichat_chaos_events_thread_created",
+      "trichat_chaos_events",
+      "thread_id, created_at DESC"
+    );
+    this.ensureIndex("idx_trichat_slo_snapshots_created", "trichat_slo_snapshots", "created_at DESC");
+    this.ensureIndex(
+      "idx_trichat_slo_snapshots_window_created",
+      "trichat_slo_snapshots",
+      "window_minutes, created_at DESC"
+    );
+  }
+
   private appendTaskEvent(params: {
     task_id: string;
     event_type: string;
@@ -4933,6 +5355,46 @@ function mapTriChatAdapterEventRow(row: Record<string, unknown>): TriChatAdapter
   };
 }
 
+function mapTriChatChaosEventRow(row: Record<string, unknown>): TriChatChaosEventRecord {
+  return {
+    event_id: String(row.event_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    action: String(row.action ?? ""),
+    thread_id: asNullableString(row.thread_id),
+    turn_id: asNullableString(row.turn_id),
+    agent_id: asNullableString(row.agent_id),
+    channel:
+      row.channel === null || row.channel === undefined
+        ? null
+        : normalizeTriChatAdapterChannel(row.channel),
+    outcome: String(row.outcome ?? ""),
+    details: parseJsonObject(row.details_json),
+  };
+}
+
+function mapTriChatSloSnapshotRow(row: Record<string, unknown>): TriChatSloSnapshotRecord {
+  return {
+    snapshot_id: String(row.snapshot_id ?? ""),
+    created_at: String(row.created_at ?? ""),
+    window_minutes: parseBoundedInt(row.window_minutes, 60, 1, 10080),
+    adapter_sample_count: parseBoundedInt(row.adapter_sample_count, 0, 0, 1_000_000),
+    adapter_error_count: parseBoundedInt(row.adapter_error_count, 0, 0, 1_000_000),
+    adapter_error_rate: clampMetricRate(row.adapter_error_rate),
+    adapter_latency_p95_ms:
+      typeof row.adapter_latency_p95_ms === "number" && Number.isFinite(row.adapter_latency_p95_ms)
+        ? Number(row.adapter_latency_p95_ms)
+        : row.adapter_latency_p95_ms === null || row.adapter_latency_p95_ms === undefined
+          ? null
+          : Number.isFinite(Number(row.adapter_latency_p95_ms))
+            ? Number(row.adapter_latency_p95_ms)
+            : null,
+    turn_total_count: parseBoundedInt(row.turn_total_count, 0, 0, 1_000_000),
+    turn_failed_count: parseBoundedInt(row.turn_failed_count, 0, 0, 1_000_000),
+    turn_failure_rate: clampMetricRate(row.turn_failure_rate),
+    metadata: parseJsonObject(row.metadata_json),
+  };
+}
+
 function normalizeTrustTier(value: unknown): TrustTier {
   const normalized = String(value ?? "raw");
   if (normalized === "verified" || normalized === "policy-backed" || normalized === "deprecated") {
@@ -5156,6 +5618,20 @@ function parseBoundedInt(value: unknown, fallback: number, min: number, max: num
   }
   const bounded = Math.max(min, Math.min(max, Math.round(parsed)));
   return bounded;
+}
+
+function clampMetricRate(value: unknown): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+  if (parsed <= 0) {
+    return 0;
+  }
+  if (parsed >= 1) {
+    return 1;
+  }
+  return Number(parsed.toFixed(6));
 }
 
 function computeTermScore(text: string, query?: string): number {

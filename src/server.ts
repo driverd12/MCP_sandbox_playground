@@ -68,6 +68,10 @@ import {
   initializeTaskAutoRetryDaemon,
 } from "./tools/task.js";
 import {
+  trichatChaos,
+  trichatChaosSchema,
+  trichatSlo,
+  trichatSloSchema,
   trichatAdapterProtocolCheck,
   trichatAdapterProtocolCheckSchema,
   trichatAdapterTelemetry,
@@ -103,8 +107,11 @@ import {
   trichatThreadListSchema,
   trichatThreadOpen,
   trichatThreadOpenSchema,
+  trichatTurnWatchdogControl,
+  trichatTurnWatchdogSchema,
   trichatTimeline,
   trichatTimelineSchema,
+  initializeTriChatTurnWatchdogDaemon,
 } from "./tools/trichat.js";
 import { TriChatBusRuntime, trichatBusControl, trichatBusSchema } from "./tools/trichat_bus.js";
 import {
@@ -139,6 +146,7 @@ storage.init();
 initializeAutoSquishDaemon(storage);
 initializeTaskAutoRetryDaemon(storage);
 initializeTriChatAutoRetentionDaemon(storage);
+initializeTriChatTurnWatchdogDaemon(storage);
 const triChatBusRuntime = new TriChatBusRuntime(storage, {
   socket_path: process.env.TRICHAT_BUS_SOCKET_PATH
     ? path.resolve(process.env.TRICHAT_BUS_SOCKET_PATH)
@@ -840,6 +848,27 @@ registerTool(
   "Manage interval-based tri-chat retention daemon (status/start/stop/run_once).",
   trichatAutoRetentionSchema,
   (input) => trichatAutoRetentionControl(storage, input)
+);
+
+registerTool(
+  "trichat.turn_watchdog",
+  "Manage stale-turn watchdog daemon (status/start/stop/run_once) to auto-fail stalled turns with evidence.",
+  trichatTurnWatchdogSchema,
+  (input) => trichatTurnWatchdogControl(storage, input)
+);
+
+registerTool(
+  "trichat.chaos",
+  "Inject controlled tri-chat adapter/turn failures and verify auto-finalization invariants.",
+  trichatChaosSchema,
+  (input) => trichatChaos(storage, input)
+);
+
+registerTool(
+  "trichat.slo",
+  "Compute and persist reliability SLO metrics (adapter p95 latency, adapter error rate, turn failure rate).",
+  trichatSloSchema,
+  (input) => trichatSlo(storage, input)
 );
 
 registerTool(

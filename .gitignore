@@ -9,5 +9,5 @@ data/*.sqlite-wal
 data/*.sqlite-journal
 data/imprint/
 coverage/
-trichat-tui
+/trichat-tui
 __pycache__/

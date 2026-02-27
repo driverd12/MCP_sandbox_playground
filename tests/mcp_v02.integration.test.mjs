@@ -53,6 +53,7 @@ const EXPECTED_TOOLS = [
   "task.timeline",
   "task.retry",
   "task.auto_retry",
+  "trichat.chaos",
   "trichat.adapter_telemetry",
   "trichat.adapter_protocol_check",
   "trichat.bus",
@@ -61,11 +62,13 @@ const EXPECTED_TOOLS = [
   "trichat.novelty",
   "trichat.auto_retention",
   "trichat.retention",
+  "trichat.slo",
   "trichat.summary",
   "trichat.turn_advance",
   "trichat.turn_artifact",
   "trichat.turn_get",
   "trichat.turn_orchestrate",
+  "trichat.turn_watchdog",
   "trichat.turn_start",
   "trichat.verify",
   "trichat.workboard",
@@ -1060,13 +1063,22 @@ test("MCP v0.2 integration and safety invariants", async () => {
           error_text: "bridge timeout",
           details: {
             threshold: 2,
+            latency_ms: 140,
+          },
+        },
+        {
+          agent_id: "codex",
+          channel: "model",
+          event_type: "response_ok",
+          details: {
+            latency_ms: 35,
           },
         },
       ],
     });
     assert.equal(adapterTelemetryRecorded.action, "record");
     assert.equal(adapterTelemetryRecorded.recorded_state_count, 2);
-    assert.equal(adapterTelemetryRecorded.recorded_event_count, 1);
+    assert.equal(adapterTelemetryRecorded.recorded_event_count, 2);
     assert.ok(adapterTelemetryRecorded.status.summary.total_channels >= 2);
 
     const adapterTelemetryStatus = await callTool(client, "trichat.adapter_telemetry", {
@@ -1084,6 +1096,121 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(
       adapterTelemetryStatus.last_open_events.some((event) => event.event_type === "trip_opened")
     );
+
+    const chaosAdapterInjected = await callTool(client, "trichat.chaos", {
+      action: "inject_adapter_failure",
+      mutation: nextMutation(testId, "trichat.chaos-inject-adapter", () => mutationCounter++),
+      agent_id: "cursor",
+      channel: "model",
+      reason: "integration chaos adapter failure",
+      open_for_seconds: 20,
+    });
+    assert.equal(chaosAdapterInjected.ok, true);
+    assert.equal(chaosAdapterInjected.state.agent_id, "cursor");
+    assert.equal(chaosAdapterInjected.state.channel, "model");
+    assert.equal(chaosAdapterInjected.event.event_type, "trip_opened");
+
+    const watchdogThreadId = `trichat-watchdog-${testId}`;
+    await callTool(client, "trichat.thread_open", {
+      mutation: nextMutation(testId, "trichat.thread_open-watchdog", () => mutationCounter++),
+      thread_id: watchdogThreadId,
+      title: `Watchdog thread ${testId}`,
+      metadata: { source: "integration-watchdog" },
+    });
+    const watchdogUser = await callTool(client, "trichat.message_post", {
+      mutation: nextMutation(testId, "trichat.message_post-watchdog-user", () => mutationCounter++),
+      thread_id: watchdogThreadId,
+      agent_id: "user",
+      role: "user",
+      content: `watchdog candidate prompt ${testId}`,
+    });
+    const watchdogTurn = await callTool(client, "trichat.turn_start", {
+      mutation: nextMutation(testId, "trichat.turn_start-watchdog", () => mutationCounter++),
+      thread_id: watchdogThreadId,
+      user_message_id: watchdogUser.message.message_id,
+      user_prompt: `watchdog turn prompt ${testId}`,
+      expected_agents: ["codex"],
+      min_agents: 1,
+      metadata: { source: "integration-watchdog" },
+    });
+    await callTool(client, "trichat.turn_advance", {
+      mutation: nextMutation(testId, "trichat.turn_advance-watchdog", () => mutationCounter++),
+      turn_id: watchdogTurn.turn.turn_id,
+      phase: "execute",
+      phase_status: "running",
+      status: "running",
+      metadata: { allow_phase_skip: true, source: "integration-watchdog" },
+    });
+
+    const watchdogRunOnce = await callTool(client, "trichat.turn_watchdog", {
+      action: "run_once",
+      mutation: nextMutation(testId, "trichat.turn_watchdog-run_once", () => mutationCounter++),
+      stale_after_seconds: 30,
+      batch_limit: 10,
+      stale_before_iso: new Date(Date.now() + 60_000).toISOString(),
+    });
+    assert.ok(watchdogRunOnce.tick.escalated_count >= 1);
+    assert.ok(
+      watchdogRunOnce.tick.escalated_turn_ids.includes(watchdogTurn.turn.turn_id),
+      "Expected watchdog to escalate integration watchdog turn"
+    );
+
+    const watchdogTurnAfter = await callTool(client, "trichat.turn_get", {
+      turn_id: watchdogTurn.turn.turn_id,
+      include_artifacts: true,
+      artifact_limit: 80,
+    });
+    assert.equal(watchdogTurnAfter.turn.status, "failed");
+    assert.equal(watchdogTurnAfter.turn.phase, "summarize");
+    assert.ok(
+      watchdogTurnAfter.artifacts.some((artifact) => artifact.artifact_type === "watchdog_timeout"),
+      "Expected watchdog_timeout artifact on escalated turn"
+    );
+
+    const chaosVerifyTurn = await callTool(client, "trichat.chaos", {
+      action: "verify_turn",
+      turn_id: watchdogTurn.turn.turn_id,
+    });
+    assert.equal(chaosVerifyTurn.found, true);
+    assert.equal(chaosVerifyTurn.ok, true);
+    assert.ok(Array.isArray(chaosVerifyTurn.invariants.checks));
+
+    const chaosRunOnce = await callTool(client, "trichat.chaos", {
+      action: "run_once",
+      mutation: nextMutation(testId, "trichat.chaos-run_once", () => mutationCounter++),
+      title: `Chaos run once ${testId}`,
+      user_prompt: `chaos run once prompt ${testId}`,
+    });
+    assert.equal(chaosRunOnce.ok, true);
+    assert.equal(chaosRunOnce.turn.status, "failed");
+    assert.equal(chaosRunOnce.turn.phase, "summarize");
+    assert.equal(chaosRunOnce.invariants.ok, true);
+
+    const chaosStatus = await callTool(client, "trichat.chaos", {
+      action: "status",
+      limit: 30,
+    });
+    assert.ok(Array.isArray(chaosStatus.recent_events));
+    assert.ok(chaosStatus.recent_events.length >= 1);
+
+    const sloStatus = await callTool(client, "trichat.slo", {
+      action: "status",
+      window_minutes: 120,
+      event_limit: 10000,
+    });
+    assert.equal(typeof sloStatus.metrics.adapter.error_rate, "number");
+    assert.equal(typeof sloStatus.metrics.turns.failure_rate, "number");
+    assert.equal(typeof sloStatus.metrics.adapter.sample_count, "number");
+
+    const sloSnapshot = await callTool(client, "trichat.slo", {
+      action: "snapshot",
+      mutation: nextMutation(testId, "trichat.slo-snapshot", () => mutationCounter++),
+      window_minutes: 120,
+      event_limit: 10000,
+    });
+    assert.equal(sloSnapshot.ok, true);
+    assert.ok(sloSnapshot.snapshot.snapshot_id);
+    assert.equal(typeof sloSnapshot.snapshot.adapter_error_rate, "number");
 
     const adapterProtocolCheck = await callTool(client, "trichat.adapter_protocol_check", {
       agent_ids: ["codex", "cursor", "local-imprint"],
@@ -1668,18 +1795,20 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.equal(healthStorage.ok, true);
     assert.equal(path.resolve(healthStorage.db_path), path.resolve(dbPath));
     assert.equal(healthStorage.db_exists, true);
-    assert.ok(healthStorage.schema_version >= 6);
+    assert.ok(healthStorage.schema_version >= 9);
     assert.equal(typeof healthStorage.table_counts.schema_migrations, "number");
     assert.equal(typeof healthStorage.table_counts.daemon_configs, "number");
     assert.equal(typeof healthStorage.table_counts.imprint_profiles, "number");
     assert.equal(typeof healthStorage.table_counts.imprint_snapshots, "number");
+    assert.equal(typeof healthStorage.table_counts.trichat_chaos_events, "number");
+    assert.equal(typeof healthStorage.table_counts.trichat_slo_snapshots, "number");
 
     const healthPolicy = await callTool(client, "health.policy", {});
     assert.equal(healthPolicy.ok, true);
     assert.ok(healthPolicy.enforced_rules.length >= 3);
 
     const migrationStatus = await callTool(client, "migration.status", {});
-    assert.ok(migrationStatus.schema_version >= 6);
+    assert.ok(migrationStatus.schema_version >= 9);
     assert.ok(Array.isArray(migrationStatus.applied_versions));
     assert.ok(
       migrationStatus.applied_versions.some((entry) => entry.version === 1),
@@ -1696,6 +1825,10 @@ test("MCP v0.2 integration and safety invariants", async () => {
     assert.ok(
       migrationStatus.applied_versions.some((entry) => entry.version === 6),
       "Expected migration version 6 to be present"
+    );
+    assert.ok(
+      migrationStatus.applied_versions.some((entry) => entry.version === 9),
+      "Expected migration version 9 to be present"
     );
     assert.equal(typeof migrationStatus.recorded_count, "number");
     assert.equal(typeof migrationStatus.inferred_count, "number");

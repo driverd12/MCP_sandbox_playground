@@ -26,9 +26,12 @@ Local-first is non-negotiable: everything lives on your machine, centered on `./
 - Retry daemon with deterministic backoff (`task.auto_retry`)
 - Adapter circuit breakers with persisted telemetry (`trichat.adapter_telemetry`)
 - Adapter protocol diagnostics for wrapper compliance (`trichat.adapter_protocol_check`)
+- Controlled chaos injection + invariant validation for turn auto-finalization (`trichat.chaos`)
 - Consensus mode for cross-agent agreement/disagreement detection (`trichat.consensus`)
 - Turn orchestration state machine (`trichat.turn_start`, `trichat.turn_advance`, `trichat.turn_artifact`, `trichat.turn_get`, `trichat.turn_orchestrate`)
 - Workboard + novelty scoring for forced-delta retries (`trichat.workboard`, `trichat.novelty`) with dedupe guard on internal reliability heartbeats
+- Stale-turn watchdog daemon for auto-escalation/fail with timeline evidence (`trichat.turn_watchdog`)
+- Reliability SLO metrics persisted in SQLite (`trichat.slo`: adapter p95 latency, adapter error rate, turn failure rate)
 - Imprint continuity (`imprint.profile_set`, `imprint.snapshot`, `imprint.bootstrap`)
 - Inbox worker for autonomous execution (`imprint.inbox.*`, `agent_loop.py`)
 - ADR support (`adr.create`) writing to `./docs/adrs/` and SQLite
@@ -102,7 +105,13 @@ TriChat TUI gives you:
 - Consensus status line with auto-flag on disagreement (latest tri-agent turn)
 - Settings panel for fanout target, gate mode, failover timeouts, and circuit breaker tuning
 - Settings toggle for consensus threshold (`min_agents=2` or `3`)
+- Settings toggle for interoperability rounds (`0-3`) to run peer bounce refinement before merge/execute
+- Autonomous council loop in normal chat flow: agents auto-ask each other targeted merge questions and incorporate answers before decision
+- Runtime-sync context injection so codex/cursor/local-imprint share the same adaptive timeout and coordination posture each turn
 - Help panel with command reference
+- `Ctrl+A` hotkey in chat to run adapter protocol diagnostics instantly
+- Optional `/adaptercheck` command in TUI mode for one-shot bridge protocol diagnostics rendered in-chat
+- Optional `/interop` command in TUI mode to tune cross-agent bounce rounds live
 - Optional `/consensus` command in CLI mode for explicit turn-by-turn agreement inspection
 - Role-differentiated proposal lanes (`planner` / `implementer` / `reliability-critic`) so fanout responses are intentionally non-identical
 
@@ -144,8 +153,13 @@ cursor-agent login
 The runtime is built to degrade gracefully instead of stalling:
 
 - Per-agent command/model circuit breakers
+- Adaptive retry on transient adapter/model faults with compact retry payloads
+- Short suppression windows for persistent failures (for example missing bridge binary or unavailable Ollama endpoint)
+- Suppression windows persist in adapter state telemetry so restarts do not reset known-fault backoff
+- Adaptive model/bridge timeout tuning from recent `trichat.slo` p95 + error-rate signals
 - Recovery windows and auto-close behavior
 - Durable breaker state + trip history in SQLite
+- Auto-finalization on fanout/execute pipeline errors so turns cannot remain stuck in running state
 - Automatic retry for failed tasks with backoff
 - Lease-based task claiming with heartbeat support
 - Message retention daemons to keep growth bounded
@@ -247,6 +261,9 @@ TriChat bus and telemetry:
 - `trichat.auto_retention`
 - `trichat.adapter_telemetry`
 - `trichat.adapter_protocol_check`
+- `trichat.chaos`
+- `trichat.turn_watchdog`
+- `trichat.slo`
 
 Tasks and execution:
 
@@ -278,9 +295,16 @@ Key env vars:
 - `TRICHAT_OLLAMA_MODEL`
 - `TRICHAT_TUI_LAUNCHER` (`true`/`false`)
 - `TRICHAT_EXECUTE_GATE_MODE` (`open`/`allowlist`/`approval`)
+- `TRICHAT_INTEROP_ROUNDS` (`0-3`, default `1`)
 - `TRICHAT_BUS_SOCKET_PATH` (Unix socket for live bus, default `./data/trichat.bus.sock`)
 - `TRICHAT_BUS_AUTOSTART` (`true`/`false`, default `true`)
 - `TRICHAT_ADAPTER_HANDSHAKE_TTL_SECONDS` (cache duration for successful adapter ping checks, default `120`)
+- `TRICHAT_ADAPTER_RETRY_ATTEMPTS` (retry count for transient adapter/model faults, default `1`)
+- `TRICHAT_ADAPTER_CIRCUIT_THRESHOLD` (consecutive failures before opening a channel circuit, default `2`)
+- `TRICHAT_ADAPTER_CIRCUIT_RECOVERY_SECONDS` (circuit recovery window, default `45`)
+- `TRICHAT_ADAPTIVE_TIMEOUTS` (`true`/`false`, auto-tune model/bridge/failover timeouts from `trichat.slo`, default `true`)
+- `TRICHAT_ADAPTIVE_TIMEOUT_MIN_SAMPLES` (minimum SLO latency samples before tuning, default `12`)
+- `TRICHAT_ADAPTIVE_TIMEOUT_MAX_STEP_SECONDS` (max per-turn timeout adjustment step, default `8`)
 - `ANAMNESIS_TRICHAT_RELIABILITY_LOOP_ENABLED` (`true`/`false`, optional launchd reliability loop)
 - `ANAMNESIS_TRICHAT_RELIABILITY_INTERVAL_SECONDS` (loop interval for launchd, default `300`)
 - `ANAMNESIS_TRICHAT_RELIABILITY_THREAD_ID` (internal archived thread id, default `trichat-reliability-internal`)

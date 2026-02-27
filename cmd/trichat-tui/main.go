@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -44,6 +45,7 @@ const (
 	adapterProtocol     = "trichat-bridge-v1"
 	adapterResponseKind = "trichat.adapter.response"
 	adapterPongKind     = "trichat.adapter.pong"
+	adapterMaxRetries   = 1
 )
 
 const (
@@ -73,7 +75,11 @@ type appConfig struct {
 	adapterFailoverTimeoutSecond int
 	adapterCircuitThreshold      int
 	adapterCircuitRecoverySecond int
+	adaptiveTimeoutsEnabled      bool
+	adaptiveTimeoutMinSamples    int
+	adaptiveTimeoutMaxStepSecond int
 	consensusMinAgents           int
+	interopRounds                int
 	executeGateMode              string
 	executeAllowAgents           map[string]bool
 	executeApprovalPhrase        string
@@ -89,6 +95,7 @@ type runtimeSettings struct {
 	fanoutTarget                 string
 	executeGateMode              string
 	consensusMinAgents           int
+	interopRounds                int
 	autoRefresh                  bool
 	pollInterval                 time.Duration
 	modelTimeoutSeconds          int
@@ -96,6 +103,9 @@ type runtimeSettings struct {
 	adapterFailoverTimeoutSecond int
 	adapterCircuitThreshold      int
 	adapterCircuitRecoverySecond int
+	adaptiveTimeoutsEnabled      bool
+	adaptiveTimeoutMinSamples    int
+	adaptiveTimeoutMaxStepSecond int
 }
 
 type mcpCaller struct {
@@ -252,6 +262,63 @@ type taskLastFailed struct {
 
 type daemonStatusResp struct {
 	Running bool `json:"running"`
+}
+
+type triChatTurnWatchdogStatusResp struct {
+	Running           bool   `json:"running"`
+	InTick            bool   `json:"in_tick"`
+	StartedAt         string `json:"started_at"`
+	LastTickAt        string `json:"last_tick_at"`
+	LastError         string `json:"last_error"`
+	LastSloSnapshotID string `json:"last_slo_snapshot_id"`
+	Config            struct {
+		IntervalSeconds   int `json:"interval_seconds"`
+		StaleAfterSeconds int `json:"stale_after_seconds"`
+		BatchLimit        int `json:"batch_limit"`
+	} `json:"config"`
+	Stats struct {
+		TickCount         int      `json:"tick_count"`
+		StaleDetected     int      `json:"stale_detected_count"`
+		EscalatedCount    int      `json:"escalated_count"`
+		LastEscalatedTurn []string `json:"last_escalated_turn_ids"`
+	} `json:"stats"`
+}
+
+type triChatSloSnapshotResp struct {
+	SnapshotID         string   `json:"snapshot_id"`
+	CreatedAt          string   `json:"created_at"`
+	WindowMinutes      int      `json:"window_minutes"`
+	AdapterSampleCount int      `json:"adapter_sample_count"`
+	AdapterErrorCount  int      `json:"adapter_error_count"`
+	AdapterErrorRate   float64  `json:"adapter_error_rate"`
+	AdapterP95Latency  *float64 `json:"adapter_latency_p95_ms"`
+	TurnTotalCount     int      `json:"turn_total_count"`
+	TurnFailedCount    int      `json:"turn_failed_count"`
+	TurnFailureRate    float64  `json:"turn_failure_rate"`
+}
+
+type triChatSloStatusResp struct {
+	Action  string `json:"action"`
+	Metrics struct {
+		ComputedAt    string `json:"computed_at"`
+		ThreadID      string `json:"thread_id"`
+		WindowMinutes int    `json:"window_minutes"`
+		SinceISO      string `json:"since_iso"`
+		EventLimit    int    `json:"event_limit"`
+		Adapter       struct {
+			SampleCount    int      `json:"sample_count"`
+			ErrorCount     int      `json:"error_count"`
+			ErrorRate      float64  `json:"error_rate"`
+			LatencySamples int      `json:"latency_sample_count"`
+			P95LatencyMS   *float64 `json:"p95_latency_ms"`
+		} `json:"adapter"`
+		Turns struct {
+			TotalCount  int     `json:"total_count"`
+			FailedCount int     `json:"failed_count"`
+			FailureRate float64 `json:"failure_rate"`
+		} `json:"turns"`
+	} `json:"metrics"`
+	LatestSnapshot *triChatSloSnapshotResp `json:"latest_snapshot"`
 }
 
 type triChatSummaryResp struct {
@@ -555,6 +622,8 @@ type reliabilitySnapshot struct {
 	taskAutoRetry    daemonStatusResp
 	transcriptSquish daemonStatusResp
 	triRetention     daemonStatusResp
+	turnWatchdog     triChatTurnWatchdogStatusResp
+	slo              triChatSloStatusResp
 	triSummary       triChatSummaryResp
 	consensus        triChatConsensusResp
 	workboard        triChatWorkboardResp
@@ -623,6 +692,56 @@ func (b *breakerState) reset() {
 	b.lastResult = "reset"
 }
 
+type adapterErrorClass struct {
+	Code        string
+	Retryable   bool
+	Persistent  bool
+	SuppressFor time.Duration
+}
+
+func classifyCommandAdapterError(errText string) adapterErrorClass {
+	normalized := strings.ToLower(strings.TrimSpace(errText))
+	switch {
+	case strings.Contains(normalized, "command not found"):
+		return adapterErrorClass{Code: "command_not_found", Persistent: true, SuppressFor: 5 * time.Minute}
+	case strings.Contains(normalized, "permission denied"):
+		return adapterErrorClass{Code: "permission_denied", Persistent: true, SuppressFor: 5 * time.Minute}
+	case strings.Contains(normalized, "protocol_version"), strings.Contains(normalized, "protocol mismatch"):
+		return adapterErrorClass{Code: "protocol_mismatch", Persistent: true, SuppressFor: 3 * time.Minute}
+	case strings.Contains(normalized, "bridge protocol violation"):
+		return adapterErrorClass{Code: "protocol_violation", Retryable: true, Persistent: true, SuppressFor: 90 * time.Second}
+	case strings.Contains(normalized, "bridge timeout"), strings.Contains(normalized, "deadline exceeded"), strings.Contains(normalized, "timed out"):
+		return adapterErrorClass{Code: "timeout", Retryable: true}
+	case strings.Contains(normalized, "broken pipe"), strings.Contains(normalized, "connection reset"):
+		return adapterErrorClass{Code: "transport_transient", Retryable: true}
+	default:
+		return adapterErrorClass{Code: "unknown"}
+	}
+}
+
+func classifyModelAdapterError(errText string) adapterErrorClass {
+	normalized := strings.ToLower(strings.TrimSpace(errText))
+	switch {
+	case strings.Contains(normalized, "context deadline exceeded"), strings.Contains(normalized, "timed out"):
+		return adapterErrorClass{Code: "timeout", Retryable: true}
+	case strings.Contains(normalized, "connection refused"), strings.Contains(normalized, "dial tcp"), strings.Contains(normalized, "no such host"):
+		return adapterErrorClass{Code: "endpoint_unreachable", Persistent: true, SuppressFor: 35 * time.Second}
+	case strings.Contains(normalized, "http 404"), strings.Contains(normalized, "model not found"), strings.Contains(normalized, "pull it first"), strings.Contains(normalized, "ollama pull"):
+		return adapterErrorClass{Code: "model_missing", Persistent: true, SuppressFor: 3 * time.Minute}
+	case strings.Contains(normalized, "connection reset"), strings.Contains(normalized, "eof"):
+		return adapterErrorClass{Code: "transport_transient", Retryable: true}
+	default:
+		return adapterErrorClass{Code: "unknown"}
+	}
+}
+
+func suppressionRemaining(until time.Time, now time.Time) time.Duration {
+	if until.IsZero() || !now.Before(until) {
+		return 0
+	}
+	return until.Sub(now)
+}
+
 type agentRuntime struct {
 	mu sync.Mutex
 
@@ -636,6 +755,10 @@ type agentRuntime struct {
 	lastCommandHandshakeAt  time.Time
 	lastCommandHandshakeOK  bool
 	lastCommandHandshakeFor string
+	commandSuppressedUntil  time.Time
+	commandSuppressionCause string
+	modelSuppressedUntil    time.Time
+	modelSuppressionCause   string
 }
 
 type agentResponse struct {
@@ -718,6 +841,7 @@ func (o *orchestrator) bootstrapText() string {
 }
 
 func (o *orchestrator) restoreStates(states []adapterState, cfg runtimeSettings) {
+	now := time.Now()
 	for _, state := range states {
 		agent := o.agents[state.AgentID]
 		if agent == nil {
@@ -726,13 +850,45 @@ func (o *orchestrator) restoreStates(states []adapterState, cfg runtimeSettings)
 		agent.mu.Lock()
 		if state.Channel == "command" {
 			hydrateBreaker(&agent.commandBreaker, state, cfg)
+			suppressedUntil, suppressionReason := parseSuppressionMetadata(state.Metadata)
+			if suppressionRemaining(suppressedUntil, now) > 0 {
+				agent.commandSuppressedUntil = suppressedUntil
+				agent.commandSuppressionCause = suppressionReason
+			} else {
+				agent.commandSuppressedUntil = time.Time{}
+				agent.commandSuppressionCause = ""
+			}
 		} else {
 			hydrateBreaker(&agent.modelBreaker, state, cfg)
+			suppressedUntil, suppressionReason := parseSuppressionMetadata(state.Metadata)
+			if suppressionRemaining(suppressedUntil, now) > 0 {
+				agent.modelSuppressedUntil = suppressedUntil
+				agent.modelSuppressionCause = suppressionReason
+			} else {
+				agent.modelSuppressedUntil = time.Time{}
+				agent.modelSuppressionCause = ""
+			}
 		}
 		agent.turnCount = maxInt(agent.turnCount, state.TurnCount)
 		agent.degradedTurns = maxInt(agent.degradedTurns, state.DegradedTurnCount)
 		agent.mu.Unlock()
 	}
+}
+
+func parseSuppressionMetadata(metadata map[string]any) (time.Time, string) {
+	if len(metadata) == 0 {
+		return time.Time{}, ""
+	}
+	suppressionReason := asTrimmedString(metadata["suppression_reason"])
+	suppressedUntilText := asTrimmedString(metadata["suppressed_until"])
+	if suppressedUntilText == "" {
+		return time.Time{}, suppressionReason
+	}
+	suppressedUntil, err := parseISO(suppressedUntilText)
+	if err != nil {
+		return time.Time{}, suppressionReason
+	}
+	return suppressedUntil.UTC(), suppressionReason
 }
 
 func hydrateBreaker(target *breakerState, state adapterState, cfg runtimeSettings) {
@@ -752,7 +908,8 @@ func hydrateBreaker(target *breakerState, state adapterState, cfg runtimeSetting
 }
 
 func (o *orchestrator) collectStates(cfg appConfig, settings runtimeSettings) []map[string]any {
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().UTC()
+	nowISO := now.Format(time.RFC3339)
 	states := make([]map[string]any, 0, 6)
 	commands := map[string]string{
 		"codex":         cfg.codexCommand,
@@ -773,15 +930,62 @@ func (o *orchestrator) collectStates(cfg appConfig, settings runtimeSettings) []
 		degraded := agent.degradedTurns
 		commandSnapshot := agent.commandBreaker
 		modelSnapshot := agent.modelBreaker
+		commandSuppressedUntil := agent.commandSuppressedUntil
+		commandSuppressionReason := agent.commandSuppressionCause
+		modelSuppressedUntil := agent.modelSuppressedUntil
+		modelSuppressionReason := agent.modelSuppressionCause
 		agent.mu.Unlock()
 
-		states = append(states, breakerToStatePayload(agentID, "command", now, turnCount, degraded, commandSnapshot, commands[agentID] != ""))
-		states = append(states, breakerToStatePayload(agentID, "model", now, turnCount, degraded, modelSnapshot, commands[agentID] != ""))
+		states = append(
+			states,
+			breakerToStatePayload(
+				agentID,
+				"command",
+				nowISO,
+				turnCount,
+				degraded,
+				commandSnapshot,
+				commands[agentID] != "",
+				commandSuppressedUntil,
+				commandSuppressionReason,
+			),
+		)
+		states = append(
+			states,
+			breakerToStatePayload(
+				agentID,
+				"model",
+				nowISO,
+				turnCount,
+				degraded,
+				modelSnapshot,
+				commands[agentID] != "",
+				modelSuppressedUntil,
+				modelSuppressionReason,
+			),
+		)
 	}
 	return states
 }
 
-func breakerToStatePayload(agentID, channel, now string, turnCount, degraded int, snapshot breakerState, commandEnabled bool) map[string]any {
+func breakerToStatePayload(
+	agentID, channel, now string,
+	turnCount, degraded int,
+	snapshot breakerState,
+	commandEnabled bool,
+	suppressedUntil time.Time,
+	suppressionReason string,
+) map[string]any {
+	metadata := map[string]any{
+		"command_enabled": commandEnabled,
+	}
+	if suppressionRemaining(suppressedUntil, time.Now()) > 0 {
+		metadata["suppressed"] = true
+		metadata["suppressed_until"] = suppressedUntil.UTC().Format(time.RFC3339)
+	}
+	if strings.TrimSpace(suppressionReason) != "" {
+		metadata["suppression_reason"] = compactSingleLine(suppressionReason, 180)
+	}
 	payload := map[string]any{
 		"agent_id":            agentID,
 		"channel":             channel,
@@ -794,9 +998,7 @@ func breakerToStatePayload(agentID, channel, now string, turnCount, degraded int
 		"turn_count":          turnCount,
 		"degraded_turn_count": degraded,
 		"last_result":         snapshot.lastResult,
-		"metadata": map[string]any{
-			"command_enabled": commandEnabled,
-		},
+		"metadata":            metadata,
 	}
 	if !snapshot.openUntil.IsZero() {
 		payload["open_until"] = snapshot.openUntil.UTC().Format(time.RFC3339)
@@ -903,6 +1105,8 @@ func (a *agentRuntime) respond(
 	deadline := start.Add(time.Duration(maxInt(1, settings.adapterFailoverTimeoutSecond)) * time.Second)
 	attempts := make([]string, 0, 4)
 	events := make([]map[string]any, 0, 4)
+	maxRetries := clampInt(envOrInt("TRICHAT_ADAPTER_RETRY_ATTEMPTS", adapterMaxRetries), 0, 3)
+	minRetryBudget := 1200 * time.Millisecond
 
 	a.mu.Lock()
 	a.turnCount += 1
@@ -930,9 +1134,25 @@ func (a *agentRuntime) respond(
 			a.mu.Lock()
 			open := a.commandBreaker.isOpen(now)
 			remainingOpen := a.commandBreaker.remaining(now)
+			commandSuppressedRemaining := suppressionRemaining(a.commandSuppressedUntil, now)
+			commandSuppressionCause := a.commandSuppressionCause
+			if commandSuppressedRemaining <= 0 && !a.commandSuppressedUntil.IsZero() {
+				a.commandSuppressedUntil = time.Time{}
+				a.commandSuppressionCause = ""
+			}
 			a.mu.Unlock()
 			if open {
 				attempts = append(attempts, fmt.Sprintf("command:circuit-open(%.1fs)", remainingOpen.Seconds()))
+				continue
+			}
+			if commandSuppressedRemaining > 0 {
+				reason := compactSingleLine(commandSuppressionCause, 90)
+				attempts = append(attempts, fmt.Sprintf("command:suppressed(%.1fs:%s)", commandSuppressedRemaining.Seconds(), reason))
+				events = append(events, telemetryEvent(a.agentID, "command", "suppressed_skip", "", "", map[string]any{
+					"path":              "command",
+					"suppressed_reason": reason,
+					"remaining_sec":     commandSuppressedRemaining.Seconds(),
+				}))
 				continue
 			}
 
@@ -955,7 +1175,9 @@ func (a *agentRuntime) respond(
 					"timestamp":        time.Now().UTC().Format(time.RFC3339),
 				}
 				pingTimeout := minDuration(remaining, 5*time.Second)
+				handshakeStarted := time.Now()
 				pingErr := pingCommandAdapter(command, pingPayload, pingTimeout)
+				handshakeLatencyMS := time.Since(handshakeStarted).Milliseconds()
 				a.mu.Lock()
 				a.lastCommandHandshakeAt = time.Now().UTC()
 				a.lastCommandHandshakeFor = strings.TrimSpace(command)
@@ -963,20 +1185,39 @@ func (a *agentRuntime) respond(
 				a.mu.Unlock()
 				if pingErr != nil {
 					errText := fmt.Sprintf("RuntimeError: adapter handshake failed: %v", pingErr)
+					errClass := classifyCommandAdapterError(errText)
 					events = append(events, telemetryEvent(a.agentID, "command", "handshake_failed", errText, "", map[string]any{
-						"path":       "command",
-						"request_id": pingRequestID,
+						"path":        "command",
+						"request_id":  pingRequestID,
+						"latency_ms":  handshakeLatencyMS,
+						"timeout_sec": pingTimeout.Seconds(),
+						"class":       errClass.Code,
 					}))
 					a.mu.Lock()
 					tripped := a.commandBreaker.recordFailure(time.Now(), errText)
 					openUntil := a.commandBreaker.openUntil
 					lastError := a.commandBreaker.lastError
+					var suppressedUntil time.Time
+					var suppressionReason string
+					if errClass.Persistent && errClass.SuppressFor > 0 {
+						suppressedUntil = time.Now().Add(errClass.SuppressFor).UTC()
+						suppressionReason = errClass.Code + ": " + compactSingleLine(errText, 160)
+						a.commandSuppressedUntil = suppressedUntil
+						a.commandSuppressionCause = suppressionReason
+					}
 					a.mu.Unlock()
 					if tripped {
 						events = append(events, telemetryEvent(a.agentID, "command", "trip_opened", lastError, openUntil.Format(time.RFC3339), map[string]any{
 							"path":      "command",
 							"stage":     "handshake",
 							"threshold": maxInt(1, settings.adapterCircuitThreshold),
+						}))
+					}
+					if !suppressedUntil.IsZero() {
+						events = append(events, telemetryEvent(a.agentID, "command", "suppression_opened", suppressionReason, suppressedUntil.Format(time.RFC3339), map[string]any{
+							"path":             "command",
+							"class":            errClass.Code,
+							"suppression_secs": int(errClass.SuppressFor.Seconds()),
 						}))
 					}
 					attempts = append(attempts, "command:handshake("+compactSingleLine(errText, 120)+")")
@@ -990,7 +1231,8 @@ func (a *agentRuntime) respond(
 			roleObjective := adapterDirective(prompt, "TRICHAT_ROLE_OBJECTIVE")
 			responseMode := inferAdapterResponseMode(prompt)
 			timeout := minDuration(remaining, time.Duration(maxInt(1, settings.bridgeTimeoutSeconds))*time.Second)
-			envelope, err := callCommandAdapter(command, map[string]any{
+			commandAttemptStarted := time.Now()
+			requestPayload := map[string]any{
 				"op":                     "ask",
 				"protocol_version":       adapterProtocol,
 				"request_id":             requestID,
@@ -1007,10 +1249,70 @@ func (a *agentRuntime) respond(
 				"role_objective":         roleObjective,
 				"response_mode":          responseMode,
 				"collaboration_contract": "coordinate with other agents and avoid duplicate strategy",
-			}, timeout)
+			}
+			envelope, err := callCommandAdapter(command, requestPayload, timeout)
+			commandLatencyMS := time.Since(commandAttemptStarted).Milliseconds()
+			retryAttempt := 0
+			if err != nil {
+				retryPayload := map[string]any{
+					"op":                     "ask",
+					"protocol_version":       adapterProtocol,
+					"request_id":             requestID,
+					"agent_id":               a.agentID,
+					"thread_id":              threadID,
+					"prompt":                 compactRetryPrompt(prompt),
+					"history":                compactRetryHistory(history, 6),
+					"bootstrap_text":         truncate(strings.TrimSpace(bootstrapText), 420),
+					"peer_context":           truncate(compactSingleLine(peerContext, 420), 420),
+					"workspace":              cfg.repoRoot,
+					"timestamp":              time.Now().UTC().Format(time.RFC3339),
+					"turn_phase":             turnPhase,
+					"role_hint":              roleHint,
+					"role_objective":         roleObjective,
+					"response_mode":          responseMode,
+					"retry_attempt":          1,
+					"collaboration_contract": "coordinate with other agents and avoid duplicate strategy",
+				}
+				for retryAttempt < maxRetries {
+					errText := fmt.Sprintf("%T: %v", err, err)
+					errClass := classifyCommandAdapterError(errText)
+					if !errClass.Retryable || !time.Now().Add(minRetryBudget).Before(deadline) {
+						break
+					}
+					retryAttempt += 1
+					attempts = append(attempts, fmt.Sprintf("command:retry-%d(%s)", retryAttempt, errClass.Code))
+					events = append(events, telemetryEvent(a.agentID, "command", "retry_scheduled", errText, "", map[string]any{
+						"path":          "command",
+						"request_id":    requestID,
+						"attempt":       retryAttempt,
+						"class":         errClass.Code,
+						"compact_retry": true,
+					}))
+					retryTimeout := minDuration(deadline.Sub(time.Now()), timeout)
+					if retryTimeout <= 0 {
+						break
+					}
+					retryStart := time.Now()
+					envelope, err = callCommandAdapter(command, retryPayload, retryTimeout)
+					commandLatencyMS = time.Since(retryStart).Milliseconds()
+					if err == nil {
+						break
+					}
+				}
+			}
 			if err == nil {
+				events = append(events, telemetryEvent(a.agentID, "command", "response_ok", "", "", map[string]any{
+					"path":             "command",
+					"request_id":       requestID,
+					"latency_ms":       commandLatencyMS,
+					"timeout_sec":      timeout.Seconds(),
+					"protocol_version": envelope.ProtocolVersion,
+					"retry_attempt":    retryAttempt,
+				}))
 				a.mu.Lock()
 				recovered := a.commandBreaker.recordSuccess(time.Now())
+				a.commandSuppressedUntil = time.Time{}
+				a.commandSuppressionCause = ""
 				turnCount := a.turnCount
 				degraded := a.degradedTurns
 				status := a.snapshotStateLocked(command != "", turnCount, degraded)
@@ -1029,6 +1331,7 @@ func (a *agentRuntime) respond(
 					"protocol_version": envelope.ProtocolVersion,
 					"bridge":           nullIfEmpty(envelope.Bridge),
 					"bridge_meta":      envelope.Meta,
+					"retry_attempt":    retryAttempt,
 				}
 				if len(attempts) > 0 {
 					content = "[failover recovered via command after: " + strings.Join(attempts, "; ") + "]\n\n" + content
@@ -1037,13 +1340,37 @@ func (a *agentRuntime) respond(
 			}
 
 			errText := fmt.Sprintf("%T: %v", err, err)
+			errClass := classifyCommandAdapterError(errText)
+			events = append(events, telemetryEvent(a.agentID, "command", "response_error", errText, "", map[string]any{
+				"path":        "command",
+				"request_id":  requestID,
+				"latency_ms":  commandLatencyMS,
+				"timeout_sec": timeout.Seconds(),
+				"class":       errClass.Code,
+				"retry_count": retryAttempt,
+			}))
 			a.mu.Lock()
 			tripped := a.commandBreaker.recordFailure(time.Now(), errText)
 			openUntil := a.commandBreaker.openUntil
 			lastError := a.commandBreaker.lastError
+			var suppressedUntil time.Time
+			var suppressionReason string
+			if errClass.Persistent && errClass.SuppressFor > 0 {
+				suppressedUntil = time.Now().Add(errClass.SuppressFor).UTC()
+				suppressionReason = errClass.Code + ": " + compactSingleLine(errText, 160)
+				a.commandSuppressedUntil = suppressedUntil
+				a.commandSuppressionCause = suppressionReason
+			}
 			a.mu.Unlock()
 			if tripped {
 				events = append(events, telemetryEvent(a.agentID, "command", "trip_opened", lastError, openUntil.Format(time.RFC3339), map[string]any{"path": "command", "threshold": maxInt(1, settings.adapterCircuitThreshold)}))
+			}
+			if !suppressedUntil.IsZero() {
+				events = append(events, telemetryEvent(a.agentID, "command", "suppression_opened", suppressionReason, suppressedUntil.Format(time.RFC3339), map[string]any{
+					"path":             "command",
+					"class":            errClass.Code,
+					"suppression_secs": int(errClass.SuppressFor.Seconds()),
+				}))
 			}
 			attempts = append(attempts, "command:failed("+compactSingleLine(errText, 120)+")")
 			continue
@@ -1052,17 +1379,80 @@ func (a *agentRuntime) respond(
 		a.mu.Lock()
 		open := a.modelBreaker.isOpen(now)
 		remainingOpen := a.modelBreaker.remaining(now)
+		modelSuppressedRemaining := suppressionRemaining(a.modelSuppressedUntil, now)
+		modelSuppressionCause := a.modelSuppressionCause
+		if modelSuppressedRemaining <= 0 && !a.modelSuppressedUntil.IsZero() {
+			a.modelSuppressedUntil = time.Time{}
+			a.modelSuppressionCause = ""
+		}
 		a.mu.Unlock()
 		if open {
 			attempts = append(attempts, fmt.Sprintf("ollama:circuit-open(%.1fs)", remainingOpen.Seconds()))
 			continue
 		}
+		if modelSuppressedRemaining > 0 {
+			reason := compactSingleLine(modelSuppressionCause, 90)
+			attempts = append(attempts, fmt.Sprintf("ollama:suppressed(%.1fs:%s)", modelSuppressedRemaining.Seconds(), reason))
+			events = append(events, telemetryEvent(a.agentID, "model", "suppressed_skip", "", "", map[string]any{
+				"path":              "ollama",
+				"suppressed_reason": reason,
+				"remaining_sec":     modelSuppressedRemaining.Seconds(),
+			}))
+			continue
+		}
 
 		timeout := minDuration(remaining, time.Duration(maxInt(1, settings.modelTimeoutSeconds))*time.Second)
+		modelAttemptStarted := time.Now()
 		content, err := callOllama(ollamaAPI, settings.model, messages, timeout)
+		modelLatencyMS := time.Since(modelAttemptStarted).Milliseconds()
+		retryAttempt := 0
+		if err != nil {
+			retryMessages := buildOllamaMessages(
+				a.systemPrompt,
+				compactRetryPrompt(prompt),
+				compactRetryHistory(history, 6),
+				truncate(strings.TrimSpace(bootstrapText), 420),
+				truncate(compactSingleLine(peerContext, 420), 420),
+			)
+			for retryAttempt < maxRetries {
+				errText := fmt.Sprintf("%T: %v", err, err)
+				errClass := classifyModelAdapterError(errText)
+				if !errClass.Retryable || !time.Now().Add(minRetryBudget).Before(deadline) {
+					break
+				}
+				retryAttempt += 1
+				attempts = append(attempts, fmt.Sprintf("ollama:retry-%d(%s)", retryAttempt, errClass.Code))
+				events = append(events, telemetryEvent(a.agentID, "model", "retry_scheduled", errText, "", map[string]any{
+					"path":          "ollama",
+					"model":         settings.model,
+					"attempt":       retryAttempt,
+					"class":         errClass.Code,
+					"compact_retry": true,
+				}))
+				retryTimeout := minDuration(deadline.Sub(time.Now()), timeout)
+				if retryTimeout <= 0 {
+					break
+				}
+				retryStart := time.Now()
+				content, err = callOllama(ollamaAPI, settings.model, retryMessages, retryTimeout)
+				modelLatencyMS = time.Since(retryStart).Milliseconds()
+				if err == nil {
+					break
+				}
+			}
+		}
 		if err == nil {
+			events = append(events, telemetryEvent(a.agentID, "model", "response_ok", "", "", map[string]any{
+				"path":          "ollama",
+				"model":         settings.model,
+				"latency_ms":    modelLatencyMS,
+				"timeout_sec":   timeout.Seconds(),
+				"retry_attempt": retryAttempt,
+			}))
 			a.mu.Lock()
 			recovered := a.modelBreaker.recordSuccess(time.Now())
+			a.modelSuppressedUntil = time.Time{}
+			a.modelSuppressionCause = ""
 			turnCount := a.turnCount
 			degraded := a.degradedTurns
 			status := a.snapshotStateLocked(command != "", turnCount, degraded)
@@ -1071,11 +1461,12 @@ func (a *agentRuntime) respond(
 				events = append(events, telemetryEvent(a.agentID, "model", "recovered", "", "", map[string]any{"path": "ollama"}))
 			}
 			meta := map[string]any{
-				"adapter":  "ollama",
-				"model":    settings.model,
-				"degraded": false,
-				"attempts": attempts,
-				"circuit":  status,
+				"adapter":       "ollama",
+				"model":         settings.model,
+				"degraded":      false,
+				"attempts":      attempts,
+				"circuit":       status,
+				"retry_attempt": retryAttempt,
 			}
 			if len(attempts) > 0 {
 				content = "[failover recovered via ollama after: " + strings.Join(attempts, "; ") + "]\n\n" + content
@@ -1084,13 +1475,37 @@ func (a *agentRuntime) respond(
 		}
 
 		errText := fmt.Sprintf("%T: %v", err, err)
+		errClass := classifyModelAdapterError(errText)
+		events = append(events, telemetryEvent(a.agentID, "model", "response_error", errText, "", map[string]any{
+			"path":        "ollama",
+			"model":       settings.model,
+			"latency_ms":  modelLatencyMS,
+			"timeout_sec": timeout.Seconds(),
+			"class":       errClass.Code,
+			"retry_count": retryAttempt,
+		}))
 		a.mu.Lock()
 		tripped := a.modelBreaker.recordFailure(time.Now(), errText)
 		openUntil := a.modelBreaker.openUntil
 		lastError := a.modelBreaker.lastError
+		var suppressedUntil time.Time
+		var suppressionReason string
+		if errClass.Persistent && errClass.SuppressFor > 0 {
+			suppressedUntil = time.Now().Add(errClass.SuppressFor).UTC()
+			suppressionReason = errClass.Code + ": " + compactSingleLine(errText, 160)
+			a.modelSuppressedUntil = suppressedUntil
+			a.modelSuppressionCause = suppressionReason
+		}
 		a.mu.Unlock()
 		if tripped {
 			events = append(events, telemetryEvent(a.agentID, "model", "trip_opened", lastError, openUntil.Format(time.RFC3339), map[string]any{"path": "ollama", "threshold": maxInt(1, settings.adapterCircuitThreshold)}))
+		}
+		if !suppressedUntil.IsZero() {
+			events = append(events, telemetryEvent(a.agentID, "model", "suppression_opened", suppressionReason, suppressedUntil.Format(time.RFC3339), map[string]any{
+				"path":             "ollama",
+				"class":            errClass.Code,
+				"suppression_secs": int(errClass.SuppressFor.Seconds()),
+			}))
 		}
 		attempts = append(attempts, "ollama:failed("+compactSingleLine(errText, 120)+")")
 	}
@@ -1124,32 +1539,43 @@ func (a *agentRuntime) respond(
 }
 
 func (a *agentRuntime) snapshotStateLocked(commandEnabled bool, turnCount, degraded int) map[string]any {
+	now := time.Now()
+	commandSuppressedRemaining := suppressionRemaining(a.commandSuppressedUntil, now)
+	modelSuppressedRemaining := suppressionRemaining(a.modelSuppressedUntil, now)
 	return map[string]any{
 		"command": map[string]any{
-			"open":                 a.commandBreaker.isOpen(time.Now()),
-			"remaining_seconds":    maxFloat(0, a.commandBreaker.remaining(time.Now()).Seconds()),
-			"open_until_epoch":     epochOrNil(a.commandBreaker.openUntil),
-			"last_opened_at_epoch": epochOrNil(a.commandBreaker.lastOpenedAt),
-			"failure_count":        a.commandBreaker.failureCount,
-			"last_error":           nullIfEmpty(a.commandBreaker.lastError),
-			"last_result":          nullIfEmpty(a.commandBreaker.lastResult),
-			"trip_count":           a.commandBreaker.tripCount,
-			"success_count":        a.commandBreaker.successCount,
-			"threshold":            a.commandBreaker.threshold,
-			"recovery_seconds":     int(a.commandBreaker.recovery.Seconds()),
+			"open":                   a.commandBreaker.isOpen(now),
+			"remaining_seconds":      maxFloat(0, a.commandBreaker.remaining(now).Seconds()),
+			"open_until_epoch":       epochOrNil(a.commandBreaker.openUntil),
+			"last_opened_at_epoch":   epochOrNil(a.commandBreaker.lastOpenedAt),
+			"failure_count":          a.commandBreaker.failureCount,
+			"last_error":             nullIfEmpty(a.commandBreaker.lastError),
+			"last_result":            nullIfEmpty(a.commandBreaker.lastResult),
+			"trip_count":             a.commandBreaker.tripCount,
+			"success_count":          a.commandBreaker.successCount,
+			"threshold":              a.commandBreaker.threshold,
+			"recovery_seconds":       int(a.commandBreaker.recovery.Seconds()),
+			"suppressed":             commandSuppressedRemaining > 0,
+			"suppressed_seconds":     maxFloat(0, commandSuppressedRemaining.Seconds()),
+			"suppressed_until_epoch": epochOrNil(a.commandSuppressedUntil),
+			"suppression_reason":     nullIfEmpty(a.commandSuppressionCause),
 		},
 		"model": map[string]any{
-			"open":                 a.modelBreaker.isOpen(time.Now()),
-			"remaining_seconds":    maxFloat(0, a.modelBreaker.remaining(time.Now()).Seconds()),
-			"open_until_epoch":     epochOrNil(a.modelBreaker.openUntil),
-			"last_opened_at_epoch": epochOrNil(a.modelBreaker.lastOpenedAt),
-			"failure_count":        a.modelBreaker.failureCount,
-			"last_error":           nullIfEmpty(a.modelBreaker.lastError),
-			"last_result":          nullIfEmpty(a.modelBreaker.lastResult),
-			"trip_count":           a.modelBreaker.tripCount,
-			"success_count":        a.modelBreaker.successCount,
-			"threshold":            a.modelBreaker.threshold,
-			"recovery_seconds":     int(a.modelBreaker.recovery.Seconds()),
+			"open":                   a.modelBreaker.isOpen(now),
+			"remaining_seconds":      maxFloat(0, a.modelBreaker.remaining(now).Seconds()),
+			"open_until_epoch":       epochOrNil(a.modelBreaker.openUntil),
+			"last_opened_at_epoch":   epochOrNil(a.modelBreaker.lastOpenedAt),
+			"failure_count":          a.modelBreaker.failureCount,
+			"last_error":             nullIfEmpty(a.modelBreaker.lastError),
+			"last_result":            nullIfEmpty(a.modelBreaker.lastResult),
+			"trip_count":             a.modelBreaker.tripCount,
+			"success_count":          a.modelBreaker.successCount,
+			"threshold":              a.modelBreaker.threshold,
+			"recovery_seconds":       int(a.modelBreaker.recovery.Seconds()),
+			"suppressed":             modelSuppressedRemaining > 0,
+			"suppressed_seconds":     maxFloat(0, modelSuppressedRemaining.Seconds()),
+			"suppressed_until_epoch": epochOrNil(a.modelSuppressedUntil),
+			"suppression_reason":     nullIfEmpty(a.modelSuppressionCause),
 		},
 		"turn_count":          turnCount,
 		"degraded_turn_count": degraded,
@@ -1215,6 +1641,22 @@ func buildOllamaMessages(
 		{"role": "system", "content": systemPrompt},
 		{"role": "user", "content": user},
 	}
+}
+
+func compactRetryHistory(history []triChatMessage, limit int) []triChatMessage {
+	if limit <= 0 || len(history) <= limit {
+		out := make([]triChatMessage, len(history))
+		copy(out, history)
+		return out
+	}
+	start := len(history) - limit
+	out := make([]triChatMessage, len(history[start:]))
+	copy(out, history[start:])
+	return out
+}
+
+func compactRetryPrompt(prompt string) string {
+	return truncate(strings.TrimSpace(prompt), 1800)
 }
 
 func adapterHandshakeTTL() time.Duration {
@@ -1307,6 +1749,38 @@ func runCommandAdapterRaw(command string, payload map[string]any, timeout time.D
 	return output, strings.TrimSpace(stderr.String()), nil
 }
 
+func parseJSONLineFallback[T any](output string) (T, bool, error) {
+	var zero T
+	trimmed := strings.TrimSpace(output)
+	if trimmed == "" {
+		return zero, false, errors.New("empty stdout")
+	}
+	var parsed T
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err == nil {
+		return parsed, false, nil
+	}
+	lines := strings.Split(trimmed, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		var candidate T
+		if err := json.Unmarshal([]byte(line), &candidate); err == nil {
+			return candidate, true, nil
+		}
+		start := strings.Index(line, "{")
+		end := strings.LastIndex(line, "}")
+		if start >= 0 && end > start {
+			jsonSlice := strings.TrimSpace(line[start : end+1])
+			if err := json.Unmarshal([]byte(jsonSlice), &candidate); err == nil {
+				return candidate, true, nil
+			}
+		}
+	}
+	return zero, false, fmt.Errorf("invalid JSON envelope")
+}
+
 func callCommandAdapter(command string, payload map[string]any, timeout time.Duration) (commandAdapterResponse, error) {
 	expectedRequestID := asTrimmedString(payload["request_id"])
 	expectedAgentID := asTrimmedString(payload["agent_id"])
@@ -1320,8 +1794,8 @@ func callCommandAdapter(command string, payload map[string]any, timeout time.Dur
 	if err != nil {
 		return commandAdapterResponse{}, err
 	}
-	var envelope commandAdapterResponse
-	if decodeErr := json.Unmarshal([]byte(output), &envelope); decodeErr != nil {
+	envelope, parsedWithFallback, decodeErr := parseJSONLineFallback[commandAdapterResponse](output)
+	if decodeErr != nil {
 		return commandAdapterResponse{}, fmt.Errorf(
 			"bridge protocol violation: invalid JSON envelope: %v stdout=%s stderr=%s",
 			decodeErr,
@@ -1360,6 +1834,9 @@ func callCommandAdapter(command string, payload map[string]any, timeout time.Dur
 	if envelope.Meta == nil {
 		envelope.Meta = map[string]any{}
 	}
+	if parsedWithFallback {
+		envelope.Meta["stdout_fallback_parsed"] = true
+	}
 	return envelope, nil
 }
 
@@ -1370,8 +1847,8 @@ func pingCommandAdapter(command string, payload map[string]any, timeout time.Dur
 	if err != nil {
 		return err
 	}
-	var pong commandAdapterPong
-	if decodeErr := json.Unmarshal([]byte(output), &pong); decodeErr != nil {
+	pong, _, decodeErr := parseJSONLineFallback[commandAdapterPong](output)
+	if decodeErr != nil {
 		return fmt.Errorf(
 			"adapter handshake invalid JSON: %v stdout=%s stderr=%s",
 			decodeErr,
@@ -1448,6 +1925,176 @@ func callOllama(apiBase, model string, messages []map[string]string, timeout tim
 	return content, nil
 }
 
+type adaptiveTimeoutTuning struct {
+	Applied             bool
+	Reason              string
+	BaseModelTimeout    int
+	BaseBridgeTimeout   int
+	BaseFailoverTimeout int
+	TunedModelTimeout   int
+	TunedBridgeTimeout  int
+	TunedFailover       int
+	P95LatencyMS        float64
+	SampleCount         int
+	AdapterErrorRate    float64
+	TurnFailureRate     float64
+}
+
+func deriveAdaptiveTimeouts(settings runtimeSettings, slo triChatSloStatusResp) (runtimeSettings, adaptiveTimeoutTuning) {
+	result := settings
+	tuning := adaptiveTimeoutTuning{
+		BaseModelTimeout:    settings.modelTimeoutSeconds,
+		BaseBridgeTimeout:   settings.bridgeTimeoutSeconds,
+		BaseFailoverTimeout: settings.adapterFailoverTimeoutSecond,
+		TunedModelTimeout:   settings.modelTimeoutSeconds,
+		TunedBridgeTimeout:  settings.bridgeTimeoutSeconds,
+		TunedFailover:       settings.adapterFailoverTimeoutSecond,
+		Reason:              "disabled",
+	}
+
+	if !settings.adaptiveTimeoutsEnabled {
+		return result, tuning
+	}
+	if slo.Metrics.Adapter.P95LatencyMS == nil {
+		tuning.Reason = "slo-p95-unavailable"
+		return result, tuning
+	}
+	if slo.Metrics.Adapter.LatencySamples < maxInt(1, settings.adaptiveTimeoutMinSamples) {
+		tuning.Reason = "insufficient-samples"
+		return result, tuning
+	}
+
+	p95 := maxFloat(*slo.Metrics.Adapter.P95LatencyMS, 1)
+	adapterErrorRate := maxFloat(0, slo.Metrics.Adapter.ErrorRate)
+	turnFailureRate := maxFloat(0, slo.Metrics.Turns.FailureRate)
+
+	modelTarget := int(math.Ceil((p95*2.3 + 850) / 1000))
+	bridgeTarget := int(math.Ceil((p95*2.9 + 1300) / 1000))
+
+	if adapterErrorRate >= 0.10 || turnFailureRate >= 0.12 {
+		modelTarget += 4
+		bridgeTarget += 6
+	} else if adapterErrorRate >= 0.05 || turnFailureRate >= 0.07 {
+		modelTarget += 2
+		bridgeTarget += 3
+	} else if adapterErrorRate <= 0.015 && turnFailureRate <= 0.02 {
+		modelTarget -= 1
+		bridgeTarget -= 1
+	}
+
+	modelTarget = clampInt(modelTarget, 4, 120)
+	bridgeTarget = clampInt(bridgeTarget, 6, 120)
+	if bridgeTarget < modelTarget+2 {
+		bridgeTarget = clampInt(modelTarget+2, 6, 120)
+	}
+
+	step := maxInt(1, settings.adaptiveTimeoutMaxStepSecond)
+	modelTarget = moveTowardInt(settings.modelTimeoutSeconds, modelTarget, step)
+	bridgeTarget = moveTowardInt(settings.bridgeTimeoutSeconds, bridgeTarget, step)
+	if bridgeTarget < modelTarget+2 {
+		bridgeTarget = clampInt(modelTarget+2, 6, 120)
+	}
+
+	failoverTarget := settings.adapterFailoverTimeoutSecond
+	minFailover := clampInt(maxInt(modelTarget+8, bridgeTarget+5), 1, 120)
+	if failoverTarget < minFailover {
+		failoverTarget = minFailover
+	}
+
+	result.modelTimeoutSeconds = modelTarget
+	result.bridgeTimeoutSeconds = bridgeTarget
+	result.adapterFailoverTimeoutSecond = failoverTarget
+
+	tuning.P95LatencyMS = p95
+	tuning.SampleCount = slo.Metrics.Adapter.LatencySamples
+	tuning.AdapterErrorRate = adapterErrorRate
+	tuning.TurnFailureRate = turnFailureRate
+	tuning.TunedModelTimeout = modelTarget
+	tuning.TunedBridgeTimeout = bridgeTarget
+	tuning.TunedFailover = failoverTarget
+	tuning.Applied = modelTarget != settings.modelTimeoutSeconds ||
+		bridgeTarget != settings.bridgeTimeoutSeconds ||
+		failoverTarget != settings.adapterFailoverTimeoutSecond
+	if tuning.Applied {
+		tuning.Reason = "applied"
+	} else {
+		tuning.Reason = "steady"
+	}
+	return result, tuning
+}
+
+func moveTowardInt(current int, target int, step int) int {
+	if step <= 0 {
+		return target
+	}
+	if target > current {
+		return minInt(current+step, target)
+	}
+	if target < current {
+		return maxInt(current-step, target)
+	}
+	return current
+}
+
+func adaptiveTimeoutSummary(tuning adaptiveTimeoutTuning) string {
+	if !tuning.Applied {
+		return ""
+	}
+	return fmt.Sprintf(
+		"adaptive=%d/%d/%d->%d/%d/%d p95=%.0fms n=%d err=%.1f%% turn_fail=%.1f%%",
+		tuning.BaseModelTimeout,
+		tuning.BaseBridgeTimeout,
+		tuning.BaseFailoverTimeout,
+		tuning.TunedModelTimeout,
+		tuning.TunedBridgeTimeout,
+		tuning.TunedFailover,
+		tuning.P95LatencyMS,
+		tuning.SampleCount,
+		tuning.AdapterErrorRate*100,
+		tuning.TurnFailureRate*100,
+	)
+}
+
+func adaptiveDecisionLabel(tuning adaptiveTimeoutTuning) string {
+	if tuning.Applied {
+		return "applied"
+	}
+	return "steady"
+}
+
+func buildRuntimeCoordinationContext(settings runtimeSettings, tuning adaptiveTimeoutTuning) string {
+	p95Text := "n/a"
+	if tuning.P95LatencyMS > 0 {
+		p95Text = fmt.Sprintf("%.0fms", tuning.P95LatencyMS)
+	}
+	return fmt.Sprintf(
+		"runtime-sync: adaptive=%s decision=%s model_timeout=%ds bridge_timeout=%ds failover_timeout=%ds p95=%s samples=%d err=%.1f%% turn_fail=%.1f%% gate=%s interop_rounds=%d",
+		onOff(settings.adaptiveTimeoutsEnabled),
+		adaptiveDecisionLabel(tuning),
+		settings.modelTimeoutSeconds,
+		settings.bridgeTimeoutSeconds,
+		settings.adapterFailoverTimeoutSecond,
+		p95Text,
+		maxInt(0, tuning.SampleCount),
+		tuning.AdapterErrorRate*100,
+		tuning.TurnFailureRate*100,
+		settings.executeGateMode,
+		settings.interopRounds,
+	)
+}
+
+func mergeCoordinationContext(runtimeContext string, peerContext string) string {
+	runtimeTrimmed := strings.TrimSpace(runtimeContext)
+	peerTrimmed := strings.TrimSpace(peerContext)
+	if runtimeTrimmed == "" {
+		return peerTrimmed
+	}
+	if peerTrimmed == "" {
+		return runtimeTrimmed
+	}
+	return runtimeTrimmed + "\n" + peerTrimmed
+}
+
 type tabID int
 
 const (
@@ -1470,27 +2117,32 @@ type model struct {
 	busEvents   []triChatBusEvent
 	reliability reliabilitySnapshot
 
-	ready          bool
-	startupErr     error
-	statusLine     string
-	logs           []string
-	activeTab      tabID
-	settingsIndex  int
-	launcherActive bool
-	launcherIndex  int
-	launcherItems  []string
-	launcherPulse  int
-	inflight       bool
-	refreshing     bool
-	lastRefresh    time.Time
-	quitConfirm    bool
-	busSocketPath  string
-	busLiveConn    bool
-	busLiveError   string
-	busLastSeq     int
-	busListening   bool
-	busInbound     chan tea.Msg
-	busSeenEventID map[string]struct{}
+	ready                bool
+	startupErr           error
+	statusLine           string
+	logs                 []string
+	lastAdaptiveDecision string
+	lastAdaptiveReason   string
+	lastAdaptiveP95MS    float64
+	lastAdaptiveSamples  int
+	lastAdaptiveAt       time.Time
+	activeTab            tabID
+	settingsIndex        int
+	launcherActive       bool
+	launcherIndex        int
+	launcherItems        []string
+	launcherPulse        int
+	inflight             bool
+	refreshing           bool
+	lastRefresh          time.Time
+	quitConfirm          bool
+	busSocketPath        string
+	busLiveConn          bool
+	busLiveError         string
+	busLastSeq           int
+	busListening         bool
+	busInbound           chan tea.Msg
+	busSeenEventID       map[string]struct{}
 
 	width  int
 	height int
@@ -1518,11 +2170,19 @@ type refreshDoneMsg struct {
 }
 
 type actionDoneMsg struct {
-	status      string
-	err         error
-	threadID    string
-	threadTitle string
-	refresh     bool
+	status            string
+	err               error
+	threadID          string
+	threadTitle       string
+	refresh           bool
+	adaptiveEvaluated bool
+	adaptiveApplied   bool
+	modelTimeout      int
+	bridgeTimeout     int
+	failoverTimeout   int
+	adaptiveReason    string
+	adaptiveP95MS     float64
+	adaptiveSamples   int
 }
 
 type tickMsg time.Time
@@ -1698,6 +2358,7 @@ func newModel(cfg appConfig) model {
 		fanoutTarget:                 "all",
 		executeGateMode:              cfg.executeGateMode,
 		consensusMinAgents:           cfg.consensusMinAgents,
+		interopRounds:                cfg.interopRounds,
 		autoRefresh:                  true,
 		pollInterval:                 cfg.pollInterval,
 		modelTimeoutSeconds:          cfg.modelTimeoutSeconds,
@@ -1705,6 +2366,9 @@ func newModel(cfg appConfig) model {
 		adapterFailoverTimeoutSecond: cfg.adapterFailoverTimeoutSecond,
 		adapterCircuitThreshold:      cfg.adapterCircuitThreshold,
 		adapterCircuitRecoverySecond: cfg.adapterCircuitRecoverySecond,
+		adaptiveTimeoutsEnabled:      cfg.adaptiveTimeoutsEnabled,
+		adaptiveTimeoutMinSamples:    cfg.adaptiveTimeoutMinSamples,
+		adaptiveTimeoutMaxStepSecond: cfg.adaptiveTimeoutMaxStepSecond,
 	}
 
 	caller := mcpCaller{
@@ -1791,6 +2455,8 @@ func (m model) initCmd() tea.Cmd {
 			"trichat.consensus",
 			"trichat.adapter_protocol_check",
 			"trichat.adapter_telemetry",
+			"trichat.turn_watchdog",
+			"trichat.slo",
 			"task.summary",
 			"task.auto_retry",
 			"transcript.auto_squish",
@@ -1955,6 +2621,18 @@ func (m model) refreshCmd() tea.Cmd {
 		triRetPayload, err := caller.callTool("trichat.auto_retention", map[string]any{"action": "status"})
 		if err == nil {
 			reliability.triRetention, _ = decodeAny[daemonStatusResp](triRetPayload)
+		}
+		watchdogPayload, err := caller.callTool("trichat.turn_watchdog", map[string]any{"action": "status"})
+		if err == nil {
+			reliability.turnWatchdog, _ = decodeAny[triChatTurnWatchdogStatusResp](watchdogPayload)
+		}
+		sloPayload, err := caller.callTool("trichat.slo", map[string]any{
+			"action":         "status",
+			"window_minutes": 60,
+			"event_limit":    8000,
+		})
+		if err == nil {
+			reliability.slo, _ = decodeAny[triChatSloStatusResp](sloPayload)
 		}
 		triSummaryPayload, err := caller.callTool("trichat.summary", map[string]any{"busiest_limit": 5})
 		if err == nil {
@@ -2224,12 +2902,74 @@ func (m model) postMessageCmd(agentID, role, content string, replyTo string, met
 func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 	caller := m.caller
 	cfg := m.cfg
-	settings := m.settings
+	baseSettings := m.settings
+	settings, timeoutTuning := deriveAdaptiveTimeouts(baseSettings, m.reliability.slo)
+	adaptiveSummary := adaptiveTimeoutSummary(timeoutTuning)
+	runtimeCoordinationContext := buildRuntimeCoordinationContext(settings, timeoutTuning)
 	threadID := m.threadID
 	mutation := m.mutation
 	orch := m.orch
 	currentMessages := append([]triChatMessage{}, m.messages...)
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
+		turnID := ""
+		turnPhase := "plan"
+		turnWarning := ""
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				msg = actionDoneMsg{err: fmt.Errorf("fanout pipeline panic: %v", recovered)}
+			}
+			done, ok := msg.(actionDoneMsg)
+			if !ok || done.err == nil || strings.TrimSpace(turnID) == "" {
+				return
+			}
+			errorText := compactSingleLine(done.err.Error(), 220)
+			_, _ = caller.callTool("trichat.turn_artifact", map[string]any{
+				"mutation":      mutation.next("trichat.turn_artifact"),
+				"turn_id":       turnID,
+				"phase":         turnPhase,
+				"artifact_type": "router_error",
+				"agent_id":      "router",
+				"content":       "turn failed in phase " + turnPhase + ": " + errorText,
+				"structured": map[string]any{
+					"phase": turnPhase,
+					"error": errorText,
+				},
+				"metadata": map[string]any{
+					"source":             "trichat-tui",
+					"auto_fail_finalize": true,
+				},
+			})
+			_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+				"mutation":         mutation.next("trichat.turn_advance"),
+				"turn_id":          turnID,
+				"phase":            "summarize",
+				"phase_status":     "completed",
+				"status":           "failed",
+				"verify_status":    "error",
+				"verify_summary":   "fanout pipeline error: " + errorText,
+				"decision_summary": "turn failed in phase " + turnPhase + ": " + errorText,
+				"metadata": map[string]any{
+					"source":             "trichat-tui",
+					"allow_phase_skip":   true,
+					"auto_fail_finalize": true,
+				},
+			})
+			_, _ = caller.callTool("trichat.message_post", map[string]any{
+				"mutation":  mutation.next("trichat.message_post"),
+				"thread_id": threadID,
+				"agent_id":  "router",
+				"role":      "system",
+				"content":   "tri-chat turn " + turnID + " failed in phase " + turnPhase + ": " + errorText,
+				"metadata": map[string]any{
+					"kind":               "turn-failed",
+					"source":             "trichat-tui",
+					"turn_id":            turnID,
+					"phase":              turnPhase,
+					"auto_fail_finalize": true,
+				},
+			})
+		}()
+
 		userMutation := mutation.next("trichat.message_post")
 		userPostPayload := map[string]any{
 			"mutation":  userMutation,
@@ -2254,8 +2994,6 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 			} `json:"message"`
 		}](postResult)
 		userMessageID := posted.Message.MessageID
-		turnID := ""
-		turnWarning := ""
 
 		expectedAgents := fanoutTargets(target)
 		minAgents := settings.consensusMinAgents
@@ -2273,6 +3011,18 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 			"metadata": map[string]any{
 				"source":      "trichat-tui",
 				"fanout_mode": target,
+				"adaptive_timeout": map[string]any{
+					"enabled":                 settings.adaptiveTimeoutsEnabled,
+					"reason":                  timeoutTuning.Reason,
+					"base_model_timeout_s":    timeoutTuning.BaseModelTimeout,
+					"base_bridge_timeout_s":   timeoutTuning.BaseBridgeTimeout,
+					"base_failover_timeout_s": timeoutTuning.BaseFailoverTimeout,
+					"model_timeout_s":         settings.modelTimeoutSeconds,
+					"bridge_timeout_s":        settings.bridgeTimeoutSeconds,
+					"failover_timeout_s":      settings.adapterFailoverTimeoutSecond,
+					"p95_ms":                  timeoutTuning.P95LatencyMS,
+					"latency_samples":         timeoutTuning.SampleCount,
+				},
 			},
 		})
 		if err == nil {
@@ -2280,6 +3030,7 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 			if decodeErr == nil {
 				turnID = strings.TrimSpace(turnStart.Turn.TurnID)
 				if turnID != "" {
+					turnPhase = "propose"
 					_, _ = caller.callTool("trichat.turn_advance", map[string]any{
 						"mutation":     mutation.next("trichat.turn_advance"),
 						"turn_id":      turnID,
@@ -2304,7 +3055,16 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 
 		proposalPrompt := buildProposalPrompt(prompt, target)
 		proposalPromptOverrides := buildProposalPromptOverrides(prompt, target, expectedAgents)
-		responses, events := orch.fanout(proposalPrompt, proposalPromptOverrides, history.Messages, cfg, settings, target, threadID, "")
+		responses, events := orch.fanout(
+			proposalPrompt,
+			proposalPromptOverrides,
+			history.Messages,
+			cfg,
+			settings,
+			target,
+			threadID,
+			mergeCoordinationContext(runtimeCoordinationContext, ""),
+		)
 		for _, response := range responses {
 			structured := parseProposalStructured(response.content, response.agentID, false)
 			postArgs := map[string]any{
@@ -2344,12 +3104,14 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 			}
 		}
 
+		noveltyThreshold := 0.35
+		maxSimilarity := 0.82
 		novelty := triChatNoveltyResp{}
 		if turnID != "" {
 			noveltyPayload, noveltyErr := caller.callTool("trichat.novelty", map[string]any{
 				"turn_id":           turnID,
-				"novelty_threshold": 0.35,
-				"max_similarity":    0.82,
+				"novelty_threshold": noveltyThreshold,
+				"max_similarity":    maxSimilarity,
 			})
 			if noveltyErr == nil {
 				decoded, decodeErr := decodeAny[triChatNoveltyResp](noveltyPayload)
@@ -2387,7 +3149,7 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 					settings,
 					agent,
 					threadID,
-					peerContext,
+					mergeCoordinationContext(runtimeCoordinationContext, peerContext),
 				)
 				events = append(events, deltaEvents...)
 				for _, delta := range deltaResponses {
@@ -2422,8 +3184,10 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 							"structured":    deltaStructured,
 							"score":         proposalConfidence(deltaStructured),
 							"metadata": map[string]any{
-								"source":      "trichat-tui",
-								"retry_agent": agent,
+								"source":       "trichat-tui",
+								"retry_agent":  agent,
+								"retry_round":  1,
+								"retry_origin": "novelty",
 							},
 						})
 					}
@@ -2432,8 +3196,8 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 
 			noveltyPayload, noveltyErr := caller.callTool("trichat.novelty", map[string]any{
 				"turn_id":           turnID,
-				"novelty_threshold": 0.35,
-				"max_similarity":    0.82,
+				"novelty_threshold": noveltyThreshold,
+				"max_similarity":    maxSimilarity,
 			})
 			if noveltyErr == nil {
 				decoded, decodeErr := decodeAny[triChatNoveltyResp](noveltyPayload)
@@ -2459,8 +3223,13 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 		}
 
 		peerContext := buildPeerContext(novelty.Proposals)
+		if strings.TrimSpace(peerContext) == "" {
+			peerContext = buildPeerContextFromResponses(responses)
+		}
 		critiqueAgents := resolveCritiqueAgents(novelty, responses)
+		critiqueNotes := make([]string, 0, 12)
 		if turnID != "" {
+			turnPhase = "critique"
 			if len(critiqueAgents) > 1 {
 				_, _ = caller.callTool("trichat.turn_advance", map[string]any{
 					"mutation":     mutation.next("trichat.turn_advance"),
@@ -2480,11 +3249,19 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 						settings,
 						critic,
 						threadID,
-						peerContext,
+						mergeCoordinationContext(runtimeCoordinationContext, peerContext),
 					)
 					events = append(events, critiqueEvents...)
 					for _, critiqueResponse := range critiqueResponses {
 						critiqueStructured := parseCritiqueStructured(critiqueResponse.content, critic, targetAgent)
+						if recommendation, ok := critiqueStructured["recommendation"].(string); ok {
+							if trimmedRecommendation := strings.TrimSpace(recommendation); trimmedRecommendation != "" {
+								critiqueNotes = append(
+									critiqueNotes,
+									fmt.Sprintf("%s->%s: %s", critic, targetAgent, compactSingleLine(trimmedRecommendation, 180)),
+								)
+							}
+						}
 						_, err := caller.callTool("trichat.message_post", map[string]any{
 							"mutation":            mutation.next("trichat.message_post"),
 							"thread_id":           threadID,
@@ -2538,14 +3315,239 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 			}
 		}
 
+		critiqueContext := strings.Join(critiqueNotes, "\n")
+		interopRoundsCompleted := 0
+		totalCouncilQuestions := 0
+		if settings.interopRounds > 0 && strings.EqualFold(target, "all") && len(expectedAgents) >= 2 {
+			turnPhase = "merge"
+			if turnID != "" {
+				_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+					"mutation":     mutation.next("trichat.turn_advance"),
+					"turn_id":      turnID,
+					"phase":        "merge",
+					"phase_status": "running",
+					"status":       "running",
+					"metadata": map[string]any{
+						"source":           "trichat-tui",
+						"allow_phase_skip": true,
+						"interop_rounds":   settings.interopRounds,
+					},
+				})
+			}
+			for round := 1; round <= settings.interopRounds; round++ {
+				interopPeerContext := buildPeerContext(novelty.Proposals)
+				if strings.TrimSpace(interopPeerContext) == "" {
+					interopPeerContext = peerContext
+				}
+				if strings.TrimSpace(interopPeerContext) == "" {
+					interopPeerContext = buildPeerContextFromResponses(responses)
+				}
+				councilQuestions := make([]councilQuestion, 0, len(expectedAgents))
+				normalizedCouncilAgents := normalizeUniqueAgents(expectedAgents)
+				if len(normalizedCouncilAgents) >= 2 {
+					councilOverrides := buildCouncilQuestionPromptOverrides(
+						prompt,
+						normalizedCouncilAgents,
+						round,
+						interopPeerContext,
+						critiqueContext,
+					)
+					if len(councilOverrides) > 0 {
+						councilResponses, councilEvents := orch.fanout(
+							"TRICHAT_TURN_PHASE=merge\nTRICHAT_RESPONSE_MODE=json\nAutonomous council question generation.",
+							councilOverrides,
+							history.Messages,
+							cfg,
+							settings,
+							"all",
+							threadID,
+							mergeCoordinationContext(runtimeCoordinationContext, interopPeerContext),
+						)
+						events = append(events, councilEvents...)
+						for _, councilResponse := range councilResponses {
+							question := parseCouncilQuestion(councilResponse.content, councilResponse.agentID, normalizedCouncilAgents)
+							if strings.TrimSpace(question.TargetAgent) == "" || strings.TrimSpace(question.Question) == "" {
+								continue
+							}
+							councilQuestions = append(councilQuestions, question)
+							totalCouncilQuestions += 1
+							councilContent := fmt.Sprintf("@%s %s", question.TargetAgent, question.Question)
+							_, err := caller.callTool("trichat.message_post", map[string]any{
+								"mutation":            mutation.next("trichat.message_post"),
+								"thread_id":           threadID,
+								"agent_id":            question.AskerAgent,
+								"role":                "assistant",
+								"content":             councilContent,
+								"reply_to_message_id": userMessageID,
+								"metadata": map[string]any{
+									"kind":          "fanout-council-question",
+									"source":        "trichat-tui",
+									"phase":         "merge",
+									"interop_round": round,
+									"target_agent":  question.TargetAgent,
+									"rationale":     question.Rationale,
+									"urgency":       question.Urgency,
+									"adapter":       councilResponse.adapterMeta,
+								},
+							})
+							if err != nil {
+								return actionDoneMsg{err: err}
+							}
+							if turnID != "" {
+								_, _ = caller.callTool("trichat.turn_artifact", map[string]any{
+									"mutation":      mutation.next("trichat.turn_artifact"),
+									"turn_id":       turnID,
+									"phase":         "merge",
+									"artifact_type": "council_question",
+									"agent_id":      question.AskerAgent,
+									"content":       councilContent,
+									"structured": map[string]any{
+										"asker_agent":  question.AskerAgent,
+										"target_agent": question.TargetAgent,
+										"question":     question.Question,
+										"rationale":    question.Rationale,
+										"urgency":      question.Urgency,
+									},
+									"score": question.Urgency,
+									"metadata": map[string]any{
+										"source":        "trichat-tui",
+										"interop_round": round,
+									},
+								})
+							}
+						}
+					}
+				}
+				councilQuestionByTarget := groupCouncilQuestionsByTarget(councilQuestions)
+				overrides := buildInteropPromptOverrides(
+					prompt,
+					expectedAgents,
+					round,
+					interopPeerContext,
+					critiqueContext,
+					councilQuestionByTarget,
+				)
+				if len(overrides) == 0 {
+					break
+				}
+				interopResponses, interopEvents := orch.fanout(
+					"TRICHAT_TURN_PHASE=merge\nTRICHAT_RESPONSE_MODE=json\nInterop refinement round in progress.",
+					overrides,
+					history.Messages,
+					cfg,
+					settings,
+					"all",
+					threadID,
+					mergeCoordinationContext(runtimeCoordinationContext, interopPeerContext),
+				)
+				events = append(events, interopEvents...)
+				if len(interopResponses) == 0 {
+					continue
+				}
+
+				interopRoundsCompleted += 1
+				for _, response := range interopResponses {
+					interopStructured := parseProposalStructured(response.content, response.agentID, true)
+					_, err := caller.callTool("trichat.message_post", map[string]any{
+						"mutation":            mutation.next("trichat.message_post"),
+						"thread_id":           threadID,
+						"agent_id":            response.agentID,
+						"role":                "assistant",
+						"content":             response.content,
+						"reply_to_message_id": userMessageID,
+						"metadata": map[string]any{
+							"kind":                   "fanout-interop",
+							"source":                 "trichat-tui",
+							"phase":                  "merge",
+							"interop_round":          round,
+							"council_question_count": len(councilQuestionByTarget[response.agentID]),
+							"adapter":                response.adapterMeta,
+							"structured_v":           1,
+							"structured":             interopStructured,
+						},
+					})
+					if err != nil {
+						return actionDoneMsg{err: err}
+					}
+					if turnID != "" {
+						_, _ = caller.callTool("trichat.turn_artifact", map[string]any{
+							"mutation":      mutation.next("trichat.turn_artifact"),
+							"turn_id":       turnID,
+							"phase":         "propose",
+							"artifact_type": "proposal_interop",
+							"agent_id":      response.agentID,
+							"content":       response.content,
+							"structured":    interopStructured,
+							"score":         proposalConfidence(interopStructured),
+							"metadata": map[string]any{
+								"source":                 "trichat-tui",
+								"interop_round":          round,
+								"phase_origin":           "merge",
+								"council_question_count": len(councilQuestionByTarget[response.agentID]),
+							},
+						})
+					}
+					history.Messages = append(history.Messages, triChatMessage{
+						ThreadID:         threadID,
+						AgentID:          response.agentID,
+						Role:             "assistant",
+						Content:          response.content,
+						ReplyToMessageID: userMessageID,
+					})
+				}
+
+				if turnID != "" {
+					noveltyPayload, noveltyErr := caller.callTool("trichat.novelty", map[string]any{
+						"turn_id":           turnID,
+						"novelty_threshold": noveltyThreshold,
+						"max_similarity":    maxSimilarity,
+					})
+					if noveltyErr == nil {
+						decoded, decodeErr := decodeAny[triChatNoveltyResp](noveltyPayload)
+						if decodeErr == nil {
+							novelty = decoded
+						}
+					}
+				}
+
+				if novelty.Found && !novelty.RetryRequired && !novelty.Disagreement {
+					break
+				}
+			}
+			if interopRoundsCompleted > 0 {
+				_, _ = caller.callTool("trichat.message_post", map[string]any{
+					"mutation":  mutation.next("trichat.message_post"),
+					"thread_id": threadID,
+					"agent_id":  "router",
+					"role":      "assistant",
+					"content": fmt.Sprintf(
+						"[interop] rounds=%d novelty=%.2f retry=%s disagreement=%s",
+						interopRoundsCompleted,
+						novelty.NoveltyScore,
+						onOff(novelty.RetryRequired),
+						onOff(novelty.Disagreement),
+					),
+					"metadata": map[string]any{
+						"kind":           "interop-summary",
+						"source":         "trichat-tui",
+						"interop_rounds": interopRoundsCompleted,
+						"novelty_score":  novelty.NoveltyScore,
+						"retry_required": novelty.RetryRequired,
+						"disagreement":   novelty.Disagreement,
+					},
+				})
+			}
+		}
+
 		selectedAgent, selectedStrategy, decisionSummary := deriveTurnDecision(novelty, responses)
+		turnPhase = "merge"
 		if turnID != "" {
 			orchestratePayload, orchestrateErr := caller.callTool("trichat.turn_orchestrate", map[string]any{
 				"mutation":          mutation.next("trichat.turn_orchestrate"),
 				"turn_id":           turnID,
 				"action":            "decide",
-				"novelty_threshold": 0.35,
-				"max_similarity":    0.82,
+				"novelty_threshold": noveltyThreshold,
+				"max_similarity":    maxSimilarity,
 			})
 			if orchestrateErr != nil {
 				turnWarning = compactSingleLine(orchestrateErr.Error(), 140)
@@ -2617,15 +3619,43 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 		if strings.TrimSpace(turnWarning) != "" {
 			warningStatus = " turn_warn=" + turnWarning
 		}
+		interopStatus := ""
+		if interopRoundsCompleted > 0 {
+			interopStatus = fmt.Sprintf(" interop=%d", interopRoundsCompleted)
+		}
+		councilStatus := ""
+		if totalCouncilQuestions > 0 {
+			councilStatus = fmt.Sprintf(" council_q=%d", totalCouncilQuestions)
+		}
+		adaptiveStatus := ""
+		if adaptiveSummary != "" {
+			adaptiveStatus = " " + adaptiveSummary
+		}
 		if target == "all" {
 			return actionDoneMsg{
-				status:  "fanout complete: codex, cursor, local-imprint" + turnStatus + noveltyStatus + decisionStatus + warningStatus,
-				refresh: true,
+				status:            "fanout complete: codex, cursor, local-imprint" + turnStatus + noveltyStatus + decisionStatus + interopStatus + councilStatus + warningStatus + adaptiveStatus,
+				refresh:           true,
+				adaptiveEvaluated: true,
+				adaptiveApplied:   timeoutTuning.Applied,
+				modelTimeout:      settings.modelTimeoutSeconds,
+				bridgeTimeout:     settings.bridgeTimeoutSeconds,
+				failoverTimeout:   settings.adapterFailoverTimeoutSecond,
+				adaptiveReason:    timeoutTuning.Reason,
+				adaptiveP95MS:     timeoutTuning.P95LatencyMS,
+				adaptiveSamples:   timeoutTuning.SampleCount,
 			}
 		}
 		return actionDoneMsg{
-			status:  "response complete: " + target + turnStatus + noveltyStatus + decisionStatus + warningStatus,
-			refresh: true,
+			status:            "response complete: " + target + turnStatus + noveltyStatus + decisionStatus + interopStatus + councilStatus + warningStatus + adaptiveStatus,
+			refresh:           true,
+			adaptiveEvaluated: true,
+			adaptiveApplied:   timeoutTuning.Applied,
+			modelTimeout:      settings.modelTimeoutSeconds,
+			bridgeTimeout:     settings.bridgeTimeoutSeconds,
+			failoverTimeout:   settings.adapterFailoverTimeoutSecond,
+			adaptiveReason:    timeoutTuning.Reason,
+			adaptiveP95MS:     timeoutTuning.P95LatencyMS,
+			adaptiveSamples:   timeoutTuning.SampleCount,
 		}
 	}
 }
@@ -2636,6 +3666,14 @@ type proposalRoleProfile struct {
 	PrimaryFocus    string
 	DistinctiveMove string
 	CoordinationTip string
+}
+
+type councilQuestion struct {
+	AskerAgent  string
+	TargetAgent string
+	Question    string
+	Rationale   string
+	Urgency     float64
 }
 
 func proposalRoleForAgent(agentID string) proposalRoleProfile {
@@ -2783,6 +3821,233 @@ func buildPeerContext(proposals []triChatNoveltyProposal) string {
 	return strings.Join(lines, "\n")
 }
 
+func buildPeerContextFromResponses(responses []agentResponse) string {
+	if len(responses) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(responses))
+	for _, response := range responses {
+		agentID := strings.ToLower(strings.TrimSpace(response.agentID))
+		if agentID == "" {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s: %s", agentID, compactSingleLine(response.content, 180)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func normalizeUniqueAgents(agents []string) []string {
+	normalizedAgents := make([]string, 0, len(agents))
+	seen := make(map[string]struct{}, len(agents))
+	for _, agent := range agents {
+		normalized := strings.ToLower(strings.TrimSpace(agent))
+		if normalized == "" {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		normalizedAgents = append(normalizedAgents, normalized)
+	}
+	return normalizedAgents
+}
+
+func firstCouncilTarget(agentID string, collaborators []string) string {
+	self := strings.ToLower(strings.TrimSpace(agentID))
+	for _, collaborator := range collaborators {
+		normalized := strings.ToLower(strings.TrimSpace(collaborator))
+		if normalized != "" && normalized != self {
+			return normalized
+		}
+	}
+	return self
+}
+
+func buildCouncilQuestionPromptForAgent(
+	userPrompt string,
+	agentID string,
+	collaborators []string,
+	round int,
+	peerContext string,
+	critiqueContext string,
+) string {
+	profile := proposalRoleForAgent(agentID)
+	collabLabel := strings.Join(collaborators, ",")
+	if collabLabel == "" {
+		collabLabel = "(none)"
+	}
+	if strings.TrimSpace(critiqueContext) == "" {
+		critiqueContext = "(no critiques captured)"
+	}
+	return strings.TrimSpace(
+		fmt.Sprintf(
+			`TRICHAT_TURN_PHASE=merge
+TRICHAT_RESPONSE_MODE=json
+TRICHAT_ROLE=%s
+TRICHAT_ROLE_OBJECTIVE=%s
+TRICHAT_AGENT=%s
+TRICHAT_COLLABORATORS=%s
+TRICHAT_INTEROP_ROUND=%d
+User objective:
+%s
+
+Council behavior:
+- You are in autonomous collaboration mode.
+- Pick one collaborator that should answer a high-value question before final merge.
+- Ask one concise question that improves cross-agent plan quality.
+
+Peer strategy snapshot:
+%s
+
+Critique snapshot:
+%s
+
+Return ONLY JSON with keys: target_agent, question, rationale, urgency.
+- target_agent must be one of: %s
+- question and rationale must be concise strings.
+- urgency must be a number from 0 to 1.`,
+			profile.RoleID,
+			profile.PrimaryFocus,
+			strings.TrimSpace(agentID),
+			collabLabel,
+			round,
+			strings.TrimSpace(userPrompt),
+			truncate(peerContext, 1200),
+			truncate(critiqueContext, 1200),
+			collabLabel,
+		),
+	)
+}
+
+func buildCouncilQuestionPromptOverrides(
+	userPrompt string,
+	agents []string,
+	round int,
+	peerContext string,
+	critiqueContext string,
+) map[string]string {
+	overrides := make(map[string]string, len(agents))
+	normalizedAgents := normalizeUniqueAgents(agents)
+	if len(normalizedAgents) == 0 {
+		return overrides
+	}
+	for _, agent := range normalizedAgents {
+		collaborators := make([]string, 0, len(normalizedAgents)-1)
+		for _, other := range normalizedAgents {
+			if other == agent {
+				continue
+			}
+			collaborators = append(collaborators, other)
+		}
+		overrides[agent] = buildCouncilQuestionPromptForAgent(
+			userPrompt,
+			agent,
+			collaborators,
+			round,
+			peerContext,
+			critiqueContext,
+		)
+	}
+	return overrides
+}
+
+func parseCouncilQuestion(content string, askerAgent string, validTargets []string) councilQuestion {
+	raw := strings.TrimSpace(content)
+	parsed := map[string]any{}
+	if extracted := extractJSONObject(raw); extracted != "" {
+		var obj map[string]any
+		if err := json.Unmarshal([]byte(extracted), &obj); err == nil {
+			parsed = obj
+		}
+	}
+	normalizedAsker := strings.ToLower(strings.TrimSpace(askerAgent))
+	targetCandidates := make([]string, 0, len(validTargets))
+	for _, target := range validTargets {
+		normalized := strings.ToLower(strings.TrimSpace(target))
+		if normalized == "" || normalized == normalizedAsker {
+			continue
+		}
+		targetCandidates = append(targetCandidates, normalized)
+	}
+	targetSet := make(map[string]struct{}, len(targetCandidates))
+	for _, target := range targetCandidates {
+		targetSet[target] = struct{}{}
+	}
+	target := strings.ToLower(strings.TrimSpace(fmt.Sprint(parsed["target_agent"])))
+	if _, ok := targetSet[target]; !ok {
+		target = firstCouncilTarget(normalizedAsker, targetCandidates)
+	}
+	question := strings.TrimSpace(fmt.Sprint(parsed["question"]))
+	if question == "" {
+		question = compactSingleLine(raw, 180)
+	}
+	if question == "" {
+		question = "What is the highest-impact change to improve your lane output?"
+	}
+	rationale := strings.TrimSpace(fmt.Sprint(parsed["rationale"]))
+	if rationale == "" {
+		rationale = "coordinate strategy delta before merge"
+	}
+	urgency := 0.58
+	switch value := parsed["urgency"].(type) {
+	case float64:
+		urgency = clampFloat(value, 0.05, 0.99)
+	case int:
+		urgency = clampFloat(float64(value), 0.05, 0.99)
+	case string:
+		if parsedValue, err := strconv.ParseFloat(strings.TrimSpace(value), 64); err == nil {
+			urgency = clampFloat(parsedValue, 0.05, 0.99)
+		}
+	}
+	return councilQuestion{
+		AskerAgent:  normalizedAsker,
+		TargetAgent: target,
+		Question:    compactSingleLine(question, 220),
+		Rationale:   compactSingleLine(rationale, 200),
+		Urgency:     urgency,
+	}
+}
+
+func groupCouncilQuestionsByTarget(questions []councilQuestion) map[string][]councilQuestion {
+	grouped := make(map[string][]councilQuestion, len(questions))
+	for _, question := range questions {
+		target := strings.ToLower(strings.TrimSpace(question.TargetAgent))
+		if target == "" {
+			continue
+		}
+		grouped[target] = append(grouped[target], question)
+	}
+	return grouped
+}
+
+func renderIncomingCouncilQuestions(agentID string, incoming []councilQuestion) string {
+	if len(incoming) == 0 {
+		return "(no direct council questions for this agent)"
+	}
+	normalizedAgent := strings.ToLower(strings.TrimSpace(agentID))
+	lines := make([]string, 0, len(incoming))
+	for _, question := range incoming {
+		if strings.ToLower(strings.TrimSpace(question.TargetAgent)) != normalizedAgent {
+			continue
+		}
+		lines = append(
+			lines,
+			fmt.Sprintf(
+				"- from %s (urgency %.2f): %s | rationale: %s",
+				question.AskerAgent,
+				question.Urgency,
+				question.Question,
+				question.Rationale,
+			),
+		)
+	}
+	if len(lines) == 0 {
+		return "(no direct council questions for this agent)"
+	}
+	return strings.Join(lines, "\n")
+}
+
 func buildDeltaRetryPrompt(userPrompt string, agentID string, peerContext string) string {
 	profile := proposalRoleForAgent(agentID)
 	return strings.TrimSpace(
@@ -2810,6 +4075,102 @@ Do not copy or lightly paraphrase existing strategies.`,
 			truncate(peerContext, 1200),
 		),
 	)
+}
+
+func buildInteropPromptForAgent(
+	userPrompt string,
+	agentID string,
+	collaborators []string,
+	round int,
+	peerContext string,
+	critiqueContext string,
+	incomingQuestions []councilQuestion,
+) string {
+	profile := proposalRoleForAgent(agentID)
+	collabLabel := strings.Join(collaborators, ",")
+	if collabLabel == "" {
+		collabLabel = "(none)"
+	}
+	if strings.TrimSpace(critiqueContext) == "" {
+		critiqueContext = "(no critiques captured)"
+	}
+	incomingQuestionsBlock := renderIncomingCouncilQuestions(agentID, incomingQuestions)
+	return strings.TrimSpace(
+		fmt.Sprintf(
+			`TRICHAT_TURN_PHASE=merge
+TRICHAT_RESPONSE_MODE=json
+TRICHAT_ROLE=%s
+TRICHAT_ROLE_OBJECTIVE=%s
+TRICHAT_AGENT=%s
+TRICHAT_COLLABORATORS=%s
+TRICHAT_INTEROP_ROUND=%d
+User objective:
+%s
+
+You are running interop round %d. Bounce off peers and critiques while staying in your lane.
+
+Peer strategy snapshot:
+%s
+
+Critique snapshot:
+%s
+
+Incoming council questions (address these explicitly in your merge output):
+%s
+
+Output contract:
+- Keep your lane identity (%s) and produce one meaningful delta from your earlier approach.
+- Integrate at least one peer idea and one critique item.
+- If incoming council questions exist, address them directly in strategy or coordination_handoff.
+- Return ONLY JSON with keys: strategy, plan_steps, risks, commands, confidence, role_lane, coordination_handoff.
+- "plan_steps", "risks", and "commands" must be arrays of short strings.
+- confidence must be a number from 0 to 1.`,
+			profile.RoleID,
+			profile.PrimaryFocus,
+			strings.TrimSpace(agentID),
+			collabLabel,
+			round,
+			strings.TrimSpace(userPrompt),
+			round,
+			truncate(peerContext, 1200),
+			truncate(critiqueContext, 1200),
+			truncate(incomingQuestionsBlock, 1200),
+			profile.RoleID,
+		),
+	)
+}
+
+func buildInteropPromptOverrides(
+	userPrompt string,
+	agents []string,
+	round int,
+	peerContext string,
+	critiqueContext string,
+	councilQuestionsByTarget map[string][]councilQuestion,
+) map[string]string {
+	overrides := make(map[string]string, len(agents))
+	normalizedAgents := normalizeUniqueAgents(agents)
+	sort.Strings(normalizedAgents)
+
+	for _, agent := range normalizedAgents {
+		collaborators := make([]string, 0, len(normalizedAgents)-1)
+		for _, other := range normalizedAgents {
+			if other == agent {
+				continue
+			}
+			collaborators = append(collaborators, other)
+		}
+		overrides[agent] = buildInteropPromptForAgent(
+			userPrompt,
+			agent,
+			collaborators,
+			round,
+			peerContext,
+			critiqueContext,
+			councilQuestionsByTarget[agent],
+		)
+	}
+	return overrides
 }
 
 func buildCritiquePrompt(userPrompt string, criticAgent string, targetAgent string, peerContext string) string {
@@ -3654,6 +5015,44 @@ func (m model) adapterProtocolCheckCmd(parts []string) tea.Cmd {
 	}
 }
 
+func (m *model) interopCommandCmd(parts []string) tea.Cmd {
+	if len(parts) == 0 {
+		m.inflight = false
+		m.statusLine = fmt.Sprintf("interop rounds=%d", m.settings.interopRounds)
+		m.renderPanes()
+		return nil
+	}
+	mode := strings.ToLower(strings.TrimSpace(parts[0]))
+	next := m.settings.interopRounds
+	switch mode {
+	case "status":
+		m.inflight = false
+		m.statusLine = fmt.Sprintf("interop rounds=%d", m.settings.interopRounds)
+		m.renderPanes()
+		return nil
+	case "off", "disable", "0":
+		next = 0
+	case "on", "enable", "1":
+		next = maxInt(1, m.settings.interopRounds)
+	case "2", "3":
+		parsed, _ := strconv.Atoi(mode)
+		next = parsed
+	default:
+		parsed, err := strconv.Atoi(mode)
+		if err != nil {
+			m.inflight = false
+			m.statusLine = "usage: /interop status|on|off|0|1|2|3"
+			return nil
+		}
+		next = parsed
+	}
+	m.settings.interopRounds = clampInt(next, 0, 3)
+	m.inflight = false
+	m.statusLine = fmt.Sprintf("interop rounds set: %d", m.settings.interopRounds)
+	m.renderPanes()
+	return nil
+}
+
 func (m model) executeCmd(agentID, objective string) tea.Cmd {
 	caller := m.caller
 	threadID := m.threadID
@@ -3661,8 +5060,66 @@ func (m model) executeCmd(agentID, objective string) tea.Cmd {
 	gateMode := m.settings.executeGateMode
 	allow := m.cfg.executeAllowAgents
 	approvalPhrase := m.cfg.executeApprovalPhrase
-	return func() tea.Msg {
+	return func() (msg tea.Msg) {
 		normalizedAgent := strings.ToLower(strings.TrimSpace(agentID))
+		activeTurnID := ""
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				msg = actionDoneMsg{err: fmt.Errorf("execute pipeline panic: %v", recovered)}
+			}
+			done, ok := msg.(actionDoneMsg)
+			if !ok || done.err == nil || strings.TrimSpace(activeTurnID) == "" {
+				return
+			}
+			errorText := compactSingleLine(done.err.Error(), 220)
+			_, _ = caller.callTool("trichat.turn_artifact", map[string]any{
+				"mutation":      mutation.next("trichat.turn_artifact"),
+				"turn_id":       activeTurnID,
+				"phase":         "execute",
+				"artifact_type": "router_error",
+				"agent_id":      "router",
+				"content":       "execute failed: " + errorText,
+				"structured": map[string]any{
+					"agent_id": normalizedAgent,
+					"error":    errorText,
+				},
+				"metadata": map[string]any{
+					"source":             "trichat-tui",
+					"auto_fail_finalize": true,
+				},
+			})
+			_, _ = caller.callTool("trichat.turn_advance", map[string]any{
+				"mutation":         mutation.next("trichat.turn_advance"),
+				"turn_id":          activeTurnID,
+				"phase":            "summarize",
+				"phase_status":     "completed",
+				"status":           "failed",
+				"verify_status":    "error",
+				"verify_summary":   "execute pipeline error: " + errorText,
+				"decision_summary": "execute failed via " + normalizedAgent + ": " + errorText,
+				"selected_agent":   normalizedAgent,
+				"metadata": map[string]any{
+					"source":             "trichat-tui",
+					"allow_phase_skip":   true,
+					"auto_fail_finalize": true,
+				},
+			})
+			_, _ = caller.callTool("trichat.message_post", map[string]any{
+				"mutation":  mutation.next("trichat.message_post"),
+				"thread_id": threadID,
+				"agent_id":  "router",
+				"role":      "system",
+				"content":   "execute for turn " + activeTurnID + " failed via " + normalizedAgent + ": " + errorText,
+				"metadata": map[string]any{
+					"kind":               "execute-failed",
+					"source":             "trichat-tui",
+					"turn_id":            activeTurnID,
+					"agent_id":           normalizedAgent,
+					"auto_fail_finalize": true,
+				},
+			})
+		}()
+
 		if normalizedAgent == "" {
 			return actionDoneMsg{status: "usage: /execute <agent> [objective]"}
 		}
@@ -3696,7 +5153,6 @@ func (m model) executeCmd(agentID, objective string) tea.Cmd {
 			return actionDoneMsg{status: "no objective found from latest agent message"}
 		}
 
-		activeTurnID := ""
 		turnPayload, turnErr := caller.callTool("trichat.turn_get", map[string]any{
 			"thread_id":         threadID,
 			"include_closed":    false,
@@ -3933,6 +5389,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusLine = msg.status
 			m.appendLog(msg.status)
 		}
+		if msg.adaptiveEvaluated {
+			m.lastAdaptiveDecision = ternary(msg.adaptiveApplied, "applied", "steady")
+			m.lastAdaptiveReason = strings.TrimSpace(msg.adaptiveReason)
+			m.lastAdaptiveP95MS = msg.adaptiveP95MS
+			m.lastAdaptiveSamples = maxInt(0, msg.adaptiveSamples)
+			m.lastAdaptiveAt = time.Now()
+		}
+		if msg.adaptiveApplied {
+			m.settings.modelTimeoutSeconds = clampInt(msg.modelTimeout, 1, 120)
+			m.settings.bridgeTimeoutSeconds = clampInt(msg.bridgeTimeout, 1, 120)
+			m.settings.adapterFailoverTimeoutSecond = clampInt(msg.failoverTimeout, 1, 120)
+			if strings.TrimSpace(msg.adaptiveReason) != "" {
+				m.appendLog(
+					fmt.Sprintf(
+						"adaptive timeouts applied (%s): model=%ds bridge=%ds failover=%ds",
+						msg.adaptiveReason,
+						m.settings.modelTimeoutSeconds,
+						m.settings.bridgeTimeoutSeconds,
+						m.settings.adapterFailoverTimeoutSecond,
+					),
+				)
+			}
+		}
 		threadChanged := false
 		if strings.TrimSpace(msg.threadID) != "" {
 			if msg.threadID != m.threadID {
@@ -4092,6 +5571,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.activeTab {
 		case tabChat:
 			switch msg.String() {
+			case "ctrl+a":
+				if m.inflight || !m.ready {
+					return m, tea.Batch(cmds...)
+				}
+				m.inflight = true
+				cmds = append(cmds, m.adapterProtocolCheckCmd(nil))
+				return m, tea.Batch(cmds...)
 			case "enter":
 				if m.inflight || !m.ready {
 					return m, tea.Batch(cmds...)
@@ -4200,6 +5686,8 @@ func (m *model) handleSlash(raw string) tea.Cmd {
 		return m.refreshCmd()
 	case "/adaptercheck":
 		return m.adapterProtocolCheckCmd(tail)
+	case "/interop":
+		return m.interopCommandCmd(tail)
 	case "/fanout":
 		if len(tail) == 0 {
 			m.inflight = false
@@ -4627,7 +6115,7 @@ func (m *model) renderFooter() string {
 		statusStyle = m.theme.errorStatus
 	}
 	line := statusStyle.Render(compactSingleLine(m.statusLine, 180))
-	hints := m.theme.helpText.Render("Keys: Tab switch view · Enter send · PgUp/PgDn or Up/Down (input empty) or +/- scroll · Esc menu/quit prompt · Ctrl+C quit")
+	hints := m.theme.helpText.Render("Keys: Tab switch view · Enter send · Ctrl+A adapter check · PgUp/PgDn or Up/Down (input empty) or +/- scroll · Esc menu/quit prompt · Ctrl+C quit")
 	return m.theme.footer.Width(contentWidth).Render(line + "\n" + hints)
 }
 
@@ -4780,6 +6268,39 @@ func (m *model) renderTimeline() string {
 	return strings.TrimSpace(b.String())
 }
 
+func (m *model) adaptiveSidebarLine() string {
+	decision := strings.TrimSpace(m.lastAdaptiveDecision)
+	reason := strings.TrimSpace(m.lastAdaptiveReason)
+	p95 := m.lastAdaptiveP95MS
+	samples := m.lastAdaptiveSamples
+
+	if decision == "" {
+		_, tuning := deriveAdaptiveTimeouts(m.settings, m.reliability.slo)
+		decision = adaptiveDecisionLabel(tuning)
+		reason = strings.TrimSpace(tuning.Reason)
+		p95 = tuning.P95LatencyMS
+		samples = tuning.SampleCount
+	}
+	if decision == "" {
+		decision = "steady"
+	}
+
+	line := fmt.Sprintf(
+		"Adaptive  %s active=%ds/%ds/%ds",
+		decision,
+		m.settings.modelTimeoutSeconds,
+		m.settings.bridgeTimeoutSeconds,
+		m.settings.adapterFailoverTimeoutSecond,
+	)
+	if p95 > 0 && samples > 0 {
+		line += fmt.Sprintf(" p95=%.0fms n=%d", p95, samples)
+	}
+	if reason != "" && reason != "applied" && reason != "steady" {
+		line += " reason=" + compactSingleLine(reason, 22)
+	}
+	return line
+}
+
 func (m *model) renderSidebar() string {
 	r := m.reliability
 	counts := r.taskSummary.Counts
@@ -4790,8 +6311,8 @@ func (m *model) renderSidebar() string {
 
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("Tasks  pending=%d running=%d failed=%d completed=%d\n", pending, running, failed, completed))
-	b.WriteString(fmt.Sprintf("Daemons  retry=%s squish=%s retention=%s\n",
-		onOff(r.taskAutoRetry.Running), onOff(r.transcriptSquish.Running), onOff(r.triRetention.Running)))
+	b.WriteString(fmt.Sprintf("Daemons  retry=%s squish=%s retention=%s watchdog=%s\n",
+		onOff(r.taskAutoRetry.Running), onOff(r.transcriptSquish.Running), onOff(r.triRetention.Running), onOff(r.turnWatchdog.Running)))
 	b.WriteString(fmt.Sprintf("TriChat  threads=%d messages=%d\n",
 		r.triSummary.ThreadCounts.Total, r.triSummary.MessageCount))
 	latestConsensusStatus := "n/a"
@@ -4809,6 +6330,8 @@ func (m *model) renderSidebar() string {
 		r.consensus.DisagreementTurns,
 		r.consensus.IncompleteTurns,
 	))
+	b.WriteString(fmt.Sprintf("Interop  rounds=%d\n", m.settings.interopRounds))
+	b.WriteString(fmt.Sprintf("Council  auto=%s\n", onOff(m.settings.interopRounds > 0 && strings.EqualFold(m.settings.fanoutTarget, "all"))))
 	workboardRunning := r.workboard.Counts["running"]
 	workboardTotal := r.workboard.Counts["total"]
 	activePhase := "n/a"
@@ -4830,6 +6353,21 @@ func (m *model) renderSidebar() string {
 			b.WriteString("\n")
 		}
 	}
+	sloWindow := r.slo.Metrics.WindowMinutes
+	if sloWindow <= 0 {
+		sloWindow = 60
+	}
+	p95Text := "n/a"
+	if r.slo.Metrics.Adapter.P95LatencyMS != nil {
+		p95Text = fmt.Sprintf("%.0fms", *r.slo.Metrics.Adapter.P95LatencyMS)
+	}
+	b.WriteString(fmt.Sprintf("SLO %dm  p95=%s err=%.1f%% turn_fail=%.1f%%\n",
+		sloWindow,
+		p95Text,
+		r.slo.Metrics.Adapter.ErrorRate*100,
+		r.slo.Metrics.Turns.FailureRate*100,
+	))
+	b.WriteString(m.adaptiveSidebarLine() + "\n")
 	b.WriteString(fmt.Sprintf("Bus  running=%s clients=%d subs=%d events=%d\n",
 		onOff(r.busStatus.Running),
 		r.busStatus.ClientCount,
@@ -4845,6 +6383,9 @@ func (m *model) renderSidebar() string {
 	))
 	if strings.TrimSpace(r.busStatus.LastError) != "" {
 		b.WriteString("Bus err  " + compactSingleLine(r.busStatus.LastError, 72) + "\n")
+	}
+	if strings.TrimSpace(r.turnWatchdog.LastError) != "" {
+		b.WriteString("Watchdog err  " + compactSingleLine(r.turnWatchdog.LastError, 66) + "\n")
 	}
 	if strings.TrimSpace(r.adapterTelemetry.Summary.NewestTripOpenedAt) != "" {
 		b.WriteString("Last trip  " + r.adapterTelemetry.Summary.NewestTripOpenedAt + "\n")
@@ -4952,6 +6493,58 @@ func (m *model) renderReliabilityDetail() string {
 		}
 	}
 
+	b.WriteString("\n\nSLO detail:\n")
+	windowMinutes := m.reliability.slo.Metrics.WindowMinutes
+	if windowMinutes <= 0 {
+		windowMinutes = 60
+	}
+	p95Text := "n/a"
+	if m.reliability.slo.Metrics.Adapter.P95LatencyMS != nil {
+		p95Text = fmt.Sprintf("%.2fms", *m.reliability.slo.Metrics.Adapter.P95LatencyMS)
+	}
+	b.WriteString(fmt.Sprintf("- window: %dm since=%s\n", windowMinutes, nullCoalesce(m.reliability.slo.Metrics.SinceISO, "n/a")))
+	b.WriteString(fmt.Sprintf("- adapter samples=%d latency_samples=%d p95=%s\n",
+		m.reliability.slo.Metrics.Adapter.SampleCount,
+		m.reliability.slo.Metrics.Adapter.LatencySamples,
+		p95Text,
+	))
+	b.WriteString(fmt.Sprintf("- adapter error rate=%.2f%% (%d/%d)\n",
+		m.reliability.slo.Metrics.Adapter.ErrorRate*100,
+		m.reliability.slo.Metrics.Adapter.ErrorCount,
+		m.reliability.slo.Metrics.Adapter.SampleCount,
+	))
+	b.WriteString(fmt.Sprintf("- turn failure rate=%.2f%% (%d/%d)\n",
+		m.reliability.slo.Metrics.Turns.FailureRate*100,
+		m.reliability.slo.Metrics.Turns.FailedCount,
+		m.reliability.slo.Metrics.Turns.TotalCount,
+	))
+	if m.reliability.slo.LatestSnapshot != nil {
+		b.WriteString(fmt.Sprintf("- latest snapshot: %s at %s\n",
+			nullCoalesce(m.reliability.slo.LatestSnapshot.SnapshotID, "n/a"),
+			nullCoalesce(m.reliability.slo.LatestSnapshot.CreatedAt, "n/a"),
+		))
+	}
+
+	b.WriteString("\n\nWatchdog detail:\n")
+	b.WriteString(fmt.Sprintf("- running=%s in_tick=%s interval=%ds stale_after=%ds batch=%d\n",
+		onOff(m.reliability.turnWatchdog.Running),
+		onOff(m.reliability.turnWatchdog.InTick),
+		m.reliability.turnWatchdog.Config.IntervalSeconds,
+		m.reliability.turnWatchdog.Config.StaleAfterSeconds,
+		m.reliability.turnWatchdog.Config.BatchLimit,
+	))
+	b.WriteString(fmt.Sprintf("- ticks=%d stale_detected=%d escalated=%d\n",
+		m.reliability.turnWatchdog.Stats.TickCount,
+		m.reliability.turnWatchdog.Stats.StaleDetected,
+		m.reliability.turnWatchdog.Stats.EscalatedCount,
+	))
+	if strings.TrimSpace(m.reliability.turnWatchdog.LastError) != "" {
+		b.WriteString("- last error: " + compactSingleLine(m.reliability.turnWatchdog.LastError, 96) + "\n")
+	}
+	if len(m.reliability.turnWatchdog.Stats.LastEscalatedTurn) > 0 {
+		b.WriteString("- last escalated turns: " + strings.Join(m.reliability.turnWatchdog.Stats.LastEscalatedTurn, ",") + "\n")
+	}
+
 	b.WriteString("\n\nBus detail:\n")
 	b.WriteString(fmt.Sprintf("- socket: %s\n", nullCoalesce(m.reliability.busStatus.SocketPath, "(unset)")))
 	b.WriteString(fmt.Sprintf("- io: in=%d out=%d delivered=%d\n",
@@ -4980,7 +6573,7 @@ func (m *model) renderReliabilityDetail() string {
 }
 
 func (m *model) maxSettingsIndex() int {
-	return 9
+	return 10
 }
 
 func (m *model) adjustSetting(delta int) {
@@ -4998,18 +6591,21 @@ func (m *model) adjustSetting(delta int) {
 		options := []int{2, 3}
 		m.settings.consensusMinAgents = cycleInt(options, m.settings.consensusMinAgents, delta)
 	case 3:
-		m.settings.pollInterval = time.Duration(clampInt(int(m.settings.pollInterval.Seconds())+delta, 1, 60)) * time.Second
+		options := []int{0, 1, 2, 3}
+		m.settings.interopRounds = cycleInt(options, m.settings.interopRounds, delta)
 	case 4:
-		m.settings.modelTimeoutSeconds = clampInt(m.settings.modelTimeoutSeconds+delta, 1, 120)
+		m.settings.pollInterval = time.Duration(clampInt(int(m.settings.pollInterval.Seconds())+delta, 1, 60)) * time.Second
 	case 5:
-		m.settings.bridgeTimeoutSeconds = clampInt(m.settings.bridgeTimeoutSeconds+delta, 1, 120)
+		m.settings.modelTimeoutSeconds = clampInt(m.settings.modelTimeoutSeconds+delta, 1, 120)
 	case 6:
-		m.settings.adapterFailoverTimeoutSecond = clampInt(m.settings.adapterFailoverTimeoutSecond+delta, 1, 120)
+		m.settings.bridgeTimeoutSeconds = clampInt(m.settings.bridgeTimeoutSeconds+delta, 1, 120)
 	case 7:
-		m.settings.adapterCircuitThreshold = clampInt(m.settings.adapterCircuitThreshold+delta, 1, 10)
+		m.settings.adapterFailoverTimeoutSecond = clampInt(m.settings.adapterFailoverTimeoutSecond+delta, 1, 120)
 	case 8:
-		m.settings.adapterCircuitRecoverySecond = clampInt(m.settings.adapterCircuitRecoverySecond+delta, 1, 600)
+		m.settings.adapterCircuitThreshold = clampInt(m.settings.adapterCircuitThreshold+delta, 1, 10)
 	case 9:
+		m.settings.adapterCircuitRecoverySecond = clampInt(m.settings.adapterCircuitRecoverySecond+delta, 1, 600)
+	case 10:
 		if delta != 0 {
 			m.settings.autoRefresh = !m.settings.autoRefresh
 		}
@@ -5027,6 +6623,7 @@ func (m *model) renderSettings() string {
 		{"Fanout Target", m.settings.fanoutTarget, "all/codex/cursor/local-imprint"},
 		{"Execute Gate", m.settings.executeGateMode, "open/allowlist/approval"},
 		{"Consensus Min Agents", strconv.Itoa(m.settings.consensusMinAgents), "2 or 3 required responses for consensus/disagreement"},
+		{"Interop Rounds", strconv.Itoa(m.settings.interopRounds), "0 disables peer bounce; 1-3 runs merge refinement loops"},
 		{"Poll Interval", fmt.Sprintf("%ds", int(m.settings.pollInterval.Seconds())), "sidebar and timeline refresh interval"},
 		{"Model Timeout", fmt.Sprintf("%ds", m.settings.modelTimeoutSeconds), "per Ollama request timeout"},
 		{"Bridge Timeout", fmt.Sprintf("%ds", m.settings.bridgeTimeoutSeconds), "per command-adapter timeout"},
@@ -5060,6 +6657,7 @@ func (m *model) renderHelp() string {
 		"- Launcher: Up/Down select, Enter launch, Esc skip to chat",
 		"- Tab / Shift+Tab: switch views",
 		"- Enter: send prompt (Chat tab)",
+		"- Ctrl+A (chat): run /adaptercheck quickly",
 		"- Esc: from non-chat tabs, return to launcher menu",
 		"- Esc in chat: show retro quit confirmation",
 		"- Timeline scroll: PgUp/PgDn, Up/Down (input empty), +/- (or Ctrl+U/Ctrl+D)",
@@ -5068,11 +6666,14 @@ func (m *model) renderHelp() string {
 		"- Reliability sidebar includes consensus status and disagreement alerts",
 		"- Workboard shows turn phase state (plan/propose/merge/execute/verify) and latest decision",
 		"- Novelty scoring can trigger forced delta retries before merge for non-identical strategies",
+		"- Interop rounds let agents refine against peer/critique context before selection",
+		"- Autonomous council step (when interop>0 and fanout=all) creates directed agent-to-agent questions each round",
 		"- Settings includes consensus threshold toggle (2 or 3 required agent responses)",
 		"- Live Bus Strip shows real-time adapter events (socket stream) before timeline persistence",
 		"",
 		"Slash Commands",
 		"- /adaptercheck [ping|live|dry] [agents] [timeout_s]",
+		"- /interop status|on|off|0|1|2|3",
 		"- /fanout all|codex|cursor|local-imprint",
 		"- /agent <agent> <message>",
 		"- /thread list [limit]",
@@ -5143,7 +6744,21 @@ func parseFlags() appConfig {
 	flag.IntVar(&cfg.adapterFailoverTimeoutSecond, "adapter-failover-timeout", envOrInt("TRICHAT_ADAPTER_FAILOVER_TIMEOUT", 75), "Per-agent failover timeout seconds")
 	flag.IntVar(&cfg.adapterCircuitThreshold, "adapter-circuit-threshold", envOrInt("TRICHAT_ADAPTER_CIRCUIT_THRESHOLD", 2), "Consecutive failures before opening circuit")
 	flag.IntVar(&cfg.adapterCircuitRecoverySecond, "adapter-circuit-recovery-seconds", envOrInt("TRICHAT_ADAPTER_CIRCUIT_RECOVERY_SECONDS", 45), "Circuit recovery window seconds")
+	flag.BoolVar(&cfg.adaptiveTimeoutsEnabled, "adaptive-timeouts", envOrBool("TRICHAT_ADAPTIVE_TIMEOUTS", true), "Enable adaptive timeout tuning from trichat.slo metrics")
+	flag.IntVar(
+		&cfg.adaptiveTimeoutMinSamples,
+		"adaptive-timeout-min-samples",
+		envOrInt("TRICHAT_ADAPTIVE_TIMEOUT_MIN_SAMPLES", 12),
+		"Minimum SLO latency samples required before adaptive timeout tuning",
+	)
+	flag.IntVar(
+		&cfg.adaptiveTimeoutMaxStepSecond,
+		"adaptive-timeout-max-step",
+		envOrInt("TRICHAT_ADAPTIVE_TIMEOUT_MAX_STEP_SECONDS", 8),
+		"Maximum timeout adjustment (seconds) per turn when adaptive tuning is enabled",
+	)
 	flag.IntVar(&cfg.consensusMinAgents, "consensus-min-agents", envOrInt("TRICHAT_CONSENSUS_MIN_AGENTS", 3), "Consensus threshold (2 or 3 agents)")
+	flag.IntVar(&cfg.interopRounds, "interop-rounds", envOrInt("TRICHAT_INTEROP_ROUNDS", 1), "Interop bounce rounds before merge decision (0-3)")
 	flag.StringVar(&cfg.executeGateMode, "execute-gate-mode", envOr("TRICHAT_EXECUTE_GATE_MODE", "open"), "execute gate mode (open|allowlist|approval)")
 	allowAgents := envOr("TRICHAT_EXECUTE_ALLOW_AGENTS", "codex,cursor,local-imprint")
 	flag.StringVar(&allowAgents, "execute-allow-agents", allowAgents, "Comma-separated execute allowlist")
@@ -5169,7 +6784,10 @@ func parseFlags() appConfig {
 	cfg.adapterFailoverTimeoutSecond = clampInt(cfg.adapterFailoverTimeoutSecond, 1, 120)
 	cfg.adapterCircuitThreshold = clampInt(cfg.adapterCircuitThreshold, 1, 10)
 	cfg.adapterCircuitRecoverySecond = clampInt(cfg.adapterCircuitRecoverySecond, 1, 600)
+	cfg.adaptiveTimeoutMinSamples = clampInt(cfg.adaptiveTimeoutMinSamples, 1, 1000)
+	cfg.adaptiveTimeoutMaxStepSecond = clampInt(cfg.adaptiveTimeoutMaxStepSecond, 1, 30)
 	cfg.consensusMinAgents = clampInt(cfg.consensusMinAgents, 2, 3)
+	cfg.interopRounds = clampInt(cfg.interopRounds, 0, 3)
 	minFailover := clampInt(maxInt(cfg.modelTimeoutSeconds+8, cfg.bridgeTimeoutSeconds+5), 1, 120)
 	if cfg.adapterFailoverTimeoutSecond < minFailover {
 		cfg.adapterFailoverTimeoutSecond = minFailover

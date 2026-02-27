@@ -276,10 +276,100 @@ export const trichatAutoRetentionSchema = z
     }
   });
 
+export const trichatTurnWatchdogSchema = z
+  .object({
+    action: z.enum(["status", "start", "stop", "run_once"]).default("status"),
+    mutation: mutationSchema.optional(),
+    interval_seconds: z.number().int().min(5).max(3600).optional(),
+    stale_after_seconds: z.number().int().min(15).max(86400).optional(),
+    batch_limit: z.number().int().min(1).max(200).optional(),
+    stale_before_iso: z.string().optional(),
+    run_immediately: z.boolean().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.action !== "status" && !value.mutation) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "mutation is required for start, stop, and run_once actions",
+        path: ["mutation"],
+      });
+    }
+  });
+
+export const trichatChaosSchema = z
+  .object({
+    action: z
+      .enum(["status", "inject_adapter_failure", "inject_turn_failure", "verify_turn", "run_once"])
+      .default("status"),
+    mutation: mutationSchema.optional(),
+    thread_id: z.string().min(1).optional(),
+    turn_id: z.string().min(1).optional(),
+    agent_id: z.string().min(1).optional(),
+    channel: adapterChannelSchema.optional(),
+    reason: z.string().min(1).optional(),
+    open_for_seconds: z.number().int().min(5).max(3600).optional(),
+    limit: z.number().int().min(1).max(500).optional(),
+    title: z.string().min(1).optional(),
+    user_prompt: z.string().min(1).optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (
+      (value.action === "inject_adapter_failure" ||
+        value.action === "inject_turn_failure" ||
+        value.action === "run_once") &&
+      !value.mutation
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "mutation is required for mutating chaos actions",
+        path: ["mutation"],
+      });
+    }
+    if (value.action === "inject_adapter_failure" && !value.agent_id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "agent_id is required for inject_adapter_failure action",
+        path: ["agent_id"],
+      });
+    }
+    if ((value.action === "inject_turn_failure" || value.action === "verify_turn") && !value.turn_id && !value.thread_id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "turn_id or thread_id is required",
+        path: ["turn_id"],
+      });
+    }
+  });
+
+export const trichatSloSchema = z
+  .object({
+    action: z.enum(["status", "snapshot", "history"]).default("status"),
+    mutation: mutationSchema.optional(),
+    window_minutes: z.number().int().min(1).max(10080).optional(),
+    event_limit: z.number().int().min(10).max(50000).optional(),
+    thread_id: z.string().min(1).optional(),
+    history_limit: z.number().int().min(1).max(1000).optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.action === "snapshot" && !value.mutation) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "mutation is required for snapshot action",
+        path: ["mutation"],
+      });
+    }
+  });
+
 type TriChatAutoRetentionConfig = {
   interval_seconds: number;
   older_than_days: number;
   limit: number;
+};
+
+type TriChatTurnWatchdogConfig = {
+  interval_seconds: number;
+  stale_after_seconds: number;
+  batch_limit: number;
 };
 
 type TriChatAutoRetentionTickResult = {
@@ -295,6 +385,12 @@ const DEFAULT_AUTO_RETENTION_CONFIG: TriChatAutoRetentionConfig = {
   interval_seconds: 600,
   older_than_days: 30,
   limit: 1000,
+};
+
+const DEFAULT_TURN_WATCHDOG_CONFIG: TriChatTurnWatchdogConfig = {
+  interval_seconds: 30,
+  stale_after_seconds: 180,
+  batch_limit: 10,
 };
 
 const autoRetentionRuntime: {
@@ -319,6 +415,73 @@ const autoRetentionRuntime: {
   tick_count: 0,
   total_candidates: 0,
   total_deleted: 0,
+};
+
+const turnWatchdogRuntime: {
+  running: boolean;
+  timer: NodeJS.Timeout | null;
+  config: TriChatTurnWatchdogConfig;
+  in_tick: boolean;
+  started_at: string | null;
+  last_tick_at: string | null;
+  last_error: string | null;
+  tick_count: number;
+  stale_detected_count: number;
+  escalated_count: number;
+  last_escalated_turn_ids: string[];
+  last_slo_snapshot_id: string | null;
+} = {
+  running: false,
+  timer: null,
+  config: { ...DEFAULT_TURN_WATCHDOG_CONFIG },
+  in_tick: false,
+  started_at: null,
+  last_tick_at: null,
+  last_error: null,
+  tick_count: 0,
+  stale_detected_count: 0,
+  escalated_count: 0,
+  last_escalated_turn_ids: [],
+  last_slo_snapshot_id: null,
+};
+
+type TriChatTurnWatchdogTickResult = {
+  completed_at: string;
+  stale_before_iso: string;
+  stale_after_seconds: number;
+  candidate_count: number;
+  escalated_count: number;
+  escalated_turn_ids: string[];
+  invariant_failures: Array<{
+    turn_id: string;
+    failed_checks: string[];
+  }>;
+  slo_snapshot: {
+    snapshot_id: string;
+    created_at: string;
+  } | null;
+  skipped?: boolean;
+  reason?: string;
+};
+
+type TriChatSloMetrics = {
+  computed_at: string;
+  thread_id: string | null;
+  window_minutes: number;
+  since_iso: string;
+  event_limit: number;
+  adapter: {
+    sample_count: number;
+    error_count: number;
+    error_rate: number;
+    latency_sample_count: number;
+    p95_latency_ms: number | null;
+  };
+  turns: {
+    total_count: number;
+    failed_count: number;
+    failure_rate: number;
+  };
 };
 
 export function trichatThreadOpen(storage: Storage, input: z.infer<typeof trichatThreadOpenSchema>) {
@@ -666,10 +829,16 @@ export function trichatNovelty(
   const artifacts = storage.listTriChatTurnArtifacts({
     turn_id: turn.turn_id,
     phase: "propose",
-    artifact_type: "proposal",
     limit: input.limit ?? 200,
   });
-  const proposals = collectLatestProposalsByAgent(turn, artifacts, storage);
+  const proposals = collectLatestProposalsByAgent(
+    turn,
+    artifacts.filter((artifact) => {
+      const type = String(artifact.artifact_type ?? "").trim().toLowerCase();
+      return type === "proposal" || type === "proposal_retry" || type === "proposal_interop";
+    }),
+    storage
+  );
   const pairs = buildNoveltyPairs(proposals);
   const averageSimilarity =
     pairs.length > 0
@@ -935,6 +1104,322 @@ export function trichatAutoRetentionControl(storage: Storage, input: z.infer<typ
         running: autoRetentionRuntime.running,
         tick,
         status: getAutoRetentionStatus(),
+      };
+    },
+  });
+}
+
+export function initializeTriChatTurnWatchdogDaemon(storage: Storage) {
+  const persisted = storage.getTriChatTurnWatchdogState();
+  if (!persisted) {
+    turnWatchdogRuntime.config = { ...DEFAULT_TURN_WATCHDOG_CONFIG };
+    stopTurnWatchdogDaemon();
+    return {
+      restored: false,
+      running: false,
+      config: { ...turnWatchdogRuntime.config },
+    };
+  }
+
+  turnWatchdogRuntime.config = resolveTurnWatchdogConfig(persisted, DEFAULT_TURN_WATCHDOG_CONFIG);
+  if (persisted.enabled) {
+    startTurnWatchdogDaemon(storage);
+  } else {
+    stopTurnWatchdogDaemon();
+  }
+
+  return {
+    restored: true,
+    running: turnWatchdogRuntime.running,
+    config: { ...turnWatchdogRuntime.config },
+    updated_at: persisted.updated_at,
+  };
+}
+
+export function trichatTurnWatchdogControl(storage: Storage, input: z.infer<typeof trichatTurnWatchdogSchema>) {
+  if (input.action === "status") {
+    return getTurnWatchdogStatus();
+  }
+
+  if (!input.mutation) {
+    throw new Error("mutation is required for start, stop, and run_once actions");
+  }
+
+  return runIdempotentMutation({
+    storage,
+    tool_name: "trichat.turn_watchdog",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => {
+      if (input.action === "start") {
+        const wasRunning = turnWatchdogRuntime.running;
+        turnWatchdogRuntime.config = resolveTurnWatchdogConfig(input, turnWatchdogRuntime.config);
+        startTurnWatchdogDaemon(storage);
+        let initialTick: TriChatTurnWatchdogTickResult | undefined;
+        if (input.run_immediately ?? true) {
+          initialTick = runTurnWatchdogTick(storage, turnWatchdogRuntime.config, {
+            stale_before_iso: input.stale_before_iso,
+          });
+        }
+        return {
+          running: true,
+          started: !wasRunning,
+          updated: wasRunning,
+          config: { ...turnWatchdogRuntime.config },
+          persisted: storage.setTriChatTurnWatchdogState({
+            enabled: true,
+            interval_seconds: turnWatchdogRuntime.config.interval_seconds,
+            stale_after_seconds: turnWatchdogRuntime.config.stale_after_seconds,
+            batch_limit: turnWatchdogRuntime.config.batch_limit,
+          }),
+          initial_tick: initialTick,
+          status: getTurnWatchdogStatus(),
+        };
+      }
+
+      if (input.action === "stop") {
+        const wasRunning = turnWatchdogRuntime.running;
+        stopTurnWatchdogDaemon();
+        return {
+          running: false,
+          stopped: wasRunning,
+          persisted: storage.setTriChatTurnWatchdogState({
+            enabled: false,
+            interval_seconds: turnWatchdogRuntime.config.interval_seconds,
+            stale_after_seconds: turnWatchdogRuntime.config.stale_after_seconds,
+            batch_limit: turnWatchdogRuntime.config.batch_limit,
+          }),
+          status: getTurnWatchdogStatus(),
+        };
+      }
+
+      const config = resolveTurnWatchdogConfig(input, turnWatchdogRuntime.config);
+      const tick = runTurnWatchdogTick(storage, config, {
+        stale_before_iso: input.stale_before_iso,
+      });
+      return {
+        running: turnWatchdogRuntime.running,
+        tick,
+        status: getTurnWatchdogStatus(),
+      };
+    },
+  });
+}
+
+export function trichatChaos(storage: Storage, input: z.infer<typeof trichatChaosSchema>) {
+  if (input.action === "status") {
+    return {
+      generated_at: new Date().toISOString(),
+      recent_events: storage.listTriChatChaosEvents({
+        limit: input.limit ?? 25,
+      }),
+      watchdog: getTurnWatchdogStatus(),
+      latest_slo_snapshot: storage.getLatestTriChatSloSnapshot(),
+    };
+  }
+
+  if (input.action === "verify_turn") {
+    const turn = resolveChaosTargetTurn(storage, input.turn_id, input.thread_id, true);
+    if (!turn) {
+      return {
+        ok: false,
+        found: false,
+        turn_id: input.turn_id ?? null,
+        thread_id: input.thread_id ?? null,
+      };
+    }
+    const invariants = evaluateTurnAutoFinalizationInvariants(storage, turn);
+    return {
+      ok: invariants.ok,
+      found: true,
+      turn: pickTurnSummary(turn),
+      invariants,
+    };
+  }
+
+  if (!input.mutation) {
+    throw new Error("mutation is required for mutating chaos actions");
+  }
+
+  return runIdempotentMutation({
+    storage,
+    tool_name: "trichat.chaos",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => {
+      if (input.action === "inject_adapter_failure") {
+        const injected = injectAdapterFailure(storage, {
+          agent_id: input.agent_id ?? "",
+          channel: input.channel ?? "model",
+          reason:
+            input.reason?.trim() ||
+            `chaos adapter failure injection for ${input.agent_id ?? "unknown-agent"}/${input.channel ?? "model"}`,
+          open_for_seconds: clampInt(input.open_for_seconds ?? 45, 5, 3600),
+        });
+        return {
+          action: input.action,
+          ok: true,
+          ...injected,
+        };
+      }
+
+      if (input.action === "inject_turn_failure") {
+        const turn = resolveChaosTargetTurn(storage, input.turn_id, input.thread_id, false);
+        if (!turn) {
+          throw new Error("No running turn found for chaos injection target");
+        }
+        const result = failTurnWithEvidence(storage, {
+          turn,
+          source: "trichat.chaos",
+          actor: "chaos",
+          artifact_type: "chaos_fault",
+          reason:
+            input.reason?.trim() ||
+            `chaos injected failure for turn ${turn.turn_id} at phase ${turn.phase}/${turn.phase_status}`,
+          metadata: {
+            injected: true,
+            action: input.action,
+          },
+          chaos_action: "inject_turn_failure",
+        });
+        return {
+          action: input.action,
+          ok: result.invariants.ok,
+          ...result,
+        };
+      }
+
+      const syntheticThreadId = `trichat-chaos-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+      const title = input.title?.trim() || "TriChat Chaos Probe";
+      const userPrompt = input.user_prompt?.trim() || "chaos probe: validate turn auto-finalization invariants";
+      storage.upsertTriChatThread({
+        thread_id: syntheticThreadId,
+        title,
+        status: "archived",
+        metadata: {
+          source: "trichat.chaos",
+          kind: "run_once",
+        },
+      });
+      const userMessage = storage.appendTriChatMessage({
+        thread_id: syntheticThreadId,
+        agent_id: "user",
+        role: "user",
+        content: userPrompt,
+        metadata: {
+          source: "trichat.chaos",
+          kind: "run_once_seed",
+        },
+      });
+      const started = trichatTurnStart(storage, {
+        mutation: input.mutation!,
+        thread_id: syntheticThreadId,
+        user_message_id: userMessage.message_id,
+        user_prompt: userPrompt,
+        expected_agents: ["codex", "cursor", "local-imprint"],
+        min_agents: 2,
+        metadata: {
+          source: "trichat.chaos",
+          kind: "run_once",
+        },
+      });
+      const runningTurn = storage.updateTriChatTurn({
+        turn_id: started.turn.turn_id,
+        status: "running",
+        phase: "execute",
+        phase_status: "running",
+        metadata: {
+          source: "trichat.chaos",
+          kind: "run_once_execute_seed",
+          allow_phase_skip: true,
+        },
+      });
+      const result = failTurnWithEvidence(storage, {
+        turn: runningTurn,
+        source: "trichat.chaos",
+        actor: "chaos",
+        artifact_type: "chaos_fault",
+        reason: `chaos run_once forced failure for turn ${runningTurn.turn_id}`,
+        metadata: {
+          injected: true,
+          action: "run_once",
+        },
+        chaos_action: "run_once",
+      });
+      return {
+        action: input.action,
+        ok: result.invariants.ok,
+        thread_id: syntheticThreadId,
+        message_id: userMessage.message_id,
+        ...result,
+      };
+    },
+  });
+}
+
+export function trichatSlo(storage: Storage, input: z.infer<typeof trichatSloSchema>) {
+  if (input.action === "history") {
+    const history = storage.listTriChatSloSnapshots({
+      limit: input.history_limit ?? 50,
+    });
+    return {
+      generated_at: new Date().toISOString(),
+      action: "history",
+      count: history.length,
+      snapshots: history,
+    };
+  }
+
+  if (input.action === "status") {
+    const computed = computeTriChatSloMetrics(storage, {
+      window_minutes: input.window_minutes ?? 60,
+      event_limit: input.event_limit ?? 8000,
+      thread_id: input.thread_id,
+    });
+    return {
+      generated_at: new Date().toISOString(),
+      action: "status",
+      metrics: computed,
+      latest_snapshot: storage.getLatestTriChatSloSnapshot(),
+    };
+  }
+
+  if (!input.mutation) {
+    throw new Error("mutation is required for snapshot action");
+  }
+
+  return runIdempotentMutation({
+    storage,
+    tool_name: "trichat.slo",
+    mutation: input.mutation,
+    payload: input,
+    execute: () => {
+      const metrics = computeTriChatSloMetrics(storage, {
+        window_minutes: input.window_minutes ?? 60,
+        event_limit: input.event_limit ?? 8000,
+        thread_id: input.thread_id,
+      });
+      const snapshot = storage.appendTriChatSloSnapshot({
+        window_minutes: metrics.window_minutes,
+        adapter_sample_count: metrics.adapter.sample_count,
+        adapter_error_count: metrics.adapter.error_count,
+        adapter_error_rate: metrics.adapter.error_rate,
+        adapter_latency_p95_ms: metrics.adapter.p95_latency_ms,
+        turn_total_count: metrics.turns.total_count,
+        turn_failed_count: metrics.turns.failed_count,
+        turn_failure_rate: metrics.turns.failure_rate,
+        metadata: {
+          source: "trichat.slo",
+          thread_id: metrics.thread_id,
+          since_iso: metrics.since_iso,
+          event_limit: metrics.event_limit,
+        },
+      });
+      return {
+        action: "snapshot",
+        ok: true,
+        metrics,
+        snapshot,
       };
     },
   });
@@ -2621,4 +3106,690 @@ function runAutoRetentionTick(
   } finally {
     autoRetentionRuntime.in_tick = false;
   }
+}
+
+function resolveTurnWatchdogConfig(
+  input:
+    | z.infer<typeof trichatTurnWatchdogSchema>
+    | Partial<Pick<z.infer<typeof trichatTurnWatchdogSchema>, "interval_seconds" | "stale_after_seconds" | "batch_limit">>,
+  fallback: TriChatTurnWatchdogConfig
+): TriChatTurnWatchdogConfig {
+  return {
+    interval_seconds:
+      input.interval_seconds ??
+      fallback.interval_seconds ??
+      DEFAULT_TURN_WATCHDOG_CONFIG.interval_seconds,
+    stale_after_seconds:
+      input.stale_after_seconds ??
+      fallback.stale_after_seconds ??
+      DEFAULT_TURN_WATCHDOG_CONFIG.stale_after_seconds,
+    batch_limit: input.batch_limit ?? fallback.batch_limit ?? DEFAULT_TURN_WATCHDOG_CONFIG.batch_limit,
+  };
+}
+
+function getTurnWatchdogStatus() {
+  return {
+    running: turnWatchdogRuntime.running,
+    in_tick: turnWatchdogRuntime.in_tick,
+    config: { ...turnWatchdogRuntime.config },
+    started_at: turnWatchdogRuntime.started_at,
+    last_tick_at: turnWatchdogRuntime.last_tick_at,
+    last_error: turnWatchdogRuntime.last_error,
+    last_slo_snapshot_id: turnWatchdogRuntime.last_slo_snapshot_id,
+    stats: {
+      tick_count: turnWatchdogRuntime.tick_count,
+      stale_detected_count: turnWatchdogRuntime.stale_detected_count,
+      escalated_count: turnWatchdogRuntime.escalated_count,
+      last_escalated_turn_ids: [...turnWatchdogRuntime.last_escalated_turn_ids],
+    },
+  };
+}
+
+function startTurnWatchdogDaemon(storage: Storage) {
+  stopTurnWatchdogDaemon();
+  turnWatchdogRuntime.running = true;
+  turnWatchdogRuntime.in_tick = false;
+  turnWatchdogRuntime.started_at = new Date().toISOString();
+  turnWatchdogRuntime.last_error = null;
+  turnWatchdogRuntime.timer = setInterval(() => {
+    try {
+      runTurnWatchdogTick(storage, turnWatchdogRuntime.config, {});
+    } catch (error) {
+      turnWatchdogRuntime.last_error = error instanceof Error ? error.message : String(error);
+    }
+  }, turnWatchdogRuntime.config.interval_seconds * 1000);
+  turnWatchdogRuntime.timer.unref?.();
+}
+
+function stopTurnWatchdogDaemon() {
+  if (turnWatchdogRuntime.timer) {
+    clearInterval(turnWatchdogRuntime.timer);
+  }
+  turnWatchdogRuntime.timer = null;
+  turnWatchdogRuntime.running = false;
+  turnWatchdogRuntime.in_tick = false;
+}
+
+function runTurnWatchdogTick(
+  storage: Storage,
+  config: TriChatTurnWatchdogConfig,
+  overrides: {
+    stale_before_iso?: string;
+  }
+): TriChatTurnWatchdogTickResult {
+  if (turnWatchdogRuntime.in_tick) {
+    return {
+      completed_at: new Date().toISOString(),
+      stale_before_iso: new Date(Date.now() - config.stale_after_seconds * 1000).toISOString(),
+      stale_after_seconds: config.stale_after_seconds,
+      candidate_count: 0,
+      escalated_count: 0,
+      escalated_turn_ids: [],
+      invariant_failures: [],
+      slo_snapshot: null,
+      skipped: true,
+      reason: "tick-in-progress",
+    };
+  }
+
+  turnWatchdogRuntime.in_tick = true;
+  try {
+    const staleBeforeIso = normalizeIsoTimestamp(
+      overrides.stale_before_iso,
+      new Date(Date.now() - config.stale_after_seconds * 1000).toISOString()
+    );
+    const staleTurns = storage.listStaleRunningTriChatTurns({
+      stale_before_iso: staleBeforeIso,
+      limit: config.batch_limit,
+    });
+
+    const invariantFailures: TriChatTurnWatchdogTickResult["invariant_failures"] = [];
+    const escalatedTurnIds: string[] = [];
+    for (const turn of staleTurns) {
+      const now = new Date();
+      const lastUpdatedAt = normalizeIsoTimestamp(turn.updated_at, now.toISOString());
+      const staleForMs = Math.max(0, now.getTime() - Date.parse(lastUpdatedAt));
+      const staleForSeconds = Math.round(staleForMs / 1000);
+      const reason = `watchdog timeout: turn ${turn.turn_id} stalled ${staleForSeconds}s at ${turn.phase}/${turn.phase_status}`;
+      const escalated = failTurnWithEvidence(storage, {
+        turn,
+        source: "trichat.turn_watchdog",
+        actor: "watchdog",
+        artifact_type: "watchdog_timeout",
+        reason,
+        metadata: {
+          stale_before_iso: staleBeforeIso,
+          stale_after_seconds: config.stale_after_seconds,
+          stale_for_seconds: staleForSeconds,
+        },
+        chaos_action: "watchdog_timeout",
+      });
+      escalatedTurnIds.push(escalated.turn.turn_id);
+      if (!escalated.invariants.ok) {
+        invariantFailures.push({
+          turn_id: escalated.turn.turn_id,
+          failed_checks: escalated.invariants.checks
+            .filter((check) => !check.met)
+            .map((check) => check.name),
+        });
+      }
+    }
+
+    const completedAt = new Date().toISOString();
+    turnWatchdogRuntime.tick_count += 1;
+    turnWatchdogRuntime.stale_detected_count += staleTurns.length;
+    turnWatchdogRuntime.escalated_count += escalatedTurnIds.length;
+    turnWatchdogRuntime.last_escalated_turn_ids = escalatedTurnIds.slice(0, 20);
+    turnWatchdogRuntime.last_tick_at = completedAt;
+    turnWatchdogRuntime.last_error = null;
+
+    let snapshotRecord: ReturnType<Storage["appendTriChatSloSnapshot"]> | null = null;
+    if (shouldPersistSloSnapshot(storage, completedAt)) {
+      const metrics = computeTriChatSloMetrics(storage, {
+        window_minutes: 60,
+        event_limit: 8000,
+      });
+      snapshotRecord = storage.appendTriChatSloSnapshot({
+        window_minutes: metrics.window_minutes,
+        adapter_sample_count: metrics.adapter.sample_count,
+        adapter_error_count: metrics.adapter.error_count,
+        adapter_error_rate: metrics.adapter.error_rate,
+        adapter_latency_p95_ms: metrics.adapter.p95_latency_ms,
+        turn_total_count: metrics.turns.total_count,
+        turn_failed_count: metrics.turns.failed_count,
+        turn_failure_rate: metrics.turns.failure_rate,
+        metadata: {
+          source: "trichat.turn_watchdog",
+          stale_before_iso: staleBeforeIso,
+          stale_after_seconds: config.stale_after_seconds,
+          candidate_count: staleTurns.length,
+          escalated_count: escalatedTurnIds.length,
+        },
+      });
+      turnWatchdogRuntime.last_slo_snapshot_id = snapshotRecord.snapshot_id;
+    }
+
+    return {
+      completed_at: completedAt,
+      stale_before_iso: staleBeforeIso,
+      stale_after_seconds: config.stale_after_seconds,
+      candidate_count: staleTurns.length,
+      escalated_count: escalatedTurnIds.length,
+      escalated_turn_ids: escalatedTurnIds,
+      invariant_failures: invariantFailures,
+      slo_snapshot: snapshotRecord
+        ? {
+            snapshot_id: snapshotRecord.snapshot_id,
+            created_at: snapshotRecord.created_at,
+          }
+        : null,
+    };
+  } catch (error) {
+    const completedAt = new Date().toISOString();
+    const message = error instanceof Error ? error.message : String(error);
+    turnWatchdogRuntime.tick_count += 1;
+    turnWatchdogRuntime.last_tick_at = completedAt;
+    turnWatchdogRuntime.last_error = message;
+    return {
+      completed_at: completedAt,
+      stale_before_iso: new Date(Date.now() - config.stale_after_seconds * 1000).toISOString(),
+      stale_after_seconds: config.stale_after_seconds,
+      candidate_count: 0,
+      escalated_count: 0,
+      escalated_turn_ids: [],
+      invariant_failures: [],
+      slo_snapshot: null,
+      reason: message,
+    };
+  } finally {
+    turnWatchdogRuntime.in_tick = false;
+  }
+}
+
+function shouldPersistSloSnapshot(storage: Storage, nowIso: string): boolean {
+  const latest = storage.getLatestTriChatSloSnapshot();
+  if (!latest) {
+    return true;
+  }
+  const latestEpoch = Date.parse(latest.created_at);
+  const nowEpoch = Date.parse(nowIso);
+  if (!Number.isFinite(latestEpoch) || !Number.isFinite(nowEpoch)) {
+    return true;
+  }
+  return nowEpoch - latestEpoch >= 60_000;
+}
+
+function resolveChaosTargetTurn(
+  storage: Storage,
+  turnId: string | undefined,
+  threadId: string | undefined,
+  includeClosed: boolean
+) {
+  const normalizedTurnId = String(turnId ?? "").trim();
+  if (normalizedTurnId) {
+    return storage.getTriChatTurnById(normalizedTurnId);
+  }
+  const normalizedThreadId = String(threadId ?? "").trim();
+  if (!normalizedThreadId) {
+    return null;
+  }
+  const running = storage.getLatestTriChatTurn({
+    thread_id: normalizedThreadId,
+    include_closed: false,
+  });
+  if (running) {
+    return running;
+  }
+  if (!includeClosed) {
+    return null;
+  }
+  return storage.getLatestTriChatTurn({
+    thread_id: normalizedThreadId,
+    include_closed: true,
+  });
+}
+
+function pickTurnSummary(turn: NonNullable<ReturnType<Storage["getTriChatTurnById"]>>) {
+  return {
+    turn_id: turn.turn_id,
+    thread_id: turn.thread_id,
+    status: turn.status,
+    phase: turn.phase,
+    phase_status: turn.phase_status,
+    updated_at: turn.updated_at,
+    finished_at: turn.finished_at,
+    selected_agent: turn.selected_agent,
+    verify_status: turn.verify_status,
+    verify_summary: turn.verify_summary,
+  };
+}
+
+function injectAdapterFailure(
+  storage: Storage,
+  input: {
+    agent_id: string;
+    channel: z.infer<typeof adapterChannelSchema>;
+    reason: string;
+    open_for_seconds: number;
+  }
+) {
+  const agentId = normalizeConsensusAgentId(input.agent_id);
+  if (!agentId) {
+    throw new Error("agent_id is required");
+  }
+  const channel = input.channel;
+  const now = new Date().toISOString();
+  const openForSeconds = clampInt(input.open_for_seconds, 5, 3600);
+  const openUntil = new Date(Date.now() + openForSeconds * 1000).toISOString();
+  const existing = storage.listTriChatAdapterStates({
+    agent_id: agentId,
+    channel,
+    limit: 1,
+  })[0];
+  const state = storage.upsertTriChatAdapterStates({
+    states: [
+      {
+        agent_id: agentId,
+        channel,
+        updated_at: now,
+        open: true,
+        open_until: openUntil,
+        failure_count: 0,
+        trip_count: (existing?.trip_count ?? 0) + 1,
+        success_count: existing?.success_count ?? 0,
+        last_error: input.reason,
+        last_opened_at: now,
+        turn_count: existing?.turn_count ?? 0,
+        degraded_turn_count: existing?.degraded_turn_count ?? 0,
+        last_result: "trip-opened",
+        metadata: {
+          ...(existing?.metadata ?? {}),
+          chaos_injected: true,
+          chaos_injected_at: now,
+          chaos_reason: input.reason,
+          chaos_open_for_seconds: openForSeconds,
+        },
+      },
+    ],
+  })[0];
+  const event = storage.appendTriChatAdapterEvents({
+    events: [
+      {
+        agent_id: agentId,
+        channel,
+        event_type: "trip_opened",
+        open_until: openUntil,
+        error_text: input.reason,
+        details: {
+          source: "trichat.chaos",
+          injected: true,
+          open_for_seconds: openForSeconds,
+        },
+      },
+    ],
+  })[0];
+  const chaosEvent = storage.appendTriChatChaosEvent({
+    action: "inject_adapter_failure",
+    outcome: "injected",
+    agent_id: agentId,
+    channel,
+    details: {
+      reason: input.reason,
+      open_until: openUntil,
+    },
+  });
+  return {
+    state,
+    event,
+    chaos_event: chaosEvent,
+  };
+}
+
+function failTurnWithEvidence(
+  storage: Storage,
+  input: {
+    turn: NonNullable<ReturnType<Storage["getTriChatTurnById"]>>;
+    source: string;
+    actor: string;
+    artifact_type: string;
+    reason: string;
+    metadata?: Record<string, unknown>;
+    chaos_action: string;
+  }
+) {
+  const turn = input.turn;
+  if (isTerminalTurnStatus(turn.status)) {
+    const invariants = evaluateTurnAutoFinalizationInvariants(storage, turn);
+    const chaosEvent = storage.appendTriChatChaosEvent({
+      action: input.chaos_action,
+      outcome: "skipped-terminal",
+      thread_id: turn.thread_id,
+      turn_id: turn.turn_id,
+      agent_id: input.actor,
+      details: {
+        source: input.source,
+        reason: input.reason,
+        status: turn.status,
+      },
+    });
+    return {
+      turn,
+      artifact: null,
+      message: null,
+      bus_event: null,
+      invariants,
+      chaos_event: chaosEvent,
+    };
+  }
+
+  const compactReason = compactConsensusText(input.reason, 800);
+  const artifact = storage.appendTriChatTurnArtifact({
+    turn_id: turn.turn_id,
+    phase: turn.phase,
+    artifact_type: input.artifact_type,
+    agent_id: input.actor,
+    content: compactReason,
+    structured: {
+      source: input.source,
+      reason: compactReason,
+      from_phase: turn.phase,
+      from_phase_status: turn.phase_status,
+      from_status: turn.status,
+    },
+    metadata: {
+      source: input.source,
+      ...input.metadata,
+    },
+  });
+  const updated = storage.updateTriChatTurn({
+    turn_id: turn.turn_id,
+    status: "failed",
+    phase: "summarize",
+    phase_status: "failed",
+    verify_status: "error",
+    verify_summary: compactReason,
+    metadata: {
+      source: input.source,
+      auto_fail_finalize: true,
+      allow_phase_skip: true,
+      failure_reason: compactReason,
+      ...input.metadata,
+    },
+  });
+  const message = storage.appendTriChatMessage({
+    thread_id: turn.thread_id,
+    agent_id: input.actor,
+    role: "system",
+    content: `[${input.actor}] ${compactReason}`,
+    reply_to_message_id: turn.user_message_id,
+    metadata: {
+      kind: "turn-failed",
+      source: input.source,
+      turn_id: turn.turn_id,
+      from_phase: turn.phase,
+      from_status: turn.status,
+      ...input.metadata,
+    },
+  });
+  const busEvent = storage.appendTriChatBusEvent({
+    thread_id: turn.thread_id,
+    event_type: input.source === "trichat.turn_watchdog" ? "trichat.turn_watchdog" : "trichat.chaos",
+    source_agent: input.actor,
+    source_client: `mcp:${input.source}`,
+    role: "system",
+    content: compactReason,
+    metadata: {
+      kind: input.source === "trichat.turn_watchdog" ? "trichat.turn_watchdog" : "trichat.chaos",
+      source: input.source,
+      turn_id: turn.turn_id,
+      phase: turn.phase,
+      phase_status: turn.phase_status,
+      status: "failed",
+      event_kind: input.source === "trichat.turn_watchdog" ? "watchdog" : "chaos",
+      ...input.metadata,
+    },
+  });
+  const invariants = evaluateTurnAutoFinalizationInvariants(storage, updated);
+  const chaosEvent = storage.appendTriChatChaosEvent({
+    action: input.chaos_action,
+    outcome: invariants.ok ? "escalated" : "escalated-invariant-failed",
+    thread_id: updated.thread_id,
+    turn_id: updated.turn_id,
+    agent_id: input.actor,
+    details: {
+      source: input.source,
+      reason: compactReason,
+      invariant_ok: invariants.ok,
+      failed_checks: invariants.checks.filter((check) => !check.met).map((check) => check.name),
+    },
+  });
+  return {
+    turn: updated,
+    artifact,
+    message,
+    bus_event: busEvent,
+    invariants,
+    chaos_event: chaosEvent,
+  };
+}
+
+function evaluateTurnAutoFinalizationInvariants(
+  storage: Storage,
+  turn: NonNullable<ReturnType<Storage["getTriChatTurnById"]>>
+) {
+  const artifacts = storage.listTriChatTurnArtifacts({
+    turn_id: turn.turn_id,
+    limit: 300,
+  });
+  const artifactTypes = new Set(
+    artifacts.map((artifact) => String(artifact.artifact_type ?? "").trim().toLowerCase()).filter(Boolean)
+  );
+  const timeline = storage.getTriChatTimeline({
+    thread_id: turn.thread_id,
+    limit: 300,
+  });
+  const timelineEvidence = timeline.filter((message) => {
+    if (message.role !== "system") {
+      return false;
+    }
+    const messageTurnId = String(message.metadata?.turn_id ?? "").trim();
+    if (messageTurnId === turn.turn_id) {
+      return true;
+    }
+    const content = String(message.content ?? "");
+    return content.includes(turn.turn_id);
+  });
+
+  const failureEvidenceTypes = ["router_error", "watchdog_timeout", "chaos_fault", "verifier_result"];
+  const hasFailureArtifact = failureEvidenceTypes.some((type) => artifactTypes.has(type));
+  const isTerminal = turn.status === "failed" || turn.status === "completed" || turn.status === "cancelled";
+
+  const checks = [
+    {
+      name: "terminal_status",
+      met: isTerminal,
+      details: `status=${turn.status}`,
+    },
+    {
+      name: "summarize_phase",
+      met: turn.phase === "summarize",
+      details: `phase=${turn.phase}`,
+    },
+    {
+      name: "terminal_phase_status",
+      met: turn.phase_status === "failed" || turn.phase_status === "completed",
+      details: `phase_status=${turn.phase_status}`,
+    },
+    {
+      name: "finished_at_set",
+      met: Boolean(turn.finished_at),
+      details: `finished_at=${turn.finished_at ?? "(null)"}`,
+    },
+    {
+      name: "failure_evidence_present",
+      met: turn.status !== "failed" || hasFailureArtifact || timelineEvidence.length > 0,
+      details: `artifacts=${[...artifactTypes].join(",") || "none"} timeline_evidence=${timelineEvidence.length}`,
+    },
+    {
+      name: "verify_summary_on_failure",
+      met: turn.status !== "failed" || Boolean(String(turn.verify_summary ?? "").trim()),
+      details: `verify_summary=${String(turn.verify_summary ?? "").trim() ? "present" : "missing"}`,
+    },
+  ];
+
+  return {
+    ok: checks.every((check) => check.met),
+    checks,
+    evidence: {
+      artifact_count: artifacts.length,
+      artifact_types: [...artifactTypes],
+      timeline_evidence_count: timelineEvidence.length,
+    },
+  };
+}
+
+function computeTriChatSloMetrics(
+  storage: Storage,
+  input: {
+    window_minutes: number;
+    event_limit: number;
+    thread_id?: string;
+  }
+): TriChatSloMetrics {
+  const windowMinutes = clampInt(input.window_minutes, 1, 10080);
+  const eventLimit = clampInt(input.event_limit, 10, 50000);
+  const sinceIso = new Date(Date.now() - windowMinutes * 60 * 1000).toISOString();
+  const adapterEvents = storage.listTriChatAdapterEventsSince({
+    since_iso: sinceIso,
+    limit: eventLimit,
+  });
+
+  let sampleCount = 0;
+  let errorCount = 0;
+  const latencies: number[] = [];
+  for (const event of adapterEvents) {
+    const eventType = String(event.event_type ?? "").trim().toLowerCase();
+    const latencyMs = extractLatencyMsFromDetails(event.details);
+    const sampleEvent = isAdapterSampleEvent(eventType, latencyMs);
+    if (!sampleEvent) {
+      continue;
+    }
+    sampleCount += 1;
+    if (latencyMs !== null) {
+      latencies.push(latencyMs);
+    }
+    if (isAdapterErrorEvent(eventType, event.error_text)) {
+      errorCount += 1;
+    }
+  }
+
+  const turnOutcomes = storage.getTriChatTurnOutcomeCountsSince({
+    since_iso: sinceIso,
+    thread_id: input.thread_id,
+  });
+  const adapterErrorRate = sampleCount > 0 ? roundRate(errorCount / sampleCount) : 0;
+  const turnFailureRate =
+    turnOutcomes.total_count > 0 ? roundRate(turnOutcomes.failed_count / turnOutcomes.total_count) : 0;
+
+  return {
+    computed_at: new Date().toISOString(),
+    thread_id: input.thread_id?.trim() || null,
+    window_minutes: windowMinutes,
+    since_iso: sinceIso,
+    event_limit: eventLimit,
+    adapter: {
+      sample_count: sampleCount,
+      error_count: errorCount,
+      error_rate: adapterErrorRate,
+      latency_sample_count: latencies.length,
+      p95_latency_ms: percentile(latencies, 95),
+    },
+    turns: {
+      total_count: turnOutcomes.total_count,
+      failed_count: turnOutcomes.failed_count,
+      failure_rate: turnFailureRate,
+    },
+  };
+}
+
+function extractLatencyMsFromDetails(details: Record<string, unknown>): number | null {
+  const candidates = [
+    details.latency_ms,
+    details.duration_ms,
+    details.elapsed_ms,
+    details.latency,
+    details.duration,
+  ];
+  for (const candidate of candidates) {
+    const parsed = Number(candidate);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return Number(parsed);
+    }
+  }
+  return null;
+}
+
+function isAdapterSampleEvent(eventType: string, latencyMs: number | null): boolean {
+  if (latencyMs !== null) {
+    return true;
+  }
+  return (
+    eventType === "response_ok" ||
+    eventType === "response_error" ||
+    eventType === "handshake_failed" ||
+    eventType === "trip_opened"
+  );
+}
+
+function isAdapterErrorEvent(eventType: string, errorText: string | null): boolean {
+  if (eventType === "response_ok") {
+    return false;
+  }
+  if (eventType === "response_error" || eventType === "handshake_failed" || eventType === "trip_opened") {
+    return true;
+  }
+  if (eventType.includes("error") || eventType.includes("failed")) {
+    return true;
+  }
+  return Boolean(String(errorText ?? "").trim());
+}
+
+function percentile(samples: number[], percentileRank: number): number | null {
+  if (!samples.length) {
+    return null;
+  }
+  const sorted = [...samples].sort((left, right) => left - right);
+  const rank = clamp(percentileRank / 100, 0, 1);
+  const index = Math.max(0, Math.ceil(rank * sorted.length) - 1);
+  const value = sorted[index] ?? sorted[sorted.length - 1];
+  return Number(value.toFixed(2));
+}
+
+function roundRate(value: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  if (value >= 1) {
+    return 1;
+  }
+  return Number(value.toFixed(6));
+}
+
+function clampInt(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+function normalizeIsoTimestamp(value: string | undefined, fallback: string): string {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    return fallback;
+  }
+  const parsed = new Date(trimmed);
+  if (Number.isNaN(parsed.getTime())) {
+    return fallback;
+  }
+  return parsed.toISOString();
 }

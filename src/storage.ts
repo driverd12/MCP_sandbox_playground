@@ -373,6 +373,29 @@ export type TriChatTurnWatchdogStateRecord = {
   updated_at: string;
 };
 
+export type TriChatAutopilotStateRecord = {
+  enabled: boolean;
+  away_mode: "safe" | "normal" | "aggressive";
+  interval_seconds: number;
+  thread_id: string;
+  thread_title: string;
+  thread_status: "active" | "archived";
+  objective: string;
+  max_rounds: number;
+  min_success_agents: number;
+  bridge_timeout_seconds: number;
+  bridge_dry_run: boolean;
+  execute_enabled: boolean;
+  command_allowlist: string[];
+  confidence_threshold: number;
+  max_consecutive_errors: number;
+  lock_key: string | null;
+  lock_lease_seconds: number;
+  adr_policy: "every_success" | "high_impact" | "manual";
+  pause_reason: string | null;
+  updated_at: string;
+};
+
 export type TriChatChaosEventRecord = {
   event_id: string;
   created_at: string;
@@ -1326,6 +1349,156 @@ export class Storage {
            updated_at = excluded.updated_at`
       )
       .run("trichat.turn_watchdog", normalized.enabled ? 1 : 0, configJson, now);
+
+    return {
+      ...normalized,
+      updated_at: now,
+    };
+  }
+
+  getTriChatAutopilotState(): TriChatAutopilotStateRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT enabled, config_json, updated_at
+         FROM daemon_configs
+         WHERE daemon_key = ?`
+      )
+      .get("trichat.autopilot") as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+
+    const config = parseJsonObject(row.config_json);
+    const awayModeRaw = String(config.away_mode ?? "normal").trim().toLowerCase();
+    const awayMode: TriChatAutopilotStateRecord["away_mode"] =
+      awayModeRaw === "safe" || awayModeRaw === "aggressive" ? awayModeRaw : "normal";
+    const threadStatusRaw = String(config.thread_status ?? "archived").trim().toLowerCase();
+    const threadStatus: TriChatAutopilotStateRecord["thread_status"] =
+      threadStatusRaw === "active" ? "active" : "archived";
+    const adrPolicyRaw = String(config.adr_policy ?? "every_success").trim().toLowerCase();
+    const adrPolicy: TriChatAutopilotStateRecord["adr_policy"] =
+      adrPolicyRaw === "manual" || adrPolicyRaw === "high_impact" ? adrPolicyRaw : "every_success";
+    const commandAllowlist = dedupeNonEmpty(
+      Array.isArray(config.command_allowlist)
+        ? (config.command_allowlist as unknown[]).map((entry) => String(entry ?? ""))
+        : []
+    );
+    const lockKeyRaw = String(config.lock_key ?? "").trim();
+
+    return {
+      enabled: Number(row.enabled ?? 0) === 1,
+      away_mode: awayMode,
+      interval_seconds: parseBoundedInt(config.interval_seconds, 300, 10, 86400),
+      thread_id: String(config.thread_id ?? "trichat-autopilot-internal").trim() || "trichat-autopilot-internal",
+      thread_title: String(config.thread_title ?? "TriChat Autopilot").trim() || "TriChat Autopilot",
+      thread_status: threadStatus,
+      objective:
+        String(
+          config.objective ??
+            "Autopilot heartbeat: propose one high-leverage improvement for MCP server reliability and TriChat interop."
+        ).trim() ||
+        "Autopilot heartbeat: propose one high-leverage improvement for MCP server reliability and TriChat interop.",
+      max_rounds: parseBoundedInt(config.max_rounds, 2, 1, 6),
+      min_success_agents: parseBoundedInt(config.min_success_agents, 2, 1, 3),
+      bridge_timeout_seconds: parseBoundedInt(config.bridge_timeout_seconds, 180, 5, 7200),
+      bridge_dry_run: parseBoolean(config.bridge_dry_run, false),
+      execute_enabled: parseBoolean(config.execute_enabled, true),
+      command_allowlist: commandAllowlist,
+      confidence_threshold: parseBoundedFloat(config.confidence_threshold, 0.45, 0.05, 1),
+      max_consecutive_errors: parseBoundedInt(config.max_consecutive_errors, 3, 1, 20),
+      lock_key: lockKeyRaw || null,
+      lock_lease_seconds: parseBoundedInt(config.lock_lease_seconds, 600, 15, 3600),
+      adr_policy: adrPolicy,
+      pause_reason: asNullableString(config.pause_reason),
+      updated_at: String(row.updated_at ?? ""),
+    };
+  }
+
+  setTriChatAutopilotState(params: {
+    enabled: boolean;
+    away_mode: "safe" | "normal" | "aggressive";
+    interval_seconds: number;
+    thread_id: string;
+    thread_title: string;
+    thread_status: "active" | "archived";
+    objective: string;
+    max_rounds: number;
+    min_success_agents: number;
+    bridge_timeout_seconds: number;
+    bridge_dry_run: boolean;
+    execute_enabled: boolean;
+    command_allowlist: string[];
+    confidence_threshold: number;
+    max_consecutive_errors: number;
+    lock_key?: string | null;
+    lock_lease_seconds: number;
+    adr_policy: "every_success" | "high_impact" | "manual";
+    pause_reason?: string | null;
+  }): TriChatAutopilotStateRecord {
+    const now = new Date().toISOString();
+    const awayMode: TriChatAutopilotStateRecord["away_mode"] =
+      params.away_mode === "safe" || params.away_mode === "aggressive" ? params.away_mode : "normal";
+    const threadStatus: TriChatAutopilotStateRecord["thread_status"] =
+      params.thread_status === "active" ? "active" : "archived";
+    const adrPolicy: TriChatAutopilotStateRecord["adr_policy"] =
+      params.adr_policy === "manual" || params.adr_policy === "high_impact"
+        ? params.adr_policy
+        : "every_success";
+    const lockKey = String(params.lock_key ?? "").trim();
+    const normalized = {
+      enabled: Boolean(params.enabled),
+      away_mode: awayMode,
+      interval_seconds: parseBoundedInt(params.interval_seconds, 300, 10, 86400),
+      thread_id: String(params.thread_id ?? "").trim() || "trichat-autopilot-internal",
+      thread_title: String(params.thread_title ?? "").trim() || "TriChat Autopilot",
+      thread_status: threadStatus,
+      objective:
+        String(params.objective ?? "").trim() ||
+        "Autopilot heartbeat: propose one high-leverage improvement for MCP server reliability and TriChat interop.",
+      max_rounds: parseBoundedInt(params.max_rounds, 2, 1, 6),
+      min_success_agents: parseBoundedInt(params.min_success_agents, 2, 1, 3),
+      bridge_timeout_seconds: parseBoundedInt(params.bridge_timeout_seconds, 180, 5, 7200),
+      bridge_dry_run: Boolean(params.bridge_dry_run),
+      execute_enabled: Boolean(params.execute_enabled),
+      command_allowlist: dedupeNonEmpty(params.command_allowlist ?? []),
+      confidence_threshold: parseBoundedFloat(params.confidence_threshold, 0.45, 0.05, 1),
+      max_consecutive_errors: parseBoundedInt(params.max_consecutive_errors, 3, 1, 20),
+      lock_key: lockKey || null,
+      lock_lease_seconds: parseBoundedInt(params.lock_lease_seconds, 600, 15, 3600),
+      adr_policy: adrPolicy,
+      pause_reason: asNullableString(params.pause_reason),
+    };
+    const configJson = stableStringify({
+      away_mode: normalized.away_mode,
+      interval_seconds: normalized.interval_seconds,
+      thread_id: normalized.thread_id,
+      thread_title: normalized.thread_title,
+      thread_status: normalized.thread_status,
+      objective: normalized.objective,
+      max_rounds: normalized.max_rounds,
+      min_success_agents: normalized.min_success_agents,
+      bridge_timeout_seconds: normalized.bridge_timeout_seconds,
+      bridge_dry_run: normalized.bridge_dry_run,
+      execute_enabled: normalized.execute_enabled,
+      command_allowlist: normalized.command_allowlist,
+      confidence_threshold: normalized.confidence_threshold,
+      max_consecutive_errors: normalized.max_consecutive_errors,
+      lock_key: normalized.lock_key,
+      lock_lease_seconds: normalized.lock_lease_seconds,
+      adr_policy: normalized.adr_policy,
+      pause_reason: normalized.pause_reason,
+    });
+
+    this.db
+      .prepare(
+        `INSERT INTO daemon_configs (daemon_key, enabled, config_json, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(daemon_key) DO UPDATE SET
+           enabled = excluded.enabled,
+           config_json = excluded.config_json,
+           updated_at = excluded.updated_at`
+      )
+      .run("trichat.autopilot", normalized.enabled ? 1 : 0, configJson, now);
 
     return {
       ...normalized,
@@ -5618,6 +5791,15 @@ function parseBoundedInt(value: unknown, fallback: number, min: number, max: num
   }
   const bounded = Math.max(min, Math.min(max, Math.round(parsed)));
   return bounded;
+}
+
+function parseBoundedFloat(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
+  }
+  const bounded = Math.max(min, Math.min(max, parsed));
+  return Number(bounded.toFixed(4));
 }
 
 function clampMetricRate(value: unknown): number {

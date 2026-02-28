@@ -31,6 +31,7 @@ Local-first is non-negotiable: everything lives on your machine, centered on `./
 - Turn orchestration state machine (`trichat.turn_start`, `trichat.turn_advance`, `trichat.turn_artifact`, `trichat.turn_get`, `trichat.turn_orchestrate`)
 - Workboard + novelty scoring for forced-delta retries (`trichat.workboard`, `trichat.novelty`) with dedupe guard on internal reliability heartbeats
 - Stale-turn watchdog daemon for auto-escalation/fail with timeline evidence (`trichat.turn_watchdog`)
+- Autopilot daemon with away-mode safety gates, single-flight leases, emergency brake incidents, and mentorship memory compaction (`trichat.autopilot`)
 - Reliability SLO metrics persisted in SQLite (`trichat.slo`: adapter p95 latency, adapter error rate, turn failure rate)
 - Imprint continuity (`imprint.profile_set`, `imprint.snapshot`, `imprint.bootstrap`)
 - Inbox worker for autonomous execution (`imprint.inbox.*`, `agent_loop.py`)
@@ -261,6 +262,7 @@ TriChat bus and telemetry:
 - `trichat.verify`
 - `trichat.retention`
 - `trichat.auto_retention`
+- `trichat.autopilot`
 - `trichat.adapter_telemetry`
 - `trichat.adapter_protocol_check`
 - `trichat.chaos`
@@ -316,6 +318,10 @@ Key env vars:
 - `ANAMNESIS_TRICHAT_RELIABILITY_THREAD_ID` (internal archived thread id, default `trichat-reliability-internal`)
 - `ANAMNESIS_TRICHAT_RELIABILITY_DRY_RUN` (`true`/`false`, default `true`)
 - `ANAMNESIS_TRICHAT_RELIABILITY_EXECUTE` (`true`/`false`, default `false`)
+- `ANAMNESIS_TRICHAT_AUTOPILOT_MODE` (optional client-side default payload hint: `safe`/`normal`/`aggressive`)
+- `ANAMNESIS_TRICHAT_AUTOPILOT_INTERVAL_SECONDS` (optional client-side default payload hint, default `300`)
+- `ANAMNESIS_TRICHAT_AUTOPILOT_THREAD_ID` (optional client-side default payload hint, default `trichat-autopilot-internal`)
+- `ANAMNESIS_TRICHAT_AUTOPILOT_THREAD_STATUS` (optional client-side default payload hint: `active`/`archived`)
 
 ## Suggested Daily Loop
 1. Start server + TriChat.

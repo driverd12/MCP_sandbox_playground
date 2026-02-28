@@ -82,7 +82,7 @@ npm test
 - `run.begin`, `run.step`, `run.end`, `run.timeline`
 - `task.create`, `task.list`, `task.timeline`, `task.claim`, `task.heartbeat`, `task.complete`, `task.fail`, `task.retry`, `task.auto_retry`
 - `task.summary`
-- `trichat.thread_open`, `trichat.thread_list`, `trichat.thread_get`, `trichat.message_post`, `trichat.timeline`, `trichat.summary`, `trichat.adapter_telemetry`, `trichat.adapter_protocol_check`, `trichat.turn_start`, `trichat.turn_advance`, `trichat.turn_artifact`, `trichat.turn_get`, `trichat.turn_orchestrate`, `trichat.workboard`, `trichat.novelty`, `trichat.verify`, `trichat.retention`, `trichat.auto_retention`
+- `trichat.thread_open`, `trichat.thread_list`, `trichat.thread_get`, `trichat.message_post`, `trichat.timeline`, `trichat.summary`, `trichat.adapter_telemetry`, `trichat.adapter_protocol_check`, `trichat.turn_start`, `trichat.turn_advance`, `trichat.turn_artifact`, `trichat.turn_get`, `trichat.turn_orchestrate`, `trichat.workboard`, `trichat.novelty`, `trichat.verify`, `trichat.retention`, `trichat.auto_retention`, `trichat.autopilot`
 - `mutation.check`
 - `preflight.check`, `postflight.verify`
 - `lock.acquire`, `lock.release`

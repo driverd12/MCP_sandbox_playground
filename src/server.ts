@@ -112,6 +112,9 @@ import {
   trichatTimeline,
   trichatTimelineSchema,
   initializeTriChatTurnWatchdogDaemon,
+  initializeTriChatAutopilotDaemon,
+  trichatAutopilotControl,
+  trichatAutopilotSchema,
 } from "./tools/trichat.js";
 import { TriChatBusRuntime, trichatBusControl, trichatBusSchema } from "./tools/trichat_bus.js";
 import {
@@ -147,6 +150,7 @@ initializeAutoSquishDaemon(storage);
 initializeTaskAutoRetryDaemon(storage);
 initializeTriChatAutoRetentionDaemon(storage);
 initializeTriChatTurnWatchdogDaemon(storage);
+initializeTriChatAutopilotDaemon(storage);
 const triChatBusRuntime = new TriChatBusRuntime(storage, {
   socket_path: process.env.TRICHAT_BUS_SOCKET_PATH
     ? path.resolve(process.env.TRICHAT_BUS_SOCKET_PATH)
@@ -855,6 +859,13 @@ registerTool(
   "Manage stale-turn watchdog daemon (status/start/stop/run_once) to auto-fail stalled turns with evidence.",
   trichatTurnWatchdogSchema,
   (input) => trichatTurnWatchdogControl(storage, input)
+);
+
+registerTool(
+  "trichat.autopilot",
+  "Manage autonomous TriChat daemon loops with away-mode safety gates, emergency brake, and mentorship persistence.",
+  trichatAutopilotSchema,
+  (input) => trichatAutopilotControl(storage, input)
 );
 
 registerTool(

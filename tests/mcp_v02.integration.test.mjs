@@ -60,6 +60,7 @@ const EXPECTED_TOOLS = [
   "trichat.consensus",
   "trichat.message_post",
   "trichat.novelty",
+  "trichat.autopilot",
   "trichat.auto_retention",
   "trichat.retention",
   "trichat.slo",
@@ -1265,6 +1266,36 @@ test("MCP v0.2 integration and safety invariants", async () => {
     });
     assert.equal(triChatAutoRetentionStop.running, false);
     assert.equal(triChatAutoRetentionStop.persisted.enabled, false);
+
+    const triChatAutopilotStatus = await callTool(client, "trichat.autopilot", {
+      action: "status",
+    });
+    assert.equal(typeof triChatAutopilotStatus.running, "boolean");
+    assert.equal(typeof triChatAutopilotStatus.in_tick, "boolean");
+    assert.equal(typeof triChatAutopilotStatus.config.interval_seconds, "number");
+
+    const triChatAutopilotMissingMutation = await callToolExpectError(client, "trichat.autopilot", {
+      action: "run_once",
+    });
+    assert.match(triChatAutopilotMissingMutation, /mutation|required|invalid/i);
+
+    const triChatAutopilotRunOnce = await callTool(client, "trichat.autopilot", {
+      action: "run_once",
+      mutation: nextMutation(testId, "trichat.autopilot-run_once", () => mutationCounter++),
+      thread_id: `trichat-autopilot-integration-${testId}`,
+      thread_title: `TriChat Autopilot Integration ${testId}`,
+      thread_status: "archived",
+      away_mode: "normal",
+      bridge_dry_run: true,
+      execute_enabled: false,
+      max_rounds: 1,
+      min_success_agents: 1,
+      confidence_threshold: 0.1,
+      adr_policy: "manual",
+    });
+    assert.equal(typeof triChatAutopilotRunOnce.tick.ok, "boolean");
+    assert.ok(Array.isArray(triChatAutopilotRunOnce.tick.step_status));
+    assert.equal(typeof triChatAutopilotRunOnce.tick.execution.mode, "string");
 
     const durableTaskIdC = `task-${testId}-c`;
     await callTool(client, "task.create", {

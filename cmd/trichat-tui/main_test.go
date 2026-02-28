@@ -240,3 +240,161 @@ func TestBuildInteropPromptIncludesCouncilQuestions(t *testing.T) {
 		t.Fatalf("expected council question text in interop prompt")
 	}
 }
+
+func TestShouldContinueCouncilConvergenceStopsOnLatencyBudget(t *testing.T) {
+	novelty := triChatNoveltyResp{
+		Found:         true,
+		RetryRequired: true,
+		Disagreement:  true,
+		NoveltyScore:  0.34,
+	}
+	continueLoop, reason := shouldContinueCouncilConvergence(
+		2,
+		1,
+		6,
+		50*time.Second,
+		45*time.Second,
+		novelty,
+		0.22,
+		0.34,
+		0.05,
+	)
+	if continueLoop {
+		t.Fatalf("expected convergence loop to stop on latency budget")
+	}
+	if reason != "latency-budget" {
+		t.Fatalf("expected reason latency-budget, got %q", reason)
+	}
+}
+
+func TestShouldContinueCouncilConvergenceStopsOnNoveltyImproved(t *testing.T) {
+	novelty := triChatNoveltyResp{
+		Found:         true,
+		RetryRequired: true,
+		Disagreement:  true,
+		NoveltyScore:  0.41,
+	}
+	continueLoop, reason := shouldContinueCouncilConvergence(
+		3,
+		1,
+		6,
+		12*time.Second,
+		45*time.Second,
+		novelty,
+		0.25,
+		0.42,
+		0.05,
+	)
+	if continueLoop {
+		t.Fatalf("expected convergence loop to stop after novelty improvement")
+	}
+	if reason != "novelty-improved" {
+		t.Fatalf("expected reason novelty-improved, got %q", reason)
+	}
+}
+
+func TestIsCouncilTranscriptMessageClassification(t *testing.T) {
+	council := triChatMessage{
+		AgentID: "codex",
+		Role:    "assistant",
+		Content: "@cursor can you prove rollback safety?",
+		Metadata: map[string]any{
+			"kind":             "fanout-council-question",
+			"council_exchange": true,
+		},
+	}
+	if !isCouncilTranscriptMessage(council) {
+		t.Fatalf("expected council message classification")
+	}
+
+	userFacing := triChatMessage{
+		AgentID: "codex",
+		Role:    "assistant",
+		Content: "Here is my final recommendation.",
+		Metadata: map[string]any{
+			"kind": "fanout-response",
+		},
+	}
+	if isCouncilTranscriptMessage(userFacing) {
+		t.Fatalf("did not expect user-facing assistant reply to be classified as council")
+	}
+}
+
+func TestNormalizeCouncilStripMode(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{input: "always", want: "always"},
+		{input: "AUTO", want: "auto"},
+		{input: "off", want: "off"},
+		{input: "invalid", want: "auto"},
+	}
+	for _, tc := range cases {
+		got := normalizeCouncilStripMode(tc.input)
+		if got != tc.want {
+			t.Fatalf("normalizeCouncilStripMode(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestRenderTimelineCouncilStripModes(t *testing.T) {
+	baseMessages := []triChatMessage{
+		{
+			AgentID: "codex",
+			Role:    "assistant",
+			Content: "@cursor challenge this merge plan",
+			Metadata: map[string]any{
+				"kind":             "fanout-council-question",
+				"council_exchange": true,
+			},
+		},
+		{
+			AgentID: "cursor",
+			Role:    "assistant",
+			Content: "User-facing answer",
+			Metadata: map[string]any{
+				"kind": "fanout-response",
+			},
+		},
+	}
+
+	modeOff := model{
+		theme:    newTheme(),
+		settings: runtimeSettings{councilStripMode: "off"},
+		messages: baseMessages,
+	}
+	offRendered := modeOff.renderTimeline()
+	if strings.Contains(offRendered, "Council Transcript Strip") {
+		t.Fatalf("expected council strip hidden when mode=off")
+	}
+
+	modeAuto := model{
+		theme:    newTheme(),
+		settings: runtimeSettings{councilStripMode: "auto"},
+		messages: baseMessages,
+	}
+	autoRendered := modeAuto.renderTimeline()
+	if !strings.Contains(autoRendered, "Council Transcript Strip") {
+		t.Fatalf("expected council strip visible when mode=auto and council messages exist")
+	}
+
+	modeAlways := model{
+		theme:    newTheme(),
+		settings: runtimeSettings{councilStripMode: "always"},
+		messages: []triChatMessage{
+			{
+				AgentID: "cursor",
+				Role:    "assistant",
+				Content: "No council message in this turn",
+				Metadata: map[string]any{
+					"kind": "fanout-response",
+				},
+			},
+		},
+	}
+	alwaysRendered := modeAlways.renderTimeline()
+	if !strings.Contains(alwaysRendered, "Council Transcript Strip") {
+		t.Fatalf("expected council strip visible when mode=always")
+	}
+}

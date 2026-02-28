@@ -40,6 +40,7 @@ const (
 	bootstrapMaxChars   = 1200
 	timelineMaxLines    = 8
 	timelineMaxChars    = 900
+	councilStripMaxRows = 24
 	busStripMaxEvents   = 240
 	busStripMaxRows     = 5
 	adapterProtocol     = "trichat-bridge-v1"
@@ -78,6 +79,10 @@ type appConfig struct {
 	adaptiveTimeoutsEnabled      bool
 	adaptiveTimeoutMinSamples    int
 	adaptiveTimeoutMaxStepSecond int
+	councilConvergenceMaxRounds  int
+	councilLatencyBudgetSecond   int
+	councilMinNoveltyDelta       float64
+	councilStripMode             string
 	consensusMinAgents           int
 	interopRounds                int
 	executeGateMode              string
@@ -106,6 +111,10 @@ type runtimeSettings struct {
 	adaptiveTimeoutsEnabled      bool
 	adaptiveTimeoutMinSamples    int
 	adaptiveTimeoutMaxStepSecond int
+	councilConvergenceMaxRounds  int
+	councilLatencyBudgetSecond   int
+	councilMinNoveltyDelta       float64
+	councilStripMode             string
 }
 
 type mcpCaller struct {
@@ -2068,7 +2077,7 @@ func buildRuntimeCoordinationContext(settings runtimeSettings, tuning adaptiveTi
 		p95Text = fmt.Sprintf("%.0fms", tuning.P95LatencyMS)
 	}
 	return fmt.Sprintf(
-		"runtime-sync: adaptive=%s decision=%s model_timeout=%ds bridge_timeout=%ds failover_timeout=%ds p95=%s samples=%d err=%.1f%% turn_fail=%.1f%% gate=%s interop_rounds=%d",
+		"runtime-sync: adaptive=%s decision=%s model_timeout=%ds bridge_timeout=%ds failover_timeout=%ds p95=%s samples=%d err=%.1f%% turn_fail=%.1f%% gate=%s interop_rounds=%d council_max_rounds=%d council_budget=%ds council_min_delta=%.2f council_strip=%s",
 		onOff(settings.adaptiveTimeoutsEnabled),
 		adaptiveDecisionLabel(tuning),
 		settings.modelTimeoutSeconds,
@@ -2080,6 +2089,10 @@ func buildRuntimeCoordinationContext(settings runtimeSettings, tuning adaptiveTi
 		tuning.TurnFailureRate*100,
 		settings.executeGateMode,
 		settings.interopRounds,
+		settings.councilConvergenceMaxRounds,
+		settings.councilLatencyBudgetSecond,
+		settings.councilMinNoveltyDelta,
+		settings.councilStripMode,
 	)
 }
 
@@ -2369,6 +2382,10 @@ func newModel(cfg appConfig) model {
 		adaptiveTimeoutsEnabled:      cfg.adaptiveTimeoutsEnabled,
 		adaptiveTimeoutMinSamples:    cfg.adaptiveTimeoutMinSamples,
 		adaptiveTimeoutMaxStepSecond: cfg.adaptiveTimeoutMaxStepSecond,
+		councilConvergenceMaxRounds:  cfg.councilConvergenceMaxRounds,
+		councilLatencyBudgetSecond:   cfg.councilLatencyBudgetSecond,
+		councilMinNoveltyDelta:       cfg.councilMinNoveltyDelta,
+		councilStripMode:             cfg.councilStripMode,
 	}
 
 	caller := mcpCaller{
@@ -3318,6 +3335,13 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 		critiqueContext := strings.Join(critiqueNotes, "\n")
 		interopRoundsCompleted := 0
 		totalCouncilQuestions := 0
+		convergenceReason := ""
+		baselineNoveltyScore := 0.0
+		bestNoveltyScore := 0.0
+		if novelty.Found {
+			baselineNoveltyScore = novelty.NoveltyScore
+			bestNoveltyScore = novelty.NoveltyScore
+		}
 		if settings.interopRounds > 0 && strings.EqualFold(target, "all") && len(expectedAgents) >= 2 {
 			turnPhase = "merge"
 			if turnID != "" {
@@ -3334,7 +3358,11 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 					},
 				})
 			}
-			for round := 1; round <= settings.interopRounds; round++ {
+			minInteropRounds := maxInt(1, settings.interopRounds)
+			maxCouncilRounds := maxInt(minInteropRounds, settings.councilConvergenceMaxRounds)
+			councilLatencyBudget := time.Duration(maxInt(1, settings.councilLatencyBudgetSecond)) * time.Second
+			councilLoopStarted := time.Now()
+			for round := 1; round <= maxCouncilRounds; round++ {
 				interopPeerContext := buildPeerContext(novelty.Proposals)
 				if strings.TrimSpace(interopPeerContext) == "" {
 					interopPeerContext = peerContext
@@ -3380,14 +3408,15 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 								"content":             councilContent,
 								"reply_to_message_id": userMessageID,
 								"metadata": map[string]any{
-									"kind":          "fanout-council-question",
-									"source":        "trichat-tui",
-									"phase":         "merge",
-									"interop_round": round,
-									"target_agent":  question.TargetAgent,
-									"rationale":     question.Rationale,
-									"urgency":       question.Urgency,
-									"adapter":       councilResponse.adapterMeta,
+									"kind":             "fanout-council-question",
+									"source":           "trichat-tui",
+									"phase":            "merge",
+									"interop_round":    round,
+									"target_agent":     question.TargetAgent,
+									"rationale":        question.Rationale,
+									"urgency":          question.Urgency,
+									"council_exchange": true,
+									"adapter":          councilResponse.adapterMeta,
 								},
 							})
 							if err != nil {
@@ -3441,13 +3470,29 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 					mergeCoordinationContext(runtimeCoordinationContext, interopPeerContext),
 				)
 				events = append(events, interopEvents...)
+				interopRoundsCompleted += 1
 				if len(interopResponses) == 0 {
+					continueLoop, stopReason := shouldContinueCouncilConvergence(
+						interopRoundsCompleted,
+						minInteropRounds,
+						maxCouncilRounds,
+						time.Since(councilLoopStarted),
+						councilLatencyBudget,
+						novelty,
+						baselineNoveltyScore,
+						bestNoveltyScore,
+						settings.councilMinNoveltyDelta,
+					)
+					if !continueLoop {
+						convergenceReason = stopReason
+						break
+					}
 					continue
 				}
 
-				interopRoundsCompleted += 1
 				for _, response := range interopResponses {
 					interopStructured := parseProposalStructured(response.content, response.agentID, true)
+					questionCount := len(councilQuestionByTarget[response.agentID])
 					_, err := caller.callTool("trichat.message_post", map[string]any{
 						"mutation":            mutation.next("trichat.message_post"),
 						"thread_id":           threadID,
@@ -3460,7 +3505,8 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 							"source":                 "trichat-tui",
 							"phase":                  "merge",
 							"interop_round":          round,
-							"council_question_count": len(councilQuestionByTarget[response.agentID]),
+							"council_question_count": questionCount,
+							"council_exchange":       questionCount > 0,
 							"adapter":                response.adapterMeta,
 							"structured_v":           1,
 							"structured":             interopStructured,
@@ -3483,7 +3529,7 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 								"source":                 "trichat-tui",
 								"interop_round":          round,
 								"phase_origin":           "merge",
-								"council_question_count": len(councilQuestionByTarget[response.agentID]),
+								"council_question_count": questionCount,
 							},
 						})
 					}
@@ -3510,8 +3556,33 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 					}
 				}
 
-				if novelty.Found && !novelty.RetryRequired && !novelty.Disagreement {
+				if novelty.Found {
+					bestNoveltyScore = maxFloat(bestNoveltyScore, novelty.NoveltyScore)
+				}
+				continueLoop, stopReason := shouldContinueCouncilConvergence(
+					interopRoundsCompleted,
+					minInteropRounds,
+					maxCouncilRounds,
+					time.Since(councilLoopStarted),
+					councilLatencyBudget,
+					novelty,
+					baselineNoveltyScore,
+					bestNoveltyScore,
+					settings.councilMinNoveltyDelta,
+				)
+				if !continueLoop {
+					convergenceReason = stopReason
 					break
+				}
+			}
+			if convergenceReason == "" {
+				switch {
+				case interopRoundsCompleted <= 0:
+					convergenceReason = "no-interop"
+				case interopRoundsCompleted >= maxCouncilRounds:
+					convergenceReason = "max-rounds"
+				default:
+					convergenceReason = "steady"
 				}
 			}
 			if interopRoundsCompleted > 0 {
@@ -3521,19 +3592,31 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 					"agent_id":  "router",
 					"role":      "assistant",
 					"content": fmt.Sprintf(
-						"[interop] rounds=%d novelty=%.2f retry=%s disagreement=%s",
+						"[interop] rounds=%d council_q=%d novelty=%.2f delta=%.2f retry=%s disagreement=%s converge=%s budget=%ds",
 						interopRoundsCompleted,
+						totalCouncilQuestions,
 						novelty.NoveltyScore,
+						bestNoveltyScore-baselineNoveltyScore,
 						onOff(novelty.RetryRequired),
 						onOff(novelty.Disagreement),
+						convergenceReason,
+						settings.councilLatencyBudgetSecond,
 					),
 					"metadata": map[string]any{
-						"kind":           "interop-summary",
-						"source":         "trichat-tui",
-						"interop_rounds": interopRoundsCompleted,
-						"novelty_score":  novelty.NoveltyScore,
-						"retry_required": novelty.RetryRequired,
-						"disagreement":   novelty.Disagreement,
+						"kind":                   "interop-summary",
+						"source":                 "trichat-tui",
+						"interop_rounds":         interopRoundsCompleted,
+						"novelty_score":          novelty.NoveltyScore,
+						"novelty_baseline_score": baselineNoveltyScore,
+						"novelty_best_score":     bestNoveltyScore,
+						"novelty_delta":          bestNoveltyScore - baselineNoveltyScore,
+						"retry_required":         novelty.RetryRequired,
+						"disagreement":           novelty.Disagreement,
+						"council_question_count": totalCouncilQuestions,
+						"convergence_reason":     convergenceReason,
+						"convergence_budget_sec": settings.councilLatencyBudgetSecond,
+						"convergence_max_rounds": settings.councilConvergenceMaxRounds,
+						"convergence_min_delta":  settings.councilMinNoveltyDelta,
 					},
 				})
 			}
@@ -3622,6 +3705,9 @@ func (m model) fanoutCmd(prompt string, target string) tea.Cmd {
 		interopStatus := ""
 		if interopRoundsCompleted > 0 {
 			interopStatus = fmt.Sprintf(" interop=%d", interopRoundsCompleted)
+			if strings.TrimSpace(convergenceReason) != "" {
+				interopStatus += fmt.Sprintf(" converge=%s", convergenceReason)
+			}
 		}
 		councilStatus := ""
 		if totalCouncilQuestions > 0 {
@@ -4019,6 +4105,40 @@ func groupCouncilQuestionsByTarget(questions []councilQuestion) map[string][]cou
 		grouped[target] = append(grouped[target], question)
 	}
 	return grouped
+}
+
+func shouldContinueCouncilConvergence(
+	roundsCompleted int,
+	minRounds int,
+	maxRounds int,
+	elapsed time.Duration,
+	latencyBudget time.Duration,
+	novelty triChatNoveltyResp,
+	baselineNovelty float64,
+	bestNovelty float64,
+	minDelta float64,
+) (bool, string) {
+	if roundsCompleted <= 0 {
+		return true, ""
+	}
+	if roundsCompleted >= maxInt(1, maxRounds) {
+		return false, "max-rounds"
+	}
+	if roundsCompleted < maxInt(1, minRounds) {
+		return true, ""
+	}
+	if latencyBudget > 0 && elapsed >= latencyBudget {
+		return false, "latency-budget"
+	}
+	if novelty.Found {
+		if !novelty.RetryRequired && !novelty.Disagreement {
+			return false, "novelty-converged"
+		}
+		if (bestNovelty - baselineNovelty) >= clampFloat(minDelta, 0.01, 0.8) {
+			return false, "novelty-improved"
+		}
+	}
+	return true, ""
 }
 
 func renderIncomingCouncilQuestions(agentID string, incoming []councilQuestion) string {
@@ -5688,6 +5808,23 @@ func (m *model) handleSlash(raw string) tea.Cmd {
 		return m.adapterProtocolCheckCmd(tail)
 	case "/interop":
 		return m.interopCommandCmd(tail)
+	case "/councilstrip":
+		if len(tail) == 0 {
+			m.inflight = false
+			m.statusLine = "council strip mode: " + m.settings.councilStripMode
+			return nil
+		}
+		mode := normalizeCouncilStripMode(tail[0])
+		if mode != strings.ToLower(strings.TrimSpace(tail[0])) {
+			m.inflight = false
+			m.statusLine = "usage: /councilstrip always|auto|off"
+			return nil
+		}
+		m.settings.councilStripMode = mode
+		m.inflight = false
+		m.statusLine = "council strip mode set: " + mode
+		m.renderPanes()
+		return nil
 	case "/fanout":
 		if len(tail) == 0 {
 			m.inflight = false
@@ -6240,12 +6377,68 @@ func (m *model) renderTimeline() string {
 	if len(m.messages) == 0 {
 		return "No messages yet. Send a prompt to start tri-agent fanout."
 	}
-	var b strings.Builder
+	councilMode := normalizeCouncilStripMode(m.settings.councilStripMode)
+	councilMessages := make([]triChatMessage, 0, len(m.messages))
+	userFacingMessages := make([]triChatMessage, 0, len(m.messages))
 	for _, msg := range m.messages {
 		// System/router chatter is useful for audit trails but noisy in live chat.
 		if msg.Role == "system" {
 			continue
 		}
+		if isCouncilTranscriptMessage(msg) {
+			councilMessages = append(councilMessages, msg)
+			continue
+		}
+		userFacingMessages = append(userFacingMessages, msg)
+	}
+	if len(councilMessages) > councilStripMaxRows {
+		councilMessages = councilMessages[len(councilMessages)-councilStripMaxRows:]
+	}
+	showCouncilStrip := false
+	switch councilMode {
+	case "always":
+		showCouncilStrip = true
+	case "auto":
+		showCouncilStrip = len(councilMessages) > 0
+	case "off":
+		showCouncilStrip = false
+	}
+
+	var b strings.Builder
+	if showCouncilStrip {
+		b.WriteString(m.theme.panelTitle.Render("Council Transcript Strip"))
+		b.WriteString("\n")
+		if len(councilMessages) == 0 {
+			b.WriteString(m.theme.helpText.Render("(no agent-to-agent council exchanges yet)"))
+			b.WriteString("\n\n")
+		} else {
+			for _, msg := range councilMessages {
+				timestamp := shortTime(msg.CreatedAt)
+				agentLabel := msg.AgentID
+				if strings.TrimSpace(agentLabel) == "" {
+					agentLabel = msg.Role
+				}
+				style, ok := m.theme.chatAgent[agentLabel]
+				if !ok {
+					style = m.theme.chatAgent["system"]
+				}
+				header := fmt.Sprintf("%s [council %s/%s]", timestamp, agentLabel, msg.Role)
+				b.WriteString(style.Render(header))
+				b.WriteString("\n")
+				preview := compactTimelineMessage(msg.Content, 5, timelineMaxChars)
+				b.WriteString(wrapText(preview, maxInt(24, m.timeline.Width-2)))
+				b.WriteString("\n\n")
+			}
+		}
+	}
+
+	b.WriteString(m.theme.panelTitle.Render("User-Facing Timeline"))
+	b.WriteString("\n")
+	if len(userFacingMessages) == 0 {
+		b.WriteString(m.theme.helpText.Render("(no user-facing messages yet)"))
+		b.WriteString("\n")
+	}
+	for _, msg := range userFacingMessages {
 		timestamp := shortTime(msg.CreatedAt)
 		agentLabel := msg.AgentID
 		if strings.TrimSpace(agentLabel) == "" {
@@ -6331,7 +6524,10 @@ func (m *model) renderSidebar() string {
 		r.consensus.IncompleteTurns,
 	))
 	b.WriteString(fmt.Sprintf("Interop  rounds=%d\n", m.settings.interopRounds))
-	b.WriteString(fmt.Sprintf("Council  auto=%s\n", onOff(m.settings.interopRounds > 0 && strings.EqualFold(m.settings.fanoutTarget, "all"))))
+	b.WriteString(fmt.Sprintf("Council  auto=%s strip=%s\n",
+		onOff(m.settings.interopRounds > 0 && strings.EqualFold(m.settings.fanoutTarget, "all")),
+		m.settings.councilStripMode,
+	))
 	workboardRunning := r.workboard.Counts["running"]
 	workboardTotal := r.workboard.Counts["total"]
 	activePhase := "n/a"
@@ -6573,7 +6769,7 @@ func (m *model) renderReliabilityDetail() string {
 }
 
 func (m *model) maxSettingsIndex() int {
-	return 10
+	return 14
 }
 
 func (m *model) adjustSetting(delta int) {
@@ -6594,18 +6790,28 @@ func (m *model) adjustSetting(delta int) {
 		options := []int{0, 1, 2, 3}
 		m.settings.interopRounds = cycleInt(options, m.settings.interopRounds, delta)
 	case 4:
-		m.settings.pollInterval = time.Duration(clampInt(int(m.settings.pollInterval.Seconds())+delta, 1, 60)) * time.Second
+		options := []string{"always", "auto", "off"}
+		m.settings.councilStripMode = cycleString(options, m.settings.councilStripMode, delta)
 	case 5:
-		m.settings.modelTimeoutSeconds = clampInt(m.settings.modelTimeoutSeconds+delta, 1, 120)
+		m.settings.councilConvergenceMaxRounds = clampInt(m.settings.councilConvergenceMaxRounds+delta, 1, 12)
 	case 6:
-		m.settings.bridgeTimeoutSeconds = clampInt(m.settings.bridgeTimeoutSeconds+delta, 1, 120)
+		m.settings.councilLatencyBudgetSecond = clampInt(m.settings.councilLatencyBudgetSecond+delta*5, 5, 300)
 	case 7:
-		m.settings.adapterFailoverTimeoutSecond = clampInt(m.settings.adapterFailoverTimeoutSecond+delta, 1, 120)
+		next := math.Round((m.settings.councilMinNoveltyDelta+float64(delta)*0.01)*100) / 100
+		m.settings.councilMinNoveltyDelta = clampFloat(next, 0.01, 0.8)
 	case 8:
-		m.settings.adapterCircuitThreshold = clampInt(m.settings.adapterCircuitThreshold+delta, 1, 10)
+		m.settings.pollInterval = time.Duration(clampInt(int(m.settings.pollInterval.Seconds())+delta, 1, 60)) * time.Second
 	case 9:
-		m.settings.adapterCircuitRecoverySecond = clampInt(m.settings.adapterCircuitRecoverySecond+delta, 1, 600)
+		m.settings.modelTimeoutSeconds = clampInt(m.settings.modelTimeoutSeconds+delta, 1, 120)
 	case 10:
+		m.settings.bridgeTimeoutSeconds = clampInt(m.settings.bridgeTimeoutSeconds+delta, 1, 120)
+	case 11:
+		m.settings.adapterFailoverTimeoutSecond = clampInt(m.settings.adapterFailoverTimeoutSecond+delta, 1, 120)
+	case 12:
+		m.settings.adapterCircuitThreshold = clampInt(m.settings.adapterCircuitThreshold+delta, 1, 10)
+	case 13:
+		m.settings.adapterCircuitRecoverySecond = clampInt(m.settings.adapterCircuitRecoverySecond+delta, 1, 600)
+	case 14:
 		if delta != 0 {
 			m.settings.autoRefresh = !m.settings.autoRefresh
 		}
@@ -6624,6 +6830,10 @@ func (m *model) renderSettings() string {
 		{"Execute Gate", m.settings.executeGateMode, "open/allowlist/approval"},
 		{"Consensus Min Agents", strconv.Itoa(m.settings.consensusMinAgents), "2 or 3 required responses for consensus/disagreement"},
 		{"Interop Rounds", strconv.Itoa(m.settings.interopRounds), "0 disables peer bounce; 1-3 runs merge refinement loops"},
+		{"Council Strip", m.settings.councilStripMode, "always=show, auto=show when council exists, off=collapse strip"},
+		{"Council Max Rounds", strconv.Itoa(m.settings.councilConvergenceMaxRounds), "max autonomous council rounds per turn (1-12)"},
+		{"Council Budget", fmt.Sprintf("%ds", m.settings.councilLatencyBudgetSecond), "latency budget for autonomous council loop"},
+		{"Council Min Delta", fmt.Sprintf("%.2f", m.settings.councilMinNoveltyDelta), "stop when novelty gain reaches this threshold"},
 		{"Poll Interval", fmt.Sprintf("%ds", int(m.settings.pollInterval.Seconds())), "sidebar and timeline refresh interval"},
 		{"Model Timeout", fmt.Sprintf("%ds", m.settings.modelTimeoutSeconds), "per Ollama request timeout"},
 		{"Bridge Timeout", fmt.Sprintf("%ds", m.settings.bridgeTimeoutSeconds), "per command-adapter timeout"},
@@ -6667,13 +6877,15 @@ func (m *model) renderHelp() string {
 		"- Workboard shows turn phase state (plan/propose/merge/execute/verify) and latest decision",
 		"- Novelty scoring can trigger forced delta retries before merge for non-identical strategies",
 		"- Interop rounds let agents refine against peer/critique context before selection",
-		"- Autonomous council step (when interop>0 and fanout=all) creates directed agent-to-agent questions each round",
+		"- Autonomous council loop (when interop>0 and fanout=all) auto-continues rounds until novelty improves or budget/max-round limits are hit",
+		"- Council Transcript Strip isolates agent-to-agent exchanges from user-facing replies",
 		"- Settings includes consensus threshold toggle (2 or 3 required agent responses)",
 		"- Live Bus Strip shows real-time adapter events (socket stream) before timeline persistence",
 		"",
 		"Slash Commands",
 		"- /adaptercheck [ping|live|dry] [agents] [timeout_s]",
 		"- /interop status|on|off|0|1|2|3",
+		"- /councilstrip always|auto|off",
 		"- /fanout all|codex|cursor|local-imprint",
 		"- /agent <agent> <message>",
 		"- /thread list [limit]",
@@ -6757,6 +6969,30 @@ func parseFlags() appConfig {
 		envOrInt("TRICHAT_ADAPTIVE_TIMEOUT_MAX_STEP_SECONDS", 8),
 		"Maximum timeout adjustment (seconds) per turn when adaptive tuning is enabled",
 	)
+	flag.IntVar(
+		&cfg.councilConvergenceMaxRounds,
+		"council-max-rounds",
+		envOrInt("TRICHAT_COUNCIL_MAX_ROUNDS", 5),
+		"Maximum autonomous council rounds per turn (>= interop rounds)",
+	)
+	flag.IntVar(
+		&cfg.councilLatencyBudgetSecond,
+		"council-latency-budget",
+		envOrInt("TRICHAT_COUNCIL_LATENCY_BUDGET_SECONDS", 45),
+		"Latency budget in seconds for autonomous council convergence loop",
+	)
+	flag.Float64Var(
+		&cfg.councilMinNoveltyDelta,
+		"council-min-novelty-delta",
+		envOrFloat("TRICHAT_COUNCIL_MIN_NOVELTY_DELTA", 0.05),
+		"Minimum novelty gain needed before council loop can stop early",
+	)
+	flag.StringVar(
+		&cfg.councilStripMode,
+		"council-strip-mode",
+		envOr("TRICHAT_COUNCIL_STRIP_MODE", "auto"),
+		"Council transcript strip rendering mode (always|auto|off)",
+	)
 	flag.IntVar(&cfg.consensusMinAgents, "consensus-min-agents", envOrInt("TRICHAT_CONSENSUS_MIN_AGENTS", 3), "Consensus threshold (2 or 3 agents)")
 	flag.IntVar(&cfg.interopRounds, "interop-rounds", envOrInt("TRICHAT_INTEROP_ROUNDS", 1), "Interop bounce rounds before merge decision (0-3)")
 	flag.StringVar(&cfg.executeGateMode, "execute-gate-mode", envOr("TRICHAT_EXECUTE_GATE_MODE", "open"), "execute gate mode (open|allowlist|approval)")
@@ -6786,6 +7022,10 @@ func parseFlags() appConfig {
 	cfg.adapterCircuitRecoverySecond = clampInt(cfg.adapterCircuitRecoverySecond, 1, 600)
 	cfg.adaptiveTimeoutMinSamples = clampInt(cfg.adaptiveTimeoutMinSamples, 1, 1000)
 	cfg.adaptiveTimeoutMaxStepSecond = clampInt(cfg.adaptiveTimeoutMaxStepSecond, 1, 30)
+	cfg.councilConvergenceMaxRounds = clampInt(cfg.councilConvergenceMaxRounds, 1, 12)
+	cfg.councilLatencyBudgetSecond = clampInt(cfg.councilLatencyBudgetSecond, 5, 300)
+	cfg.councilMinNoveltyDelta = clampFloat(cfg.councilMinNoveltyDelta, 0.01, 0.8)
+	cfg.councilStripMode = normalizeCouncilStripMode(cfg.councilStripMode)
 	cfg.consensusMinAgents = clampInt(cfg.consensusMinAgents, 2, 3)
 	cfg.interopRounds = clampInt(cfg.interopRounds, 0, 3)
 	minFailover := clampInt(maxInt(cfg.modelTimeoutSeconds+8, cfg.bridgeTimeoutSeconds+5), 1, 120)
@@ -6823,6 +7063,16 @@ func normalizeGateMode(mode string) string {
 		return normalized
 	default:
 		return "open"
+	}
+}
+
+func normalizeCouncilStripMode(mode string) string {
+	normalized := strings.ToLower(strings.TrimSpace(mode))
+	switch normalized {
+	case "always", "auto", "off":
+		return normalized
+	default:
+		return "auto"
 	}
 }
 
@@ -6876,6 +7126,18 @@ func envOrBool(key string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func envOrFloat(key string, fallback float64) float64 {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func autoBridgeCommand(repoRoot, agentID string) string {
@@ -7006,6 +7268,54 @@ func parseAnyInt(value any) (int, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func parseAnyBool(value any) (bool, bool) {
+	switch typed := value.(type) {
+	case bool:
+		return typed, true
+	case string:
+		normalized := strings.ToLower(strings.TrimSpace(typed))
+		switch normalized {
+		case "1", "true", "yes", "on":
+			return true, true
+		case "0", "false", "no", "off":
+			return false, true
+		default:
+			return false, false
+		}
+	case float64:
+		return typed != 0, true
+	case int:
+		return typed != 0, true
+	default:
+		return false, false
+	}
+}
+
+func isCouncilTranscriptMessage(msg triChatMessage) bool {
+	if strings.EqualFold(msg.Role, "system") {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(msg.AgentID), "user") {
+		return false
+	}
+	if len(msg.Metadata) == 0 {
+		return false
+	}
+	if councilExchange, ok := parseAnyBool(msg.Metadata["council_exchange"]); ok && councilExchange {
+		return true
+	}
+	kind := strings.ToLower(strings.TrimSpace(fmt.Sprint(msg.Metadata["kind"])))
+	if strings.Contains(kind, "council") {
+		return true
+	}
+	if kind == "fanout-interop" {
+		if questionCount, ok := parseAnyInt(msg.Metadata["council_question_count"]); ok && questionCount > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func wrapText(text string, width int) string {

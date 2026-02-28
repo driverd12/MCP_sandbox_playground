@@ -106,7 +106,9 @@ TriChat TUI gives you:
 - Settings panel for fanout target, gate mode, failover timeouts, and circuit breaker tuning
 - Settings toggle for consensus threshold (`min_agents=2` or `3`)
 - Settings toggle for interoperability rounds (`0-3`) to run peer bounce refinement before merge/execute
-- Autonomous council loop in normal chat flow: agents auto-ask each other targeted merge questions and incorporate answers before decision
+- Settings toggle for Council Transcript Strip mode (`always|auto|off`) so power users can collapse council chatter
+- Autonomous council convergence loop in normal chat flow: agents auto-ask targeted merge questions and keep iterating until novelty improves or the latency budget/max-round limit is reached
+- Dedicated Council Transcript Strip in chat timeline: agent-to-agent exchanges are rendered separately from user-facing replies
 - Runtime-sync context injection so codex/cursor/local-imprint share the same adaptive timeout and coordination posture each turn
 - Help panel with command reference
 - `Ctrl+A` hotkey in chat to run adapter protocol diagnostics instantly
@@ -296,6 +298,10 @@ Key env vars:
 - `TRICHAT_TUI_LAUNCHER` (`true`/`false`)
 - `TRICHAT_EXECUTE_GATE_MODE` (`open`/`allowlist`/`approval`)
 - `TRICHAT_INTEROP_ROUNDS` (`0-3`, default `1`)
+- `TRICHAT_COUNCIL_STRIP_MODE` (`always`/`auto`/`off`, default `auto`)
+- `TRICHAT_COUNCIL_MAX_ROUNDS` (max autonomous council rounds per turn, default `5`)
+- `TRICHAT_COUNCIL_LATENCY_BUDGET_SECONDS` (convergence latency budget, default `45`)
+- `TRICHAT_COUNCIL_MIN_NOVELTY_DELTA` (minimum novelty gain before early stop, default `0.05`)
 - `TRICHAT_BUS_SOCKET_PATH` (Unix socket for live bus, default `./data/trichat.bus.sock`)
 - `TRICHAT_BUS_AUTOSTART` (`true`/`false`, default `true`)
 - `TRICHAT_ADAPTER_HANDSHAKE_TTL_SECONDS` (cache duration for successful adapter ping checks, default `120`)
